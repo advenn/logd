@@ -1,0 +1,38 @@
+version: "3.8"
+
+services:
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: logd-grafana
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "false"
+    volumes:
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    network_mode: host
+    restart: unless-stopped
+
+  # Opt-in log scrape agent. Off by default — start with:
+  #   docker compose --profile agent up
+  # Feeds logd via its Loki-compatible push endpoint (zero logd changes).
+  alloy:
+    image: grafana/alloy:v1.4.2
+    container_name: logd-alloy
+    profiles: ["agent"]
+    volumes:
+      - ./monitoring/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy_data:/var/lib/alloy/data
+    command:
+      - "run"
+      - "--storage.path=/var/lib/alloy/data"
+      - "/etc/alloy/config.alloy"
+    network_mode: host
+    restart: unless-stopped
+
+volumes:
+  grafana_data:
+  alloy_data:

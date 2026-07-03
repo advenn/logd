@@ -1,0 +1,63 @@
+# Local development stack — builds logd from the local source tree.
+# For LOCAL use only. Deploys use the registry-image compose file.
+#
+#   docker compose -f docker-compose.local.yaml up --build
+#   docker compose -f docker-compose.local.yaml --profile agent up --build
+#
+# Rebuild after code changes by re-running with --build.
+
+services:
+  logd:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: logd:local
+    container_name: logd
+    # Mount the local config so it can be tweaked without rebuilding.
+    volumes:
+      - ./config.yaml:/var/lib/logd/config.yaml:ro
+      - logd_data:/var/lib/logd/data
+    command: ["-config", "config.yaml"]
+    network_mode: host
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: logd-grafana
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "false"
+    # No datasource provisioning here — add the logd (Loki) datasource
+    # manually via the Grafana UI. The base docker-compose.yaml keeps
+    # provisioning for registry/prod use.
+    volumes:
+      - grafana_data:/var/lib/grafana
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - logd
+
+  # Log scrape agent — reads every local container's stdout via the Docker
+  # socket and ships it to logd. Runs by default locally so `up --build`
+  # gives you logs to look at. (The base/registry compose keeps it opt-in.)
+  alloy:
+    image: grafana/alloy:v1.4.2
+    container_name: logd-alloy
+    volumes:
+      - ./monitoring/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy_data:/var/lib/alloy/data
+    command:
+      - "run"
+      - "--storage.path=/var/lib/alloy/data"
+      - "/etc/alloy/config.alloy"
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - logd
+
+volumes:
+  logd_data:
+  grafana_data:
+  alloy_data:
