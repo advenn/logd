@@ -1,0 +1,26 @@
+# logd sample configuration. Point a Grafana Loki datasource at http://localhost:3100.
+port: 3100
+data_dir: ./data
+segment_size_mb: 64
+flush_interval_ms: 500
+retention_days: 30   # delete sealed segments older than this (0 = keep forever)
+index_mem_budget_mb: 256   # seal a segment early if its in-RAM index exceeds this (0 = no cap)
+shards: 1   # number of shared-nothing writer folders (data_root/shard-NNNN/); queries fan in across them
+max_label_values_per_key: 1000   # §6.2 cardinality cap: over-cap values stay in Extra (scannable) but not indexed (-1 disables)
+multitenancy: false   # when true, tag+isolate data by the X-Scope-OrgID header (§12)
+
+# Typed extraction: {name:type} captures become queryable fields "<template>_<capture>",
+# indexed for O(log n) range queries. In LogQL: {app="api"} | latency_ms > 200
+index:
+  literals:
+    - "panic:"
+  templates:
+    - name: latency
+      pattern: "took {ms:int}ms"
+
+# Label-key allowlist: only these Extra keys are indexed for fast label-equality and
+# label discovery. Everything else is scan-only. (level/service are first-class and
+# always resolved from the record's fields, never indexed.)
+labels:
+  - region
+  - env
