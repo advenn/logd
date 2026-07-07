@@ -1,5 +1,5 @@
-# logd sample configuration. Point a Grafana Loki datasource at http://localhost:3100.
-port: 3100
+# logd sample configuration. Point a Grafana Loki datasource at http://localhost:7100.
+port: 7100
 data_dir: ./data
 segment_size_mb: 64
 flush_interval_ms: 500

@@ -17,7 +17,9 @@ import (
 	"github.com/advenn/logd/compat/loki"
 	"github.com/advenn/logd/core/config"
 	"github.com/advenn/logd/core/extract"
+	"github.com/advenn/logd/core/index"
 	"github.com/advenn/logd/core/ingest"
+	"github.com/advenn/logd/core/label"
 	"github.com/advenn/logd/core/model"
 	"github.com/advenn/logd/core/query"
 	"github.com/advenn/logd/core/storage"
@@ -43,13 +45,28 @@ func run(configPath string) error {
 	if err != nil {
 		return fmt.Errorf("compiling index config: %w", err)
 	}
+	// With multitenancy on, the tenant label must be indexed (allowlisted) so the
+	// tenant-scoping predicate pushes down instead of scanning every query.
+	labels := cfg.Labels
+	if cfg.Multitenancy {
+		labels = append(append([]string{}, labels...), model.TenantLabel)
+	}
 	opts := storage.Options{
-		Schema:           engine.IndexedFields(),
-		SegmentSizeBytes: cfg.SegmentSizeBytes(),
-		FlushInterval:    cfg.FlushInterval(),
-		Retention:        cfg.Retention(),
-		IndexMemBudget:   cfg.IndexMemBudgetBytes(),
+		Schema:              engine.IndexedFields(),
+		SegmentSizeBytes:    cfg.SegmentSizeBytes(),
+		FlushInterval:       cfg.FlushInterval(),
+		Retention:           cfg.Retention(),
+		IndexMemBudget:      cfg.IndexMemBudgetBytes(),
 		MaxLabelCardinality: cfg.MaxLabelValues(),
+		// Rebuild a crash-recovered segment's index by re-extracting its records (§8),
+		// using the same extraction + allowlist as live ingest so index == scan.
+		Reindex: func(e model.LogEntry) ([]index.KeyedValue, label.Set) {
+			var keys []index.KeyedValue
+			if engine != nil {
+				keys = engine.Extract(e.Message)
+			}
+			return keys, ingest.DeriveLabels(e.Extra, labels)
+		},
 	}
 	// One shard-writer per data_root/shard-NNNN folder (shared-nothing, §10). The query
 	// engine fans in across the same shards.
@@ -75,12 +92,6 @@ func run(configPath string) error {
 		}
 	}
 
-	// With multitenancy on, the tenant label must be indexed (allowlisted) so the
-	// tenant-scoping predicate pushes down instead of scanning every query.
-	labels := cfg.Labels
-	if cfg.Multitenancy {
-		labels = append(append([]string{}, labels...), model.TenantLabel)
-	}
 	ig := ingest.NewShardedWithLabels(engine, writers, labels)
 	qe := query.NewShardedEngine(shards, engine, labels)
 	lokiSrv := loki.NewServer(ig, qe, engine)

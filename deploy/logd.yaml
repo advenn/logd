@@ -1,0 +1,25 @@
+# logd configuration for containers.
+# Baked into the image at /etc/logd/config.yaml. Override by bind-mounting your own file
+# over that path (see docker-compose.yml), or point -config elsewhere.
+
+port: 7100
+data_dir: /data                 # persist on a Docker volume, NOT the container layer
+segment_size_mb: 64
+flush_interval_ms: 500
+retention_days: 30              # delete sealed segments older than this (0 = keep forever)
+index_mem_budget_mb: 256        # seal a segment early if its in-RAM index exceeds this
+shards: 1                       # shared-nothing writer folders; queries fan in across them
+max_label_values_per_key: 1000  # cardinality cap (over-cap values stay scannable in Extra)
+multitenancy: false             # set true to isolate data by the X-Scope-OrgID header
+
+# Template extraction — declares fields you can RANGE-query in LogQL, e.g.
+#   {app="api"} | latency_ms > 200
+# Add your own; the field name is "<template>_<capture>".
+index:
+  templates:
+    - name: latency
+      pattern: "took {ms:int}ms"
+
+# Label allowlist — which pushed stream labels get INDEXED for fast {k="v"} filters.
+# Labels not listed still work (found by scan); listed ones are index-accelerated.
+labels: [region, env, app, namespace, pod, container]

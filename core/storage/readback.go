@@ -111,13 +111,12 @@ func readSegmentEntries(path string) ([]model.LogEntry, error) {
 	return out, nil
 }
 
-// Record pairs a decoded entry with its segment-relative byte offset and segment ID —
-// the same offset the typed-range index stores, so this is what rebuild-and-compare
-// (and, later, index-pushdown re-verify) reads records back through.
+// Record pairs a decoded entry with its segment-relative byte offset — the same offset
+// the typed-range index stores, so this is what rebuild-and-compare, index-pushdown
+// re-verify, and crash-recovery reindexing read records back through.
 type Record struct {
-	SegmentID uint64
-	Offset    uint64
-	Entry     model.LogEntry
+	Offset uint64
+	Entry  model.LogEntry
 }
 
 // ReadAllRecords is ReadAll but also reporting each record's segment-relative byte
@@ -129,7 +128,7 @@ func ReadAllRecords(dir string) ([]Record, error) {
 	}
 	var out []Record
 	for _, meta := range m.All() {
-		recs, err := readSegmentRecords(meta.Path, meta.ID)
+		recs, err := readSegmentRecords(meta.Path)
 		if err != nil {
 			return out, err
 		}
@@ -187,7 +186,7 @@ func ScanSegmentTimeRange(path string, start, end int64, visit func(model.LogEnt
 	return nil
 }
 
-func readSegmentRecords(path string, segID uint64) ([]Record, error) {
+func readSegmentRecords(path string) ([]Record, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -217,9 +216,8 @@ func readSegmentRecords(path string, segID uint64) ([]Record, error) {
 				break
 			}
 			out = append(out, Record{
-				SegmentID: segID,
-				Offset:    uint64(PageOffset(p)) + uint64(off),
-				Entry:     e,
+				Offset: uint64(PageOffset(p)) + uint64(off),
+				Entry:  e,
 			})
 			off += EncodedSize(e)
 		}

@@ -419,7 +419,7 @@ import logging
 from logd import LogdHandler
 
 logger = logging.getLogger(__name__)
-logger.addHandler(LogdHandler(host="logd", port=3100))
+logger.addHandler(LogdHandler(host="logd", port=7100))
 ```
 
 Reads `LOGD_SERVICE` env var on init. Sends structured JSON to `POST /v1/ingest`. Batches entries, retries on failure.
@@ -429,7 +429,7 @@ Reads `LOGD_SERVICE` env var on init. Sends structured JSON to `POST /v1/ingest`
 ## Configuration
 
 ```yaml
-port: 3100
+port: 7100
 data_dir: /var/logd/data
 retention_days: 30
 flush_interval_ms: 500

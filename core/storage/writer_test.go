@@ -430,7 +430,7 @@ func TestIndexMemBudgetForcesRotation(t *testing.T) {
 	}
 	for _, s := range segs {
 		if !s.Indexed {
-			t.Fatalf("segment %d should be fully indexed", s.ID)
+			t.Fatalf("segment %s should be fully indexed", s.ID)
 		}
 	}
 	recs, err := ReadAllRecords(dir)

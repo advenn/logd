@@ -1,0 +1,16 @@
+apiVersion: 1
+
+# Provisions logd as a Loki datasource. Grafana reaches it over the shared `logd-net`
+# network by service name, so no host ports are involved.
+datasources:
+  - name: logd
+    type: loki
+    access: proxy
+    url: http://logd:7100
+    isDefault: true
+    jsonData:
+      # If logd runs with multitenancy: true, set the tenant header Grafana sends:
+      # httpHeaderName1: "X-Scope-OrgID"
+      maxLines: 1000
+    # secureJsonData:
+    #   httpHeaderValue1: "my-tenant"

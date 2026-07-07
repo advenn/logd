@@ -10,7 +10,7 @@ import (
 // one segment is "active" (accepting appends) at a time; sealed segments are
 // immutable and read-only (design §2 invariants 3, 4).
 type Segment struct {
-	ID      uint64
+	ID      string
 	Path    string
 	File    *os.File
 	Size    int64  // current file size in bytes

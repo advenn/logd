@@ -23,7 +23,7 @@ func TestCostGuard(t *testing.T) {
 	// Records are recorded in the sealed manifest (the guard needs them).
 	for _, s := range mustLoad(t, dir).All() {
 		if s.Records == 0 {
-			t.Fatalf("segment %d has no recorded record count", s.ID)
+			t.Fatalf("segment %s has no recorded record count", s.ID)
 		}
 	}
 

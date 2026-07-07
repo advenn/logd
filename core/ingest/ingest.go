@@ -71,19 +71,24 @@ func (ig *Ingester) route(labels label.Set) int {
 	return int(h.Sum64() % uint64(n))
 }
 
-// deriveLabels pulls the allowlisted keys out of the record's Extra (using the same
-// parser the query resolver uses, so index and scan see identical values) into a
-// canonical label set.
 func (ig *Ingester) deriveLabels(extra string) label.Set {
-	if len(ig.labelKeys) == 0 {
+	return DeriveLabels(extra, ig.labelKeys)
+}
+
+// DeriveLabels pulls the allowlisted keys out of a record's Extra (using the same parser
+// the query resolver uses, so index and scan see identical values) into a canonical label
+// set. Exported so crash recovery can rebuild a segment's label index identically to how
+// it was first ingested.
+func DeriveLabels(extra string, labelKeys []string) label.Set {
+	if len(labelKeys) == 0 {
 		return nil
 	}
 	all := model.ParseExtraLabels(extra)
 	if len(all) == 0 {
 		return nil
 	}
-	m := make(map[string]string, len(ig.labelKeys))
-	for _, k := range ig.labelKeys {
+	m := make(map[string]string, len(labelKeys))
+	for _, k := range labelKeys {
 		if model.IsReservedLabelKey(k) {
 			continue // level/service resolve from entry fields, never from Extra (see model)
 		}

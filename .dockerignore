@@ -1,0 +1,13 @@
+# Keep the build context small and reproducible.
+.git
+.gitignore
+*.md
+docs/
+data/
+shard-*/
+*.log
+logd
+/logd-static
+deploy/consumer-example/
+# but the runtime config IS needed by the Dockerfile:
+!deploy/logd.yaml

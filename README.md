@@ -94,7 +94,7 @@ The contract is enforced by a **differential oracle test**: `Execute(q)` (pushdo
 - **HTTP** (`compat/loki/server.go`): `/loki/api/v1/push`, `/query_range`, `/query` (+ Grafana health stub), `/labels`, `/label/{n}/values`, `/series`, `/ready`, returning Grafana-shaped JSON.
 - **`cmd/logd`**: the real daemon — load YAML config, wire `core` → `compat`, serve, graceful shutdown. Verified with a live `curl` round-trip: push a line, then `query_range` with `{region="eu"} | latency_ms > 200` returns exactly the matching record as Loki JSON, index-accelerated.
 
-Run it: `go run ./cmd/logd -config config.yaml`, then point a Grafana Loki datasource at `http://localhost:3100`.
+Run it: `go run ./cmd/logd -config config.yaml`, then point a Grafana Loki datasource at `http://localhost:7100`.
 
 ### What Phase 7 delivers (hardening)
 

@@ -19,12 +19,17 @@ import (
 // config package: the elaborate extraction/label config (design §7.1) is a later
 // phase, and the storage engine should not depend on it.
 type Options struct {
-	SegmentSizeBytes int64             // seal + rotate once the active segment reaches this size
-	FlushInterval    time.Duration     // group-commit cadence for partial pages
-	Schema           []index.FieldType // indexed fields; each segment builds a per-field .tidx for these at seal
-	Retention        time.Duration     // delete sealed segments older than this (0 = keep forever)
-	IndexMemBudget   int64             // seal early when the active segment's in-RAM index exceeds this (0 = no cap)
-	MaxLabelCardinality int            // max distinct values indexed per label key per segment (§6.2; 0 = unlimited)
+	SegmentSizeBytes    int64             // seal + rotate once the active segment reaches this size
+	FlushInterval       time.Duration     // group-commit cadence for partial pages
+	Schema              []index.FieldType // indexed fields; each segment builds a per-field .tidx for these at seal
+	Retention           time.Duration     // delete sealed segments older than this (0 = keep forever)
+	IndexMemBudget      int64             // seal early when the active segment's in-RAM index exceeds this (0 = no cap)
+	MaxLabelCardinality int               // max distinct values indexed per label key per segment (§6.2; 0 = unlimited)
+	// Reindex re-derives a record's typed-range keys and label set (the same work the
+	// ingest layer does). If set, crash recovery re-runs it over the recovered segment's
+	// records to rebuild its in-RAM index, so a recovered segment seals fully-indexed
+	// rather than scan-only (design §8). Nil → recovered segment is scan-only.
+	Reindex func(model.LogEntry) ([]index.KeyedValue, label.Set)
 }
 
 const (
@@ -63,15 +68,15 @@ type Writer struct {
 	lockFile        *os.File         // held flock on <dir>/LOCK for this shard's lifetime
 
 	// Owned exclusively by the writer goroutine after Start (no locking needed):
-	currSeg   *Segment
-	idxWriter *IndexWriter  // sparse time index for the active segment
-	page      []byte        // the 4KB page currently being assembled in RAM
-	hdr       PageHeader    // header for the page being assembled
-	schema     []index.FieldType // indexed fields (from Options), for the buffer + manifest schema
+	currSeg    *Segment
+	idxWriter  *IndexWriter       // sparse time index for the active segment
+	page       []byte             // the 4KB page currently being assembled in RAM
+	hdr        PageHeader         // header for the page being assembled
+	schema     []index.FieldType  // indexed fields (from Options), for the buffer + manifest schema
 	buffer     *index.Buffer      // per-active-segment typed-range index buffer, flushed at seal
 	labelBuf   *label.Builder     // per-active-segment label index (stream dict + postings), flushed at seal
 	card       *label.Cardinality // per-active-segment value-cardinality cap (§6.2)
-	segRecords uint64            // record count of the active segment (for the cost guard), reset on rotate
+	segRecords uint64             // record count of the active segment (for the cost guard), reset on rotate
 
 	// liveStreams holds the ACTIVE segment's label streams for immediate discovery
 	// (sealed segments are served from their .lidx). Concurrency-safe: written by the
@@ -141,13 +146,13 @@ func NewWriter(dir string, opts Options) (*Writer, error) {
 	}
 
 	w := &Writer{
-		dir:       dir,
-		segDir:    segDir,
-		opts:      opts,
-		writeCh:   make(chan record, 4096),
-		closeCh:   make(chan struct{}),
-		manifest:  manifest,
-		serviceLT: serviceLT,
+		dir:         dir,
+		segDir:      segDir,
+		opts:        opts,
+		writeCh:     make(chan record, 4096),
+		closeCh:     make(chan struct{}),
+		manifest:    manifest,
+		serviceLT:   serviceLT,
 		schema:      opts.Schema,
 		subs:        newTailRegistry(),
 		liveStreams: make(map[string]label.Set),
@@ -160,9 +165,17 @@ func NewWriter(dir string, opts Options) (*Writer, error) {
 		if err := w.recoverActiveSegment(active); err != nil {
 			return nil, fmt.Errorf("recovering active segment: %w", err)
 		}
-		// The recovered segment's typed-range index was never rebuilt in RAM, so it
-		// must be sealed as scan-only (empty schema) rather than get a partial .tidx.
-		w.indexIncomplete = true
+		if opts.Reindex != nil {
+			// Re-extract the recovered records to rebuild the typed-range + label index in
+			// RAM, so the segment seals fully-indexed (design §8).
+			if err := w.reindexRecoveredSegment(active); err != nil {
+				return nil, fmt.Errorf("rebuilding recovered segment index: %w", err)
+			}
+		} else {
+			// No reindex hook: the segment's index can't be rebuilt, so it must seal as
+			// scan-only (empty schema) rather than get a partial .tidx.
+			w.indexIncomplete = true
+		}
 	}
 	ok = true
 	return w, nil
@@ -216,6 +229,41 @@ func (w *Writer) recoverActiveSegment(meta *SegmentMeta) error {
 	}
 	w.currSeg = seg
 	w.idxWriter = iw
+	return nil
+}
+
+// reindexRecoveredSegment rebuilds the recovered active segment's in-RAM typed-range and
+// label indexes by re-extracting each surviving record (design §8). The rebuilt index maps
+// re-derived keys/labels to each record's on-disk offset, so it is self-consistent and,
+// once the segment seals, its .tidx/.lidx point at the right records. New records appended
+// after recovery add to these same buffers, so the sealed segment is fully indexed.
+func (w *Writer) reindexRecoveredSegment(meta *SegmentMeta) error {
+	recs, err := readSegmentRecords(meta.Path)
+	if err != nil {
+		return err
+	}
+	w.buffer = index.NewBuffer(w.schema)
+	w.labelBuf = label.NewBuilder()
+	w.card = label.NewCardinality(w.opts.MaxLabelCardinality)
+	for _, rec := range recs {
+		keys, labels := w.opts.Reindex(rec.Entry)
+		labels = w.card.Apply(labels)
+		// Mirror processEntry EXACTLY: always intern + post (even an empty label set, which
+		// interns to the {} stream) so the rebuilt index is identical to the original;
+		// only a non-empty set updates the live-discovery snapshot.
+		sid := w.labelBuf.Intern(labels)
+		w.labelBuf.AddPosting(sid, rec.Offset)
+		if len(labels) > 0 {
+			w.liveMu.Lock()
+			w.liveStreams[labels.Canonical()] = labels
+			w.liveMu.Unlock()
+		}
+		for _, kv := range keys {
+			w.buffer.Add(kv.Field, kv.Key, rec.Offset)
+		}
+		w.segRecords++
+	}
+	w.indexIncomplete = false
 	return nil
 }
 
@@ -655,7 +703,7 @@ func (w *Writer) rotateSegment() error {
 	// from that ID (never read manifest.nextID outside the lock).
 	meta := &SegmentMeta{State: SegmentActive, MinTS: emptyMinTS, MaxTS: emptyMaxTS, Schema: []FieldSchema{}}
 	w.manifest.Add(meta)
-	meta.Path = fmt.Sprintf("%s/seg-%06d.log", w.segDir, meta.ID)
+	meta.Path = fmt.Sprintf("%s/seg-%s.log", w.segDir, meta.ID)
 
 	seg, err := CreateSegment(meta.Path)
 	if err != nil {
@@ -717,7 +765,7 @@ func (w *Writer) sealCurrentSegment() error {
 	if !w.indexIncomplete {
 		segBase := strings.TrimSuffix(w.currSeg.Path, ".log")
 		if w.buffer != nil {
-			written, err := w.buffer.Flush(segBase, w.currSeg.ID)
+			written, err := w.buffer.Flush(segBase, 0) // segment id in the .tidx header is vestigial
 			if err != nil {
 				return fmt.Errorf("flushing tidx: %w", err)
 			}
@@ -736,7 +784,7 @@ func (w *Writer) sealCurrentSegment() error {
 	if w.card != nil {
 		cappedKeys = w.card.CappedKeys()
 		if b := w.card.Breaches(); len(b) > 0 {
-			log.Printf("storage: segment %d label-cardinality cap breached: %v (over-cap values indexed via scan only)", w.currSeg.ID, b)
+			log.Printf("storage: segment %s label-cardinality cap breached: %v (over-cap values indexed via scan only)", w.currSeg.ID, b)
 		}
 	}
 

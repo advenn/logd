@@ -1,0 +1,32 @@
+name: logd
+
+services:
+  logd:
+    build: .
+    image: logd:latest
+    container_name: logd
+    restart: unless-stopped
+    ports:
+      - "7100:7100"          # publish to the host (optional — remove to keep it network-only)
+    volumes:
+      - logd-data:/data
+      # Customize config WITHOUT rebuilding by mounting your own over the baked one:
+      # - ./deploy/logd.yaml:/etc/logd/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:7100/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - logd-net
+
+volumes:
+  logd-data:
+
+# Shared, externally-created network: any container in ANOTHER compose project that joins
+# `logd-net` can reach this daemon at http://logd:7100 by name.
+# Create it once:  docker network create logd-net
+networks:
+  logd-net:
+    external: true

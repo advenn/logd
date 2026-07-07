@@ -31,11 +31,11 @@ type FieldSchema struct {
 // SegmentMeta describes a segment file, its time bounds, and the schema it was
 // built with.
 type SegmentMeta struct {
-	ID     uint64        `json:"id"`
-	MinTS  int64         `json:"min_ts"`
-	MaxTS  int64         `json:"max_ts"`
-	Path   string        `json:"path"`
-	State  SegmentState  `json:"state"`
+	ID      string        `json:"id"` // ULID: globally unique, sortable, no coordination (§10)
+	MinTS   int64         `json:"min_ts"`
+	MaxTS   int64         `json:"max_ts"`
+	Path    string        `json:"path"`
+	State   SegmentState  `json:"state"`
 	Schema  []FieldSchema `json:"schema"`  // fields with a .tidx for this segment
 	Records uint64        `json:"records"` // number of records (for the pushdown cost guard)
 	// CappedKeys are label keys whose distinct-value cap was breached in this segment
@@ -55,14 +55,13 @@ type SegmentMeta struct {
 // mutates it.
 type Manifest struct {
 	mu       sync.RWMutex
-	segments map[uint64]*SegmentMeta
+	segments map[string]*SegmentMeta
 	byMinTS  []*SegmentMeta // kept sorted by MinTS for time-range filtering
-	nextID   uint64
 }
 
 // NewManifest returns an empty manifest.
 func NewManifest() *Manifest {
-	return &Manifest{segments: make(map[uint64]*SegmentMeta)}
+	return &Manifest{segments: make(map[string]*SegmentMeta)}
 }
 
 // LoadManifest reads dir/manifest.json, or returns a fresh manifest if the file is
@@ -85,22 +84,18 @@ func LoadManifest(dir string) (*Manifest, error) {
 	for _, e := range entries {
 		m.segments[e.ID] = e
 		m.byMinTS = append(m.byMinTS, e)
-		if e.ID >= m.nextID {
-			m.nextID = e.ID + 1
-		}
 	}
 	m.sortLocked()
 	return m, nil
 }
 
-// Add registers a new segment, assigning it the next ID (returned in meta.ID). The
-// caller uses meta.ID — never Manifest.nextID directly — for naming, so segment
-// naming never races with concurrent readers (a data race the original had).
+// Add registers a new segment, assigning it a fresh ULID (returned in meta.ID) under the
+// lock. The caller uses meta.ID for naming, so segment naming never races with concurrent
+// readers, and the ULID is globally unique so it can't collide across shards (§10).
 func (m *Manifest) Add(meta *SegmentMeta) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.nextID++
-	meta.ID = m.nextID
+	meta.ID = newULID()
 	m.segments[meta.ID] = meta
 	m.byMinTS = append(m.byMinTS, meta)
 	m.sortLocked()
@@ -123,7 +118,7 @@ func (m *Manifest) Update(meta *SegmentMeta) {
 // SetBounds updates a segment's time bounds in place (used by the writer to publish
 // the active segment's MinTS/MaxTS as pages flush, so recent data is visible to
 // time-range queries before the segment is sealed).
-func (m *Manifest) SetBounds(id uint64, minTS, maxTS int64) {
+func (m *Manifest) SetBounds(id string, minTS, maxTS int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s, ok := m.segments[id]; ok {
@@ -138,7 +133,7 @@ func (m *Manifest) SetBounds(id uint64, minTS, maxTS int64) {
 // that read those fields. The schema is the set of fields that have a .tidx for this
 // segment; an empty schema means "scan this segment" (design §7.3), which is how a
 // crash-recovered segment (whose in-RAM index was incomplete) is marked.
-func (m *Manifest) SealSegment(id uint64, minTS, maxTS int64, schema []FieldSchema, indexed bool, records uint64, cappedKeys []string) {
+func (m *Manifest) SealSegment(id string, minTS, maxTS int64, schema []FieldSchema, indexed bool, records uint64, cappedKeys []string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s, ok := m.segments[id]; ok {
@@ -149,7 +144,7 @@ func (m *Manifest) SealSegment(id uint64, minTS, maxTS int64, schema []FieldSche
 
 // Remove deletes a segment from the manifest (used by retention). Returns the removed
 // meta (nil if unknown) so the caller can delete its files.
-func (m *Manifest) Remove(id uint64) *SegmentMeta {
+func (m *Manifest) Remove(id string) *SegmentMeta {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s, ok := m.segments[id]
@@ -215,7 +210,7 @@ func (m *Manifest) Active() *SegmentMeta {
 }
 
 // Get returns a segment by ID (nil if unknown).
-func (m *Manifest) Get(id uint64) *SegmentMeta {
+func (m *Manifest) Get(id string) *SegmentMeta {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.segments[id]

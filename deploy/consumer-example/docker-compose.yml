@@ -1,0 +1,43 @@
+name: logd-consumer
+
+# An example of a SEPARATE project (in its own folder) that uses logd. It joins the same
+# external `logd-net` and reaches the daemon by service name: http://logd:7100.
+#   docker network create logd-net           # once (shared with logd's own compose)
+#   docker compose -f ../../docker-compose.yml up -d   # start logd
+#   docker compose up                          # start this consumer
+
+services:
+  # Grafana with logd pre-wired as a Loki datasource. Open http://localhost:3000
+  # (anonymous admin), then Explore → logd → e.g.  {app="demo"}
+  grafana:
+    image: grafana/grafana:latest
+    container_name: logd-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+    volumes:
+      - ./grafana/datasource.yml:/etc/grafana/provisioning/datasources/logd.yml:ro
+    networks:
+      - logd-net
+
+  # One-shot: push a log line to logd FROM ANOTHER CONTAINER, addressing it by name.
+  seed:
+    image: curlimages/curl:latest
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        NOW=$$(date +%s)000000000
+        curl -sS -XPOST http://logd:7100/loki/api/v1/push \
+          -H 'Content-Type: application/json' \
+          -d "{\"streams\":[{\"stream\":{\"app\":\"demo\",\"region\":\"eu\"},\"values\":[[\"$$NOW\",\"hello from another container, req took 42ms\"]]}]}"
+        echo "  -> pushed a line to logd (query it in Grafana: {app=\"demo\"} )"
+    networks:
+      - logd-net
+
+networks:
+  logd-net:
+    external: true

@@ -215,7 +215,7 @@ func schemaKind(seg *storage.SegmentMeta, field string) (index.ValueKind, bool) 
 
 // SegmentPlan is how Explain reports the chosen access path per segment.
 type SegmentPlan struct {
-	SegmentID  uint64
+	SegmentID  string
 	Mode       string // "index" or "scan"
 	Candidates int    // candidate offsets when Mode=="index"
 }
