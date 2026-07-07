@@ -10,24 +10,24 @@ import (
 
 // Config is the daemon's top-level configuration (YAML).
 type Config struct {
-	Port            int         `yaml:"port"`
-	DataDir         string      `yaml:"data_dir"`
-	SegmentSizeMB   int         `yaml:"segment_size_mb"`
-	FlushIntervalMs int         `yaml:"flush_interval_ms"`
-	RetentionDays   int         `yaml:"retention_days"`    // delete sealed segments older than this (0 = keep forever)
-	IndexMemBudgetMB int        `yaml:"index_mem_budget_mb"` // seal early when the active segment's in-RAM index exceeds this (0 = no cap)
-	Shards          int         `yaml:"shards"`            // number of shard writers (shared-nothing folders); default 1
-	MaxLabelValuesPerKey int    `yaml:"max_label_values_per_key"` // §6.2 cardinality cap; default 1000
-	Multitenancy    bool        `yaml:"multitenancy"`      // tag+isolate by X-Scope-OrgID (§12); default false
-	Index           IndexConfig `yaml:"index"`
-	Labels          []string    `yaml:"labels"` // label-key allowlist (§6.2)
+	Port                 int         `yaml:"port"`
+	DataDir              string      `yaml:"data_dir"`
+	SegmentSizeMB        int         `yaml:"segment_size_mb"`
+	FlushIntervalMs      int         `yaml:"flush_interval_ms"`
+	RetentionDays        int         `yaml:"retention_days"`           // delete sealed segments older than this (0 = keep forever)
+	IndexMemBudgetMB     int         `yaml:"index_mem_budget_mb"`      // seal early when the active segment's in-RAM index exceeds this (0 = no cap)
+	Shards               int         `yaml:"shards"`                   // number of shard writers (shared-nothing folders); default 1
+	MaxLabelValuesPerKey int         `yaml:"max_label_values_per_key"` // §6.2 cardinality cap; default 1000
+	Multitenancy         bool        `yaml:"multitenancy"`             // tag+isolate by X-Scope-OrgID (§12); default false
+	Index                IndexConfig `yaml:"index"`
+	Labels               []string    `yaml:"labels"` // label-key allowlist (§6.2)
 }
 
 // Default returns a config with sensible defaults, used when no file is given and to
 // fill unset fields.
 func Default() Config {
 	return Config{
-		Port:            3100,
+		Port:            7100, // not Loki's 3100, so the two can run side by side
 		DataDir:         "./data",
 		SegmentSizeMB:   64,
 		FlushIntervalMs: 500,
