@@ -332,6 +332,30 @@ func (w *Writer) WriteExtracted(e model.LogEntry, keys []index.KeyedValue, label
 	}
 }
 
+// WriteExtractedCtx is WriteExtracted, but it WAITS for queue space instead of dropping.
+//
+// The distinction matters for any caller ingesting a multi-entry batch on behalf of a
+// client that will retry. WriteExtracted's non-blocking drop means a batch can be accepted
+// halfway and then fail, and because the wire protocols logd speaks (Loki push, and every
+// shipper built on it) have no way to say "I took the first 412 of your 1000", the client
+// retries the WHOLE batch and the accepted prefix is stored twice. That is silent
+// duplication, not data loss, so nothing surfaces it — it was found by a corpus with known
+// ground truth returning 169,692 rows for 50,000 pushed lines.
+//
+// Blocking turns backpressure into latency, which is what Loki and VictoriaLogs do and
+// what shippers already expect. The caller's context bounds the wait, and a closed writer
+// is reported rather than deadlocking on a channel nobody is draining.
+func (w *Writer) WriteExtractedCtx(ctx context.Context, e model.LogEntry, keys []index.KeyedValue, labels label.Set) error {
+	select {
+	case w.writeCh <- record{entry: e, keys: keys, labels: labels}:
+		return nil
+	case <-w.closeCh:
+		return fmt.Errorf("writer is closed")
+	case <-ctx.Done():
+		return fmt.Errorf("waiting for write queue: %w", ctx.Err())
+	}
+}
+
 // Close drains the queue, flushes the final partial page, seals the active segment,
 // and persists all metadata. Idempotent and safe to call concurrently: the whole
 // cleanup (not just closing the channel) runs under closeOnce, so an explicit Close

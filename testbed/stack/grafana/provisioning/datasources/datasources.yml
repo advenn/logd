@@ -1,0 +1,43 @@
+apiVersion: 1
+
+# All three stores provisioned side by side. In Explore, the datasource picker is the
+# comparison: same query, three engines.
+#
+# Note the asymmetry. logd and Loki are both `type: loki` because logd implements the Loki
+# query API. VictoriaLogs accepts the Loki PUSH protocol but answers queries in LogsQL, so
+# it needs its own plugin and its own query syntax — which is why the parity harness keeps
+# a hand-written LogsQL twin for every query in the matrix.
+
+deleteDatasources:
+  - name: logd
+    orgId: 1
+  - name: loki
+    orgId: 1
+  - name: victorialogs
+    orgId: 1
+
+datasources:
+  - name: logd
+    type: loki
+    uid: logd
+    url: http://logd:7100
+    access: proxy
+    isDefault: true
+    jsonData:
+      maxLines: 5000
+      timeout: 300
+
+  - name: loki
+    type: loki
+    uid: loki
+    url: http://loki:3100
+    access: proxy
+    jsonData:
+      maxLines: 5000
+      timeout: 300
+
+  - name: victorialogs
+    type: victoriametrics-logs-datasource
+    uid: victorialogs
+    url: http://victorialogs:9428
+    access: proxy

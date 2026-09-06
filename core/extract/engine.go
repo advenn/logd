@@ -26,7 +26,16 @@ type Engine struct {
 	patternStrings []string          // AC pattern index -> literal string
 	firstLitTmpls  map[string][]int  // first-literal string -> indices of templates starting with it
 	schema         []index.FieldType // every indexed field (template captures + literal existence)
-	failures       map[string]*atomic.Int64
+
+	// Per-template extraction counters. All three are needed together: a failure count
+	// on its own has no denominator ("50 failures" of how many?). candidates counts
+	// anchor occurrences we tried, matches counts full successes, failures counts
+	// anchor-aligned-but-unparseable. candidates > matches+failures means the anchor
+	// fires but the rest of the pattern doesn't align — a different mis-specification
+	// than failures > 0 (which means it aligns but the declared type is wrong).
+	candidates map[string]*atomic.Int64
+	matches    map[string]*atomic.Int64
+	failures   map[string]*atomic.Int64
 }
 
 // Compile validates the config and builds an Engine. It enforces the §7.2 rules:
@@ -36,6 +45,8 @@ func Compile(cfg config.IndexConfig) (*Engine, error) {
 	e := &Engine{
 		bareLitField:  map[string]string{},
 		firstLitTmpls: map[string][]int{},
+		candidates:    map[string]*atomic.Int64{},
+		matches:       map[string]*atomic.Int64{},
 		failures:      map[string]*atomic.Int64{},
 	}
 
@@ -57,7 +68,7 @@ func Compile(cfg config.IndexConfig) (*Engine, error) {
 		if err != nil {
 			return nil, err
 		}
-		t := template{name: tc.Name, fragments: frags}
+		t := template{name: tc.Name, pattern: tc.Pattern, fragments: frags}
 		if err := validateTemplate(&t); err != nil {
 			return nil, err
 		}
@@ -84,6 +95,8 @@ func Compile(cfg config.IndexConfig) (*Engine, error) {
 		idx := len(e.templates)
 		e.templates = append(e.templates, t)
 		e.firstLitTmpls[t.firstLiteral] = append(e.firstLitTmpls[t.firstLiteral], idx)
+		e.candidates[tc.Name] = new(atomic.Int64)
+		e.matches[tc.Name] = new(atomic.Int64)
 		e.failures[tc.Name] = new(atomic.Int64)
 	}
 
@@ -143,12 +156,62 @@ func (e *Engine) FieldKind(name string) (index.ValueKind, bool) {
 }
 
 // FailureCount returns how many times a template's anchor matched but a capture failed
-// to parse — a real signal that a template is mis-specified for the data.
+// to parse — a real signal that a template is mis-specified for the data. Prefer Stats,
+// which returns this alongside the denominators that make it interpretable.
 func (e *Engine) FailureCount(template string) int64 {
 	if c, ok := e.failures[template]; ok {
 		return c.Load()
 	}
 	return 0
+}
+
+// TemplateStat is one template's live extraction accounting. It answers the question the
+// index config actually poses — "is this pattern earning its place?" — which a raw
+// failure count cannot:
+//
+//	Candidates == 0             the anchor never appears; the pattern is for other data
+//	Matches < Candidates        the anchor fires but the pattern doesn't align after it
+//	Failures > 0                it aligns but a capture won't parse as the declared type
+//	Matches ≈ Candidates        healthy
+type TemplateStat struct {
+	Name       string   `json:"name"`
+	Pattern    string   `json:"pattern"`
+	Fields     []string `json:"fields"`
+	Candidates int64    `json:"candidates"`
+	Matches    int64    `json:"matches"`
+	Failures   int64    `json:"failures"`
+}
+
+// Stats snapshots every template's counters. The three counters are read independently,
+// so a concurrent Extract can land between them; the numbers are diagnostic, not
+// transactional, and the skew is at most one record.
+func (e *Engine) Stats() []TemplateStat {
+	out := make([]TemplateStat, 0, len(e.templates))
+	for i := range e.templates {
+		t := &e.templates[i]
+		var fields []string
+		for _, f := range t.fragments {
+			if f.isCapture {
+				fields = append(fields, f.field)
+			}
+		}
+		out = append(out, TemplateStat{
+			Name:       t.name,
+			Pattern:    t.pattern,
+			Fields:     fields,
+			Candidates: e.candidates[t.name].Load(),
+			Matches:    e.matches[t.name].Load(),
+			Failures:   e.failures[t.name].Load(),
+		})
+	}
+	return out
+}
+
+// Literals returns the configured bare existence-indexed literals, for config reporting.
+func (e *Engine) Literals() []string {
+	out := make([]string, len(e.bareLiterals))
+	copy(out, e.bareLiterals)
+	return out
 }
 
 type matchStatus uint8
@@ -176,7 +239,17 @@ type FieldValue struct {
 // ExtractValues runs the automaton once over message and returns every template
 // capture's typed value, plus a zero-valued str entry per matched bare literal
 // (existence). This is the shared core of extraction.
+// It does NOT update the per-template counters. This method is on the query path too
+// (the scan/re-verify path re-extracts every candidate record to compare exact values),
+// and counting there would make the stats meaningless: they would report how many times
+// the matcher ran, which is dominated by query volume, rather than how much of the
+// INGESTED data each template actually matched — the only question the index config poses.
+// Extract, the ingest entry point, is where counting happens.
 func (e *Engine) ExtractValues(message string) []FieldValue {
+	return e.extractValues(message, false)
+}
+
+func (e *Engine) extractValues(message string, count bool) []FieldValue {
 	hits := e.ac.search(message)
 	if len(hits) == 0 {
 		return nil
@@ -191,14 +264,22 @@ func (e *Engine) ExtractValues(message string) []FieldValue {
 	for ti := range e.templates {
 		t := &e.templates[ti]
 		for _, start := range posByLit[t.firstLiteral] {
+			if count {
+				e.candidates[t.name].Add(1)
+			}
 			vals, status := e.matchAt(message, start, t)
 			switch status {
 			case matchOK:
+				if count {
+					e.matches[t.name].Add(1)
+				}
 				for _, cv := range vals {
 					out = append(out, FieldValue{Field: cv.field, Value: cv.value})
 				}
 			case parseFail:
-				e.failures[t.name].Add(1)
+				if count {
+					e.failures[t.name].Add(1)
+				}
 			}
 		}
 	}
@@ -212,8 +293,11 @@ func (e *Engine) ExtractValues(message string) []FieldValue {
 
 // Extract returns the encoded (field, key) pairs to index for a record, de-duplicated
 // on (field, key) so the same value indexed twice in one line produces one entry.
+//
+// This is the INGEST entry point, so it is where the per-template counters are updated:
+// one increment per record ingested, independent of how often that record is later read.
 func (e *Engine) Extract(message string) []index.KeyedValue {
-	vals := e.ExtractValues(message)
+	vals := e.extractValues(message, true)
 	if len(vals) == 0 {
 		return nil
 	}

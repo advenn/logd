@@ -1,1 +1,14 @@
 .idea
+
+# Runtime data. Segments, indexes and manifests are generated at run time; committing
+# them makes diffs noisy and ships stale fixtures that look like real state.
+data/
+shard-*/
+testbed/corpus/
+testbed/results/
+
+# Build output
+/logd
+/logd-static
+bin/
+*.test
