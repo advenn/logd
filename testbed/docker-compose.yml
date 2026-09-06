@@ -1,0 +1,150 @@
+name: logd-testbed
+
+# Head-to-head testbed: logd, Loki and VictoriaLogs side by side in one Grafana, fed
+# identical traffic.
+#
+#   docker compose up -d            bring up all four
+#   make corpus load                generate a corpus and push it to all three
+#   open http://localhost:3000      Explore, switch datasource, compare
+#
+# Resource limits are set on every backend deliberately. On a shared dev box an unpinned
+# run measures scheduler luck rather than the store, and an OOM-killed Loki midway through
+# a benchmark looks exactly like a crash bug.
+
+x-bench-limits: &bench-limits
+  cpus: "2.0"
+  mem_limit: 3g
+  restart: unless-stopped
+
+services:
+  logd:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: logd:testbed
+    container_name: tb-logd
+    <<: *bench-limits
+    ports:
+      - "7100:7100"
+    volumes:
+      - ./stack/logd/logd.yaml:/etc/logd/config.yaml:ro
+      - logd-data:/data
+    command: ["-config", "/etc/logd/config.yaml"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:7100/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  loki:
+    image: grafana/loki:3.7.7
+    container_name: tb-loki
+    <<: *bench-limits
+    user: "10001:10001"
+    command: ["-config.file=/etc/loki/loki.yaml", "-target=all"]
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./stack/loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    # No healthcheck. Loki 3.7.x ships as a distroless image with no /bin/sh and no wget,
+    # so CMD and CMD-SHELL probes both fail with "stat /bin/sh: no such file or directory"
+    # — which Docker reports as "unhealthy", indistinguishable from Loki actually being
+    # broken. Readiness is polled from the `waiter` service instead.
+
+  victorialogs:
+    image: victoriametrics/victoria-logs:v1.52.0
+    container_name: tb-victorialogs
+    <<: *bench-limits
+    command:
+      - "-storageDataPath=/vlogs"
+      - "-httpListenAddr=:9428"
+      - "-retentionPeriod=100y"     # the corpus is dated 2026-01-01; do not expire it
+      - "-futureRetention=100y"
+      - "-inmemoryDataFlushInterval=1s"
+      - "-loggerLevel=WARN"
+    ports:
+      - "9428:9428"
+    volumes:
+      - vlogs-data:/vlogs
+    # No healthcheck: this image is built FROM scratch, so there is no shell, no wget and
+    # no curl inside it for a CMD/CMD-SHELL probe to run. Readiness is gated by the
+    # `waiter` service below, which polls it from the outside.
+
+  # One-shot readiness gate.
+  #
+  # Both Loki and VictoriaLogs ship as shell-less images, so neither can run a container-
+  # local healthcheck. Polling all three from a container that DOES have curl is the only
+  # honest way to wait on them, and it gives Grafana a single dependency instead of three
+  # heterogeneous probes. logd (alpine-based) keeps its own healthcheck and is gated on
+  # normally.
+  waiter:
+    image: curlimages/curl:8.14.1
+    container_name: tb-waiter
+    restart: "no"
+    depends_on:
+      logd:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for i in $$(seq 1 120); do
+          if curl -sf http://victorialogs:9428/health >/dev/null \
+             && curl -sf http://logd:7100/ready       >/dev/null \
+             && curl -sf http://loki:3100/ready       >/dev/null; then
+            echo "all three backends ready"; exit 0
+          fi
+          sleep 1
+        done
+        echo "backends not ready after 120s" >&2; exit 1
+
+  grafana:
+    image: grafana/grafana:13.2.1
+    container_name: tb-grafana
+    restart: unless-stopped
+    depends_on:
+      waiter:
+        condition: service_completed_successfully
+    ports:
+      - "3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      # VictoriaLogs speaks the Loki PUSH protocol but not the Loki QUERY API — its query
+      # language is LogsQL — so Grafana needs its own datasource plugin to read it.
+      # This downloads at container start and is the flakiest part of `up`; if it fails,
+      # bake a Grafana image with the plugin preinstalled.
+      GF_INSTALL_PLUGINS: "victoriametrics-logs-datasource"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./stack/grafana/provisioning:/etc/grafana/provisioning:ro
+
+  # --- profile: alloy -------------------------------------------------------------
+  # COMPATIBILITY DEMO ONLY. This proves Grafana Alloy ships to logd unmodified.
+  # It must NEVER run during a measured benchmark: Alloy's loki.write gives each endpoint
+  # its own queue, backoff and retry state, so under load the three backends receive
+  # different data and the throughput number measures Alloy's queue, not any store.
+  alloy:
+    image: grafana/alloy:v1.19.2
+    container_name: tb-alloy
+    profiles: ["alloy"]
+    volumes:
+      - ./stack/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - ./corpus:/var/log/app:ro
+      - alloy-data:/var/lib/alloy/data
+    command:
+      - run
+      - --storage.path=/var/lib/alloy/data
+      - --server.http.listen-addr=0.0.0.0:12345
+      - /etc/alloy/config.alloy
+    ports:
+      - "12345:12345"
+
+volumes:
+  logd-data:
+  loki-data:
+  vlogs-data:
+  alloy-data:

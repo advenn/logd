@@ -74,6 +74,19 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/loki/api/v1/tail", s.handleTail)
 	mux.HandleFunc("/ready", s.handleReady)
 	mux.HandleFunc("/loki/api/v1/ready", s.handleReady)
+
+	// Grafana's capability-discovery calls. Without buildinfo Grafana feature-gates the
+	// datasource down and the user sees a degraded UI with no visible error. See
+	// discovery.go.
+	mux.HandleFunc("/loki/api/v1/status/buildinfo", s.handleBuildInfo)
+	mux.HandleFunc("/loki/api/v1/index/stats", s.handleIndexStatsLoki)
+	mux.HandleFunc("/loki/api/v1/format_query", s.handleFormatQuery)
+
+	// logd's own introspection surface. Kept out of the /loki/ namespace so Grafana's
+	// feature detection never sees a route real Loki lacks. See introspect.go.
+	mux.HandleFunc("/logd/api/v1/index_stats", s.handleIndexStats)
+	mux.HandleFunc("/logd/api/v1/explain", s.handleExplain)
+	mux.HandleFunc("/logd/api/v1/query_scan", s.handleQueryScan)
 	return mux
 }
 
@@ -102,9 +115,13 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 			entries[i].Extra = model.WithExtraLabel(entries[i].Extra, model.TenantLabel, t)
 		}
 	}
+	// Wait for queue space rather than dropping. A push is one indivisible batch to the
+	// client: there is no way in the Loki protocol to report "I accepted the first 412 of
+	// your 1000 entries", so failing partway through leaves the client to retry the whole
+	// batch and duplicate everything already stored. Expressing backpressure as latency
+	// (which is what Loki and VictoriaLogs do) keeps the request effectively atomic.
 	for i := range entries {
-		if err := s.ig.Ingest(entries[i]); err != nil {
-			// Backpressure/queue-full is surfaced, not silently dropped.
+		if err := s.ig.IngestCtx(r.Context(), entries[i]); err != nil {
 			s.writeError(w, http.StatusServiceUnavailable, err.Error())
 			return
 		}
@@ -113,6 +130,14 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
+	s.queryRangeWith(w, r, s.qe.Execute)
+}
+
+// queryRangeWith serves a range query, executing the log branch through exec. The
+// executor is a parameter so /loki/api/v1/query_range (index pushdown) and
+// /logd/api/v1/query_scan (forced scan) share one code path: the benchmark compares the
+// two, so any drift between them would silently corrupt the comparison.
+func (s *Server) queryRangeWith(w http.ResponseWriter, r *http.Request, exec func(query.Query) ([]model.LogEntry, error)) {
 	ast, err := logql.ParseExpr(r.FormValue("query"))
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, err.Error())
@@ -125,7 +150,7 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		results, err := s.qe.Execute(q)
+		results, err := exec(q)
 		if err != nil {
 			s.writeError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -143,6 +168,10 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, newMatrixResponse(s.hideTenant(series)))
+	default:
+		// Without this, an expression type the switch doesn't know returns 200 with an
+		// empty body — which reads to a client as "no data" rather than "unsupported".
+		s.writeError(w, http.StatusBadRequest, "unsupported query expression")
 	}
 }
 
