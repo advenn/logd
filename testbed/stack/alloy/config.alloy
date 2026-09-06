@@ -1,0 +1,47 @@
+// COMPATIBILITY DEMO ONLY — never run this during a measured benchmark.
+//
+// Its purpose is to show that a real, unmodified log shipper talks to logd: Grafana Alloy
+// tails a file and writes to all three backends over the standard Loki push protocol, with
+// no logd-specific configuration anywhere in this file.
+//
+// It must NOT be used as the benchmark's load path. Each `endpoint` block below carries its
+// own queue, backoff and retry state, so the moment one backend is slower than the others
+// the three receive different data — and the resulting throughput number measures Alloy's
+// queue rather than any store. The benchmark uses cmd/loggen instead, which encodes each
+// batch once and delivers the identical bytes to every backend closed-loop.
+//
+// Usage:
+//   docker compose --profile alloy up -d alloy
+//   go run ./cmd/loggen -format=app -rate=200 -out=file:./corpus/live.log
+
+local.file_match "app" {
+  path_targets = [{
+    __path__ = "/var/log/app/live.log",
+    app      = "checkout",
+    env      = "prod",
+    region   = "eu",
+  }]
+  sync_period = "5s"
+}
+
+loki.source.file "app" {
+  targets    = local.file_match.app.targets
+  forward_to = [loki.write.fanout.receiver]
+}
+
+loki.write "fanout" {
+  endpoint {
+    url = "http://logd:7100/loki/api/v1/push"
+  }
+
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+
+  // VictoriaLogs accepts the Loki push protocol on its own path. _stream_fields must be
+  // set explicitly, or it derives stream identity from every label it receives and its
+  // stream count stops matching the other two.
+  endpoint {
+    url = "http://victorialogs:9428/insert/loki/api/v1/push?_stream_fields=app,env,region"
+  }
+}
