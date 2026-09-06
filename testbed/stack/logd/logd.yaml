@@ -1,0 +1,46 @@
+# logd configuration for the head-to-head testbed.
+#
+# This is deliberately separate from the repo's config.yaml and deploy/logd.yaml: the
+# testbed's templates must track what the generator actually emits, and coupling that to
+# the shipped example config would make both harder to change.
+
+port: 7100
+data_dir: /data
+segment_size_mb: 64
+flush_interval_ms: 500
+retention_days: 0        # keep everything; a benchmark must not delete its own corpus
+index_mem_budget_mb: 256
+shards: 1
+max_label_values_per_key: 1000
+multitenancy: false
+
+index:
+  literals:
+    - "panic:"
+    - "circuit breaker opened"
+
+  templates:
+    # NOTE THE '=' . The generator renders "took=247ms", not "took 247ms".
+    # The repo's example config.yaml ships the space form, which matches ZERO lines from
+    # this generator — the anchor "took " simply never occurs. That failure is silent:
+    # the daemon runs fine, the .tidx is empty, and every range query quietly degrades to
+    # a scan. `curl /logd/api/v1/index_stats` is how you catch it (candidates would be 0).
+    - name: latency
+      pattern: "took={ms:int}ms"
+
+    - name: status
+      pattern: "status={code:int} "
+
+    # DELIBERATELY NOT DECLARED, so the index-config workflow has something real to find:
+    # the warn-level lock-contention branch renders "waited=<n>ms" (~4% of lines), which
+    # the `latency` template never sees. Declaring it is the exercise.
+    # - name: waited
+    #   pattern: "waited={ms:int}ms"
+
+# Label-key allowlist. `app` MUST be here: without it, {app="checkout"} cannot push down
+# to the label index and every query in the comparison would scan — logd would be
+# sandbagging itself against Loki and VictoriaLogs.
+labels:
+  - app
+  - env
+  - region

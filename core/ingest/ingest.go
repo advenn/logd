@@ -6,6 +6,7 @@
 package ingest
 
 import (
+	"context"
 	"hash/fnv"
 	"sync/atomic"
 
@@ -52,6 +53,19 @@ func (ig *Ingester) Ingest(e model.LogEntry) error {
 	}
 	labels := ig.deriveLabels(e.Extra)
 	return ig.writers[ig.route(labels)].WriteExtracted(e, keys, labels)
+}
+
+// IngestCtx is Ingest, but it waits for queue space rather than dropping when the writer
+// is behind. Callers ingesting a batch on behalf of a retrying client must use this:
+// dropping midway through a batch makes the client resend entries that were already
+// stored, silently duplicating them. See storage.WriteExtractedCtx.
+func (ig *Ingester) IngestCtx(ctx context.Context, e model.LogEntry) error {
+	var keys []index.KeyedValue
+	if ig.engine != nil {
+		keys = ig.engine.Extract(e.Message)
+	}
+	labels := ig.deriveLabels(e.Extra)
+	return ig.writers[ig.route(labels)].WriteExtractedCtx(ctx, e, keys, labels)
 }
 
 // route picks the shard for a record. A labelled stream is hashed to a stable shard, so a

@@ -9,5 +9,8 @@ shard-*/
 logd
 /logd-static
 deploy/consumer-example/
+# The testbed is a separate nested module (generator, harnesses, compose stack). It is
+# never part of the daemon image, and excluding it keeps `COPY . .` layer caching intact.
+testbed/
 # but the runtime config IS needed by the Dockerfile:
 !deploy/logd.yaml
