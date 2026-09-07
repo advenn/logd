@@ -17,7 +17,10 @@ LOGD_URL="${LOGD_URL:-http://localhost:7100}"
 # silently truncating the query to `{app="checkout"` and producing a LogQL parse error.
 : "${QUERY:=}"
 if [[ -z "$QUERY" ]]; then
-  QUERY='{app="checkout"} | latency_ms > 200'
+  # APP is exported by scripts/window.sh from the corpus manifest. Defaulting it blindly
+  # would query a stream that may not exist in this corpus and return nothing, which reads
+  # as a fast engine rather than a mistake.
+  QUERY="{app=\"${APP:-checkout}\"} | latency_ms > 200"
 fi
 LIMIT="${LIMIT:-1000000}"
 
@@ -76,6 +79,10 @@ then
 fi
 
 n=$(rows "$tmp/index.json")
+if [[ "$n" == "0" ]]; then
+  echo "ABORT: query matched 0 rows — nothing to measure. Check the app label and window." >&2
+  exit 1
+fi
 
 bench() { # endpoint -> mean ms
   local ep="$1" i t0 t1
