@@ -8,6 +8,7 @@ make up          # logd + Loki + VictoriaLogs + Grafana
 make load        # generate a corpus, push identical bytes to all three
 make explain     # which access path did logd choose?
 make compare     # logd's index path vs its own forced scan
+make bench       # interleaved latency across logd, Loki and VictoriaLogs
 open http://localhost:3000    # Explore → switch datasource → same query, three engines
 ```
 
@@ -54,18 +55,17 @@ logd unmodified**. That is a compatibility claim, and it never runs during a mea
 
 ---
 
-## Results (50,000 lines, 8-core dev box)
+## Results (8-core dev box)
 
-These are real numbers from this harness, not estimates. They are also **small-scale** —
-enough to prove the mechanism works, not enough to publish as a benchmark. The
-index-vs-scan comparison was repeated four times; everything else is a single run. See
-*Honest caveats* below.
+Real numbers from this harness, not estimates. Each section states its own corpus size:
+latency was measured at 500,000 lines, correctness/storage/ingest at 50,000. Reproduce with
+`./scripts/bench-vs.sh`, which interleaves samples across engines and refuses to report
+timings unless every engine returned the same non-zero row count.
 
 Corpus: unstructured application logs, e.g.
-`GET /api/v1/orders 200 took=247ms trace_id=…`. 81% of lines carry a `took=` duration;
-`latency_ms > 200` selects 5.6% of them.
+`GET /api/v1/orders 200 took=247ms trace_id=…`. 81% of lines carry a `took=` duration.
 
-### Correctness — all three agree with ground truth
+### Correctness — all three agree with ground truth (50,000 lines)
 
 | query | ground truth | logd | Loki | VictoriaLogs |
 |---|---|---|---|---|
@@ -83,28 +83,55 @@ VictoriaLogs  _stream:{app="checkout"} "took=" | extract "took=<latency_ms>ms" |
 Loki's line filter `|= "took="` is deliberately included. Omitting it would sandbag Loki,
 and the first reader would say so.
 
-### Query latency — the differentiator
+### Query latency — it depends entirely on selectivity (500,000 lines)
 
-| | mean | notes |
-|---|---|---|
-| **logd (typed index)** | **42–62 ms** | `explain`: 1 segment indexed, 2,824 candidates of 50,000 |
-| logd (forced scan) | 294–441 ms | *same binary, same data, same page cache* — index off |
-| Loki (`\| pattern`) | 59 ms | |
+500,000 lines, 12–15 interleaved samples per engine, medians. Every row verified to return
+the identical result set from all engines first.
 
-Ranges, not points: across four runs the index/scan speedup landed at **6.5×, 6.5×, 6.9×
-and 7.9×**. That spread on an otherwise-identical workload is the honest measure of how
-noisy this box is, and the reason none of these should be quoted as a single figure.
+| `latency_ms >` | rows | logd (index) | logd (scan) | Loki (`pattern`) | Loki (`regexp`) | vs Loki |
+|---|---|---|---|---|---|---|
+| 200 | 26,996 (5.4%) | 386 ms | 3320 ms | 369 ms | 450 ms | **0.96× — tied** |
+| 1000 | 3,935 (0.79%) | 110 ms | 3152 ms | 241 ms | 317 ms | **2.2×** |
+| 3000 | 1,046 (0.21%) | 77 ms | 3155 ms | 239 ms | 299 ms | **3.1×** |
+| 5000 | 482 (0.10%) | 61 ms | 2967 ms | 207 ms | 298 ms | **3.4×** |
 
-**The logd-vs-logd number is the one that matters.** An index-vs-scan result against
-another product always invites "you configured it wrong"; a comparison against the same
-binary over the same data has exactly one variable — whether the `.tidx` is consulted.
-`make compare` runs it and refuses to print timings if the two paths disagree on a row.
+**The shape is the result, not any single row.** logd's time tracks the size of the
+*answer* (386 → 61 ms as the result set shrinks 56×). Loki's is comparatively flat
+(369 → 207 ms) because it re-scans and re-parses every line regardless of how few match.
+logd's own forced-scan column is flat too (~3000 ms), which confirms that flatness is the
+signature of scanning rather than anything specific to Loki.
 
-Note logd narrowed 50,000 records to 2,824 candidates, then re-verified down to the exact
-2,806. The 18 extra are lossy-key false positives that the re-verify pass removes — by
-design, the index over-approximates and is never trusted for the final answer.
+That is precisely what the typed index is for: converting work proportional to the *data*
+into work proportional to the *answer*.
 
-### Storage — logd loses, clearly
+**Where logd does not win.** At 5.4% selectivity it is a tie. Returning 27,000 rows means
+JSON serialization dominates both engines equally and the index advantage is swamped. If
+your queries routinely match millions of lines, this index buys you nothing — the win is in
+needle-in-haystack lookups, which is what a typed range index is for.
+
+Against Loki's `| regexp` form — what most people actually type — logd is 4.9× at the
+selective end.
+
+### logd vs itself (500,000 lines)
+
+The cross-engine numbers above always invite "you configured Loki wrong". This one cannot:
+same binary, same data, same page cache, one variable — whether the `.tidx` is consulted.
+
+| `latency_ms >` | index | forced scan | speedup |
+|---|---|---|---|
+| 200 | 386 ms | 3320 ms | **8.6×** |
+| 1000 | 110 ms | 3152 ms | **28.6×** |
+| 3000 | 77 ms | 3155 ms | **41.2×** |
+| 5000 | 61 ms | 2967 ms | **48.9×** |
+
+`make compare` runs this and refuses to print timings if the two paths disagree on a row.
+
+At the 50,000-line scale the index narrowed 50,000 records to 2,824 candidates, then
+re-verified down to the exact 2,806. The 18 extra are lossy-key false positives that the
+re-verify pass removes — by design, the index over-approximates and is never trusted for
+the final answer.
+
+### Storage — logd loses, clearly (50,000 lines)
 
 | | on disk | vs logd |
 |---|---|---|
@@ -115,7 +142,7 @@ design, the index over-approximates and is never trusted for the final answer.
 logd stores records uncompressed in 4 KB pages. There is no block compression anywhere in
 the write path. This is a real, structural disadvantage and it is not close.
 
-### Ingest
+### Ingest (50,000 lines)
 
 Both a finding and a fix. The first run showed logd requiring **225 retries** to absorb
 50,000 lines while Loki and VictoriaLogs needed zero, and — worse — storing **169,692 rows
@@ -145,13 +172,19 @@ Loki and VictoriaLogs do and what shippers already expect. Pinned by
 
 Read these before quoting any number above.
 
-- **50,000 lines is small.** Loki at 59 ms is doing brute force over a corpus small enough
-  that brute force is cheap. logd's advantage should widen with scale, and that is a
-  hypothesis this harness has not yet tested, not a result.
-- **Shared dev box**, other containers running throughout. Only the index-vs-scan
-  comparison was repeated (4 runs, spread 6.5x-7.9x); the cross-engine latency and all the
-  disk and ingest figures are single runs with no percentiles. Treat them as directional.
+- **Selectivity decides the answer.** Quoting one speedup figure for "logd vs Loki" is
+  meaningless — the same corpus gives 0.96× and 3.4× depending only on how many rows match.
+  Quote the table, or quote nothing.
+- **500,000 lines is still modest**, and one node. Both engines fit the working set in
+  page cache, so none of this says anything about behaviour at disk-bound scale.
+- **Shared dev box**, other containers running throughout. Latency figures are medians of
+  12–15 interleaved samples; the disk and ingest figures are single runs with no
+  percentiles. Treat the latter as directional.
 - **Warm page cache.** Five warm-ups discarded per measurement. No cold-cache numbers.
+- **Result serialization is inside every number.** All engines pay it and it is not
+  separated out, which is exactly why the 5.4% row is a tie: at 27,000 rows the marshalling
+  dominates the lookup. A benchmark isolating engine time would show a larger gap; this one
+  measures what a client actually waits for.
 - **All latencies include HTTP and JSON serialization** of ~2,806 rows, identical across
   engines, which compresses the visible ratio relative to raw engine time.
 - **logd's advantage requires the template to be declared in advance.** On an undeclared
@@ -200,6 +233,7 @@ stack/loki/loki.yaml          single-binary filesystem Loki; every deviation com
 stack/grafana/provisioning/   all three datasources
 cmd/loggen/                   corpus generator + multi-target Loki push driver
 internal/loggen/              ported generator; corpus.go and push.go are new
+scripts/bench-vs.sh           interleaved A/B latency across all engines
 scripts/compare-self.sh       index vs forced scan, with a correctness gate first
 scripts/window.sh             derives the query window from a manifest
 ```

@@ -23,7 +23,7 @@ VL_URL   ?= http://localhost:9428
 # including high-cardinality ones, and its stream count stops matching the others.
 VL_PUSH  ?= $(VL_URL)/insert/loki/api/v1/push?_stream_fields=app,env,region
 
-.PHONY: up down clean ps logs corpus load explain compare verify-loki test alloy
+.PHONY: up down clean ps logs corpus load explain compare bench verify-loki test alloy
 
 up:
 	$(COMPOSE) up -d --build
@@ -72,6 +72,13 @@ explain:
 # consulted, so "you misconfigured the other one" cannot apply.
 compare:
 	@win=$$(./scripts/window.sh $(CORPUS) env) || exit 1; eval "$$win"; ./scripts/compare-self.sh
+
+# Interleaved A/B latency across every engine. Interleaved rather than sequential so drift
+# over the run (cache warming, a neighbouring container waking up) lands on all engines
+# equally instead of on whichever one happened to go last. Aborts unless every engine
+# returned the same non-zero row count.
+bench:
+	@win=$$(./scripts/window.sh $(CORPUS) env) || exit 1; eval "$$win"; ./scripts/bench-vs.sh
 
 # How the index config is doing against live traffic. candidates==0 means the anchor never
 # appears; matches<candidates means the pattern does not align after the anchor;
