@@ -16,6 +16,7 @@ type Config struct {
 	FlushIntervalMs      int         `yaml:"flush_interval_ms"`
 	RetentionDays        int         `yaml:"retention_days"`           // delete sealed segments older than this (0 = keep forever)
 	IndexMemBudgetMB     int         `yaml:"index_mem_budget_mb"`      // seal early when the active segment's in-RAM index exceeds this (0 = no cap)
+	IndexCacheMB         int         `yaml:"index_cache_mb"`           // query-side cache of opened index sidecars (0 = disabled)
 	Shards               int         `yaml:"shards"`                   // number of shard writers (shared-nothing folders); default 1
 	MaxLabelValuesPerKey int         `yaml:"max_label_values_per_key"` // §6.2 cardinality cap; default 1000
 	Multitenancy         bool        `yaml:"multitenancy"`             // tag+isolate by X-Scope-OrgID (§12); default false
@@ -91,6 +92,23 @@ func (c *Config) FlushInterval() time.Duration {
 // Retention returns the configured retention window (0 = keep forever).
 func (c *Config) Retention() time.Duration {
 	return time.Duration(c.RetentionDays) * 24 * time.Hour
+}
+
+// IndexCacheBytes returns the query-side sidecar cache budget in bytes.
+//
+// This is a READ cache, distinct from IndexMemBudget (which bounds the ACTIVE segment's
+// in-RAM index during writes). Without it every query re-reads and re-decodes each .tidx
+// and .lidx from disk, per segment per predicate — several megabytes each on a real
+// deployment. Negative disables it; 0 takes the default.
+func (c *Config) IndexCacheBytes() int64 {
+	switch {
+	case c.IndexCacheMB < 0:
+		return 0
+	case c.IndexCacheMB == 0:
+		return 256 << 20
+	default:
+		return int64(c.IndexCacheMB) << 20
+	}
 }
 
 // IndexMemBudgetBytes returns the active-segment index RAM budget in bytes (0 = no cap).

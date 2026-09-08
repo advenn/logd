@@ -94,6 +94,7 @@ func run(configPath string) error {
 
 	ig := ingest.NewShardedWithLabels(engine, writers, labels)
 	qe := query.NewShardedEngine(shards, engine, labels)
+	qe.SetIndexCacheBytes(cfg.IndexCacheBytes())
 	lokiSrv := loki.NewServer(ig, qe, engine)
 	if cfg.Multitenancy {
 		lokiSrv.EnableMultitenancy()

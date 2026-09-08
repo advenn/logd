@@ -74,6 +74,13 @@ type Reader struct {
 	entries []Entry
 }
 
+// SizeBytes estimates this reader's heap footprint. Used by the query-side reader cache
+// to enforce a memory budget: a .tidx for a busy field runs to several megabytes, so the
+// cache has to account for what it is holding rather than count entries.
+func (r *Reader) SizeBytes() int64 {
+	return int64(len(r.entries))*int64(tidxRecordSize) + 64
+}
+
 // OpenReader reads and validates a .tidx. A bad magic/version, header CRC mismatch, or
 // a size that disagrees with the record count returns an error so the caller can
 // degrade to a scan (design §9.1) rather than trust a corrupt index.

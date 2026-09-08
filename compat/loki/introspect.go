@@ -107,8 +107,13 @@ type explainResponse struct {
 }
 
 type explainSegment struct {
-	SegmentID  string `json:"segment_id"`
-	Mode       string `json:"mode"`
+	SegmentID string `json:"segment_id"`
+	Mode      string `json:"mode"`
+	// Reason distinguishes the several ways a segment ends up scanning — no index, nothing
+	// pushable, a missing sidecar, or the cost guard deciding a sequential read is cheaper.
+	// Without it they are indistinguishable, and "my query stopped using the index" has no
+	// diagnosis.
+	Reason     string `json:"reason"`
 	Candidates int    `json:"candidates"`
 }
 
@@ -148,6 +153,7 @@ func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
 		resp.Segments = append(resp.Segments, explainSegment{
 			SegmentID:  p.SegmentID,
 			Mode:       p.Mode,
+			Reason:     p.Reason,
 			Candidates: p.Candidates,
 		})
 		resp.Summary.SegmentsTotal++
