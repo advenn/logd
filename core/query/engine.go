@@ -382,8 +382,11 @@ func (r *engineResolver) Label(e model.LogEntry, key string) (string, bool) {
 		}
 		return "", false
 	default:
-		v, ok := model.ParseExtraLabels(e.Extra)[key]
-		return v, ok
+		// Single-key scan rather than ParseExtraLabels: this runs once per record PER
+		// label predicate on both the scan and the index re-verify paths, and building a
+		// whole map to read one key made it 28.7% of query CPU. ExtraLabel is
+		// observationally identical (differential + fuzz tested in core/model).
+		return model.ExtraLabel(e.Extra, key)
 	}
 }
 
