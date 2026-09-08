@@ -80,7 +80,7 @@ func BenchmarkLabelOnlyLimit100(b *testing.B) {
 	preds := []q.Predicate{q.LabelEqual{Key: "app", Value: "bench"}}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		out, err := e.Execute(q.Query{Start: 0, End: 1<<62, Preds: preds, Limit: 100, Direction: q.Backward})
+		out, err := e.Execute(q.Query{Start: 0, End: 1 << 62, Preds: preds, Limit: 100, Direction: q.Backward})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -98,7 +98,7 @@ func BenchmarkLabelOnlyLimit1(b *testing.B) {
 	preds := []q.Predicate{q.LabelEqual{Key: "app", Value: "bench"}}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := e.Execute(q.Query{Start: 0, End: 1<<62, Preds: preds, Limit: 1, Direction: q.Backward}); err != nil {
+		if _, err := e.Execute(q.Query{Start: 0, End: 1 << 62, Preds: preds, Limit: 1, Direction: q.Backward}); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -114,7 +114,7 @@ func BenchmarkTypedSelective(b *testing.B) {
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := e.Execute(q.Query{Start: 0, End: 1<<62, Preds: preds, Limit: 100, Direction: q.Backward}); err != nil {
+		if _, err := e.Execute(q.Query{Start: 0, End: 1 << 62, Preds: preds, Limit: 100, Direction: q.Backward}); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -130,7 +130,7 @@ func BenchmarkTypedBroad(b *testing.B) {
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := e.Execute(q.Query{Start: 0, End: 1<<62, Preds: preds, Limit: 100, Direction: q.Backward}); err != nil {
+		if _, err := e.Execute(q.Query{Start: 0, End: 1 << 62, Preds: preds, Limit: 100, Direction: q.Backward}); err != nil {
 			b.Fatal(err)
 		}
 	}

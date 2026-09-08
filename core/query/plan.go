@@ -1,7 +1,6 @@
 package query
 
 import (
-	"sort"
 	"strings"
 
 	"github.com/advenn/logd/core/index"
@@ -65,8 +64,9 @@ func (e *Engine) plan(seg *storage.SegmentMeta, preds []Predicate) ([]plannedLoo
 				keepResidual(p)
 			}
 			field, run := pred.Field, typedRun(pred, losslessKind(kind))
+			cache := e.cache
 			lookups = append(lookups, plannedLookup{run: func(segBase string) ([]uint64, bool) {
-				r, err := index.OpenReader(index.TidxPath(segBase, field))
+				r, err := cache.tidx(index.TidxPath(segBase, field))
 				if err != nil {
 					return nil, false
 				}
@@ -84,8 +84,9 @@ func (e *Engine) plan(seg *storage.SegmentMeta, preds []Predicate) ([]plannedLoo
 			if !ok || !schemaHas(seg, field) {
 				continue
 			}
+			cache := e.cache
 			lookups = append(lookups, plannedLookup{run: func(segBase string) ([]uint64, bool) {
-				r, err := index.OpenReader(index.TidxPath(segBase, field))
+				r, err := cache.tidx(index.TidxPath(segBase, field))
 				if err != nil {
 					return nil, false
 				}
@@ -109,8 +110,9 @@ func (e *Engine) plan(seg *storage.SegmentMeta, preds []Predicate) ([]plannedLoo
 				continue
 			}
 			key, value := pred.Key, pred.Value
+			cache := e.cache
 			lookups = append(lookups, plannedLookup{run: func(segBase string) ([]uint64, bool) {
-				r, err := label.OpenReader(label.IndexPath(segBase))
+				r, err := cache.lidx(label.IndexPath(segBase))
 				if err != nil {
 					return nil, false
 				}
@@ -168,25 +170,52 @@ func (e *Engine) labelAllowed(key string) bool {
 }
 
 // intersectLookups runs each lookup against the segment and intersects the candidate
-// offset sets (predicates are ANDed). Returns ok=false if any lookup's index can't be
-// opened, so the caller degrades to a full scan rather than a partial set.
-func intersectLookups(segBase string, lookups []plannedLookup) ([]uint64, bool) {
+// offset sets (predicates are ANDed).
+//
+// Returns ok=false if any lookup's index can't be opened, so the caller degrades to a full
+// scan rather than a partial set. Returns guardTripped=true when the candidate set grows
+// past what is worth fetching by offset — see below.
+func intersectLookups(segBase string, lookups []plannedLookup, maxCandidates int) (offsets []uint64, guardTripped, ok bool) {
 	var result map[uint64]struct{}
 	for _, l := range lookups {
-		offs, ok := l.run(segBase)
-		if !ok {
-			return nil, false
+		offs, lookupOK := l.run(segBase)
+		if !lookupOK {
+			return nil, false, false
 		}
 		if result == nil {
+			// Early bail is only sound when this is the ONLY lookup, because the
+			// intersection can only shrink: a large first set says nothing about the final
+			// candidate count. Tripping the guard on it anyway would demote segments whose
+			// real intersection is tiny — caught immediately by TestExplainReportsAccessPath,
+			// where `{region="eu"} | latency_ms > 200` intersects 3 typed hits down to 2.
+			bailAt := 0
+			if len(lookups) == 1 {
+				bailAt = maxCandidates
+			}
 			result = make(map[uint64]struct{}, len(offs))
 			for _, o := range offs {
 				result[o] = struct{}{}
+				// Applied DURING materialization, not after: building the whole set and
+				// then discarding it is what made a broad indexed query slower than the
+				// scan it fell back to. Bailing bounds the work at maxCandidates+1
+				// insertions. Exact, not an estimate — a raw index-entry count would
+				// over-count, since one record matching a template twice yields two entries
+				// for the same offset.
+				if bailAt > 0 && len(result) > bailAt {
+					return nil, true, true
+				}
+			}
+			// A first lookup that matched nothing means the intersection is empty. The old
+			// code only checked this from the SECOND lookup onward, so a zero-candidate
+			// first predicate still ran every remaining lookup in full.
+			if len(result) == 0 {
+				return nil, false, true
 			}
 			continue
 		}
 		next := make(map[uint64]struct{})
 		for _, o := range offs {
-			if _, ok := result[o]; ok {
+			if _, in := result[o]; in {
 				next[o] = struct{}{}
 			}
 		}
@@ -195,12 +224,13 @@ func intersectLookups(segBase string, lookups []plannedLookup) ([]uint64, bool) 
 			break
 		}
 	}
+	// No sort: FetchRecords sorts its own copy of the offsets (core/storage/readback.go),
+	// and nothing else depends on the order, so sorting here was pure duplicated work.
 	out := make([]uint64, 0, len(result))
 	for o := range result {
 		out = append(out, o)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	return out, true
+	return out, false, true
 }
 
 // costGuardFraction: when candidate offsets exceed this fraction of a segment's records,
@@ -212,6 +242,25 @@ const costGuardFraction = 0.5
 func costGuardTrips(seg *storage.SegmentMeta, candidates int) bool {
 	return seg.Records > 0 && uint64(candidates) > uint64(costGuardFraction*float64(seg.Records))
 }
+
+// costGuardLimit is the candidate count above which the guard trips, or 0 when this segment
+// has no record count and the guard is therefore disabled. Passing it into
+// intersectLookups lets the guard fire while the set is being built.
+func costGuardLimit(seg *storage.SegmentMeta) int {
+	if seg.Records == 0 {
+		return 0
+	}
+	return int(costGuardFraction * float64(seg.Records))
+}
+
+// SegmentPlanReason explains why a segment took the path it did.
+const (
+	ReasonNotIndexed   = "not_indexed"   // active or crash-recovered segment
+	ReasonNoPushdown   = "no_pushdown"   // no predicate could be pushed here
+	ReasonIndexMissing = "index_missing" // a sidecar was absent or corrupt
+	ReasonCostGuard    = "cost_guard"    // candidate set too large; sequential scan is cheaper
+	ReasonIndexed      = "indexed"       // pushdown used
+)
 
 // segCapped reports whether a label key's value cap was breached in this segment (so its
 // index is incomplete and the query must scan it).
@@ -259,9 +308,13 @@ func schemaKind(seg *storage.SegmentMeta, field string) (index.ValueKind, bool) 
 
 // SegmentPlan is how Explain reports the chosen access path per segment.
 type SegmentPlan struct {
-	SegmentID  string
-	Mode       string // "index" or "scan"
-	Candidates int    // candidate offsets when Mode=="index"
+	SegmentID string
+	Mode      string // "index" or "scan"
+	// Reason names WHY this mode was chosen. Previously a cost-guard trip and a missing
+	// index both reported Mode:"scan" with Candidates:0, indistinguishably — so a query
+	// that silently stopped using the index looked identical to one that never could.
+	Reason     string
+	Candidates int // candidate offsets when Mode=="index"
 }
 
 // Explain reports, per time-pruned segment, whether the query would use the index or
@@ -277,17 +330,24 @@ func (e *Engine) Explain(q Query) []SegmentPlan {
 		for _, seg := range sh.Manifest().Filter(q.Start, end) {
 			lookups, _ := e.plan(seg, q.Preds)
 			if lookups == nil {
-				plans = append(plans, SegmentPlan{SegmentID: seg.ID, Mode: "scan"})
+				reason := ReasonNoPushdown
+				if !seg.Indexed {
+					reason = ReasonNotIndexed
+				}
+				plans = append(plans, SegmentPlan{SegmentID: seg.ID, Mode: "scan", Reason: reason})
 				continue
 			}
 			segBase := strings.TrimSuffix(seg.Path, ".log")
-			offsets, ok := intersectLookups(segBase, lookups)
-			if !ok || costGuardTrips(seg, len(offsets)) {
-				// A missing .tidx or a cost-guard trip both make the executor scan.
-				plans = append(plans, SegmentPlan{SegmentID: seg.ID, Mode: "scan"})
+			offsets, tripped, ok := intersectLookups(segBase, lookups, costGuardLimit(seg))
+			if !ok {
+				plans = append(plans, SegmentPlan{SegmentID: seg.ID, Mode: "scan", Reason: ReasonIndexMissing})
 				continue
 			}
-			plans = append(plans, SegmentPlan{SegmentID: seg.ID, Mode: "index", Candidates: len(offsets)})
+			if tripped || costGuardTrips(seg, len(offsets)) {
+				plans = append(plans, SegmentPlan{SegmentID: seg.ID, Mode: "scan", Reason: ReasonCostGuard})
+				continue
+			}
+			plans = append(plans, SegmentPlan{SegmentID: seg.ID, Mode: "index", Reason: ReasonIndexed, Candidates: len(offsets)})
 		}
 	}
 	return plans

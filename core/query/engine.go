@@ -35,6 +35,7 @@ type Engine struct {
 	shards    []Shard
 	ex        *extract.Engine     // may be nil (no typed predicates possible)
 	labelKeys map[string]struct{} // allowlisted label keys eligible for index pushdown; nil → none
+	cache     *readerCache        // opened index sidecars, reused across queries
 }
 
 // NewEngine builds a single-shard query engine with typed pushdown but no label pushdown
@@ -51,6 +52,16 @@ func NewEngineWithLabels(w *storage.Writer, ex *extract.Engine, labelKeys []stri
 
 // NewShardedEngine fans queries out across shards and merges (design §10). labelKeys must
 // match the ingester's allowlist.
+// SetIndexCacheBytes sizes the opened-sidecar cache (0 disables it). The daemon calls this
+// from index_cache_mb; the default suits tests and embedded use.
+func (e *Engine) SetIndexCacheBytes(n int64) { e.cache = newReaderCache(n) }
+
+// ForgetSegment drops cached readers for a segment that has been deleted, so retention
+// does not leave the cache serving — and holding the memory of — files that are gone.
+func (e *Engine) ForgetSegment(segPath string) {
+	e.cache.Forget(strings.TrimSuffix(segPath, ".log"))
+}
+
 func NewShardedEngine(shards []Shard, ex *extract.Engine, labelKeys []string) *Engine {
 	var set map[string]struct{}
 	if len(labelKeys) > 0 {
@@ -59,7 +70,7 @@ func NewShardedEngine(shards []Shard, ex *extract.Engine, labelKeys []string) *E
 			set[k] = struct{}{}
 		}
 	}
-	return &Engine{shards: shards, ex: ex, labelKeys: set}
+	return &Engine{shards: shards, ex: ex, labelKeys: set, cache: newReaderCache(defaultIndexCacheBytes)}
 }
 
 // Labels returns the distinct allowlisted label keys present across sealed segments,
@@ -138,7 +149,7 @@ func (e *Engine) forEachLiveStream(fn func(label.Set)) {
 func (e *Engine) forEachLabelIndex(fn func(*label.Reader)) {
 	for _, sh := range e.shards {
 		for _, seg := range sh.Manifest().All() {
-			r, err := label.OpenReader(label.IndexPath(strings.TrimSuffix(seg.Path, ".log")))
+			r, err := e.cache.lidx(label.IndexPath(strings.TrimSuffix(seg.Path, ".log")))
 			if err != nil {
 				continue // no/corrupt label index for this segment
 			}
@@ -269,14 +280,16 @@ func (e *Engine) querySegment(seg *storage.SegmentMeta, q Query, start, end int6
 		return scan() // nothing pushable, or non-indexed segment
 	}
 	segBase := strings.TrimSuffix(seg.Path, ".log")
-	offsets, ok := intersectLookups(segBase, lookups)
+	// The cost guard limit is passed IN so it can fire while the candidate set is being
+	// built rather than after: a candidate set covering too much of the segment is cheaper
+	// to read sequentially than to fetch by random offset (a DB planner choosing seq-scan
+	// over index-scan), and materializing it first was work spent only to throw away.
+	// Correctness-neutral either way — scan and pushdown return identical results.
+	offsets, guardTripped, ok := intersectLookups(segBase, lookups, costGuardLimit(seg))
 	if !ok {
 		return scan() // a .tidx was missing/corrupt → degrade to scan
 	}
-	// Cost guard: a candidate set covering too much of the segment is cheaper to read
-	// sequentially than to fetch by random offset — same reasoning as a DB planner
-	// choosing seq-scan over index-scan. Correctness-neutral (scan == pushdown result).
-	if costGuardTrips(seg, len(offsets)) {
+	if guardTripped || costGuardTrips(seg, len(offsets)) {
 		return scan()
 	}
 	// Materialize candidates and re-verify the RESIDUAL predicates — those the index has

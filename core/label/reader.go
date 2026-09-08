@@ -14,6 +14,19 @@ type Reader struct {
 	streams []streamData
 }
 
+// SizeBytes estimates this reader's heap footprint, for the query-side reader cache's
+// memory budget. Label sets are small; the posting lists dominate.
+func (r *Reader) SizeBytes() int64 {
+	total := int64(64)
+	for i := range r.streams {
+		total += int64(len(r.streams[i].offsets)) * 8
+		for _, p := range r.streams[i].set {
+			total += int64(len(p.Key)+len(p.Value)) + 32
+		}
+	}
+	return total
+}
+
 // OpenReader reads and validates a .lidx. A bad magic/version, whole-file CRC mismatch,
 // or a malformed body returns an error so the caller degrades label predicates to a scan
 // (never a wrong answer).

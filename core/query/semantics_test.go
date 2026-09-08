@@ -44,8 +44,8 @@ func TestEmptyLabelSemantics(t *testing.T) {
 		pred qr.Predicate
 		want int
 	}{
-		{`region=""`, qr.LabelEqual{Key: "region", Value: ""}, 1},        // only the no-region record
-		{`region!=""`, qr.LabelNotEqual{Key: "region", Value: ""}, 2},    // the two with region
+		{`region=""`, qr.LabelEqual{Key: "region", Value: ""}, 1},         // only the no-region record
+		{`region!=""`, qr.LabelNotEqual{Key: "region", Value: ""}, 2},     // the two with region
 		{`region!="us"`, qr.LabelNotEqual{Key: "region", Value: "us"}, 2}, // eu + absent (absent==""!=us)
 		{`region="eu"`, qr.LabelEqual{Key: "region", Value: "eu"}, 1},
 	}

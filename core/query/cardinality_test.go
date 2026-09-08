@@ -80,7 +80,7 @@ func TestCardinalityCapMultiSegmentEqualsScan(t *testing.T) {
 	for i := 0; i < 300; i++ {
 		ig.Ingest(model.LogEntry{
 			TS: time.Unix(t0+int64(i%100), 0).UTC(), Level: model.LogLevelInfo,
-			Extra: fmt.Sprintf(`{"region":"r%d"}`, i%10), // 10 distinct values, cap 3/segment
+			Extra:   fmt.Sprintf(`{"region":"r%d"}`, i%10), // 10 distinct values, cap 3/segment
 			Message: fmt.Sprintf("took %dms", (i*7)%1000),
 		})
 	}
