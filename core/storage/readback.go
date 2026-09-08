@@ -144,6 +144,21 @@ func ReadAllRecords(dir string) ([]Record, error) {
 // appending: sealed segments are immutable, and the active segment's already-flushed
 // pages are immutable too (the writer writes whole pages through a separate fd).
 func ScanSegmentTimeRange(path string, start, end int64, visit func(model.LogEntry) bool) error {
+	return ScanSegmentPages(path, start, end, false, nil, visit)
+}
+
+// ScanSegmentPages is ScanSegmentTimeRange with two extra controls used by limited queries.
+//
+// reverse walks pages newest-written first, which for a backward "last N lines" query is
+// the order most likely to fill the caller's result set from pages it will actually keep.
+//
+// skipPage, when non-nil, is consulted with each page's validated time bounds and may
+// return true to skip decoding it entirely — that is where a bounded query prunes pages
+// that cannot beat what it already holds. It is called only AFTER the page's full-page
+// checksum has verified, so a corrupt page degrades (it is skipped as today) rather than
+// feeding bogus bounds into a pruning decision and silently dropping records. The 32-byte
+// header-only fast path is deliberately not used here for that reason.
+func ScanSegmentPages(path string, start, end int64, reverse bool, skipPage func(minTS, maxTS int64) bool, visit func(model.LogEntry) bool) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -154,10 +169,20 @@ func ScanSegmentTimeRange(path string, start, end int64, visit func(model.LogEnt
 		return err
 	}
 	numPages := uint64(info.Size() / PageSize)
+	if numPages <= 1 {
+		return nil // page 0 is the reserved placeholder
+	}
 
 	page := make([]byte, PageSize)
-	for p := uint64(1); p < numPages; p++ {
+	for n := uint64(0); n < numPages-1; n++ {
+		p := 1 + n // ascending
+		if reverse {
+			p = numPages - 1 - n
+		}
 		if _, err := f.ReadAt(page, PageOffset(p)); err != nil {
+			if reverse {
+				continue
+			}
 			break
 		}
 		if err := ValidatePage(page); err != nil {
@@ -166,6 +191,9 @@ func ScanSegmentTimeRange(path string, start, end int64, visit func(model.LogEnt
 		h := decodePageHeader(page[:PageHeaderSize])
 		if h.EntryCount == 0 || h.MaxTS < start || h.MinTS > end {
 			continue // page can't hold an in-window record
+		}
+		if skipPage != nil && skipPage(h.MinTS, h.MaxTS) {
+			continue
 		}
 		endOff := int(h.FreeSpaceOffset)
 		off := PageHeaderSize

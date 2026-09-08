@@ -188,88 +188,106 @@ func (e *Engine) execute(q Query, forceScan bool) ([]model.LogEntry, error) {
 		limit = 100
 	}
 
-	out, err := e.collect(q.Preds, start, end, forceScan)
-	if err != nil {
-		return out, err
+	// A bounded top-K accumulator rather than collect-everything-then-sort. Append order
+	// within a page is NOT time order (out-of-order arrivals), so the result still has to
+	// be ordered — but only the best `limit` records need to be kept while doing it, and
+	// knowing the worst of those lets whole segments and pages be skipped. entryLess is the
+	// ordering; see collect.go for why it must be total.
+	acc := newTopK(limit, q.Direction)
+	if err := e.collectInto(acc, q.Preds, start, end, forceScan, q.Direction); err != nil {
+		return acc.results(), err
 	}
-
-	// Global sort because append order within a page is NOT guaranteed to be time order
-	// (out-of-order arrivals, §16); then apply the limit. Equal timestamps are broken
-	// deterministically by client-visible content (message, then labels) so the result
-	// set is stable regardless of how records are partitioned across shards — the fan-in
-	// invariant (sharded == single-shard) then holds even at a limit boundary, and a
-	// given query returns the same result run to run.
-	sort.SliceStable(out, func(i, j int) bool {
-		ti, tj := out[i].TS.UnixNano(), out[j].TS.UnixNano()
-		if ti != tj {
-			if q.Direction == Forward {
-				return ti < tj
-			}
-			return ti > tj
-		}
-		if out[i].Message != out[j].Message {
-			return out[i].Message < out[j].Message
-		}
-		return out[i].Extra < out[j].Extra
-	})
-	if len(out) > limit {
-		out = out[:limit]
-	}
-	return out, nil
+	return acc.results(), nil
 }
 
 // collect returns every record in [start, end] matching preds (no sort, no limit), using
-// pushdown per segment where possible. It is the shared entry source for log queries
-// (Execute) and metric queries (ExecuteMetric).
+// pushdown per segment where possible. The metric path uses this: its aggregations need
+// EVERY entry in the window, so it must never be given a bounded accumulator.
 func (e *Engine) collect(preds []Predicate, start, end int64, forceScan bool) ([]model.LogEntry, error) {
-	var out []model.LogEntry
+	acc := &sliceCollector{}
+	err := e.collectInto(acc, preds, start, end, forceScan, Backward)
+	return acc.results(), err
+}
+
+// collectInto drives every shard into acc. When acc is bounded it also prunes: segments are
+// visited in the query's direction so the accumulator fills with the best records first,
+// and a segment whose time bounds cannot beat the current cutoff is skipped outright.
+func (e *Engine) collectInto(acc collector, preds []Predicate, start, end int64, forceScan bool, dir Direction) error {
 	for _, sh := range e.shards {
-		recs, err := e.collectShard(sh, preds, start, end, forceScan)
-		if err != nil {
-			return out, err
+		if err := e.collectShardInto(acc, sh, preds, start, end, forceScan, dir); err != nil {
+			return err
 		}
-		out = append(out, recs...)
 	}
-	return out, nil
+	return nil
 }
 
 // collectShard collects one shard's matching records, resolved with THAT shard's service
 // dictionary. The metric evaluator uses this so it can annotate each shard's entries with
 // the correct (per-shard) resolver before merging into cross-shard streams.
 func (e *Engine) collectShard(sh Shard, preds []Predicate, start, end int64, forceScan bool) ([]model.LogEntry, error) {
+	acc := &sliceCollector{}
+	err := e.collectShardInto(acc, sh, preds, start, end, forceScan, Backward)
+	return acc.results(), err
+}
+
+func (e *Engine) collectShardInto(acc collector, sh Shard, preds []Predicate, start, end int64, forceScan bool, dir Direction) error {
 	r := e.resolverFor(sh)
-	q := Query{Preds: preds} // querySegment only reads q.Preds
-	var out []model.LogEntry
-	for _, seg := range sh.Manifest().Filter(start, end) {
-		recs, err := e.querySegment(seg, q, start, end, r, forceScan)
-		if err != nil {
-			return out, err
+	q := Query{Preds: preds, Direction: dir}
+
+	segs := sh.Manifest().Filter(start, end)
+	// Filter returns MinTS-ascending. Out-of-order arrivals widen bounds, so MinTS order is
+	// NOT MaxTS order — visiting in the wrong order would fill the accumulator with records
+	// that are then all displaced, defeating the pruning. Sort by the bound that actually
+	// governs the direction. Cheap: this is a handful of segments, not records.
+	ordered := make([]*storage.SegmentMeta, len(segs))
+	copy(ordered, segs)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		if dir == Forward {
+			return ordered[i].MinTS < ordered[j].MinTS
 		}
-		out = append(out, recs...)
+		return ordered[i].MaxTS > ordered[j].MaxTS
+	})
+
+	for _, seg := range ordered {
+		if cut, ok := acc.cutoff(); ok && segmentCannotBeat(seg.MinTS, seg.MaxTS, cut, dir) {
+			// Every remaining segment is ordered no better than this one, so nothing after
+			// it can beat the cutoff either.
+			break
+		}
+		if err := e.querySegment(acc, seg, q, start, end, r, forceScan); err != nil {
+			return err
+		}
 	}
-	return out, nil
+	return nil
 }
 
 // querySegment returns the records in one segment matching the query. It uses index
 // pushdown when the planner finds pushable predicates and the segment is indexed;
 // otherwise (or on any .tidx error) it scans. Either way the survivors are re-verified
 // against the FULL predicate set, so the two paths return identical results.
-func (e *Engine) querySegment(seg *storage.SegmentMeta, q Query, start, end int64, r Resolver, forceScan bool) ([]model.LogEntry, error) {
-	var recs []model.LogEntry
-	keepAll := func(rec model.LogEntry) {
-		if matchAll(q.Preds, rec, r) {
-			recs = append(recs, rec)
+func (e *Engine) querySegment(acc collector, seg *storage.SegmentMeta, q Query, start, end int64, r Resolver, forceScan bool) error {
+	scan := func() error {
+		// Walk pages in the query's direction so a bounded accumulator fills from the pages
+		// it will actually keep, and prune pages that cannot beat what it already holds.
+		// Page bounds are only consulted after ValidatePage, so a corrupt page is skipped
+		// rather than feeding a bogus bound into the pruning decision.
+		//
+		// Pruning is per page, never per record: append order within a page is NOT time
+		// order, so stopping mid-page on a count would drop records.
+		skipPage := func(minTS, maxTS int64) bool {
+			cut, ok := acc.cutoff()
+			return ok && segmentCannotBeat(minTS, maxTS, cut, q.Direction)
 		}
-	}
-	scan := func() ([]model.LogEntry, error) {
-		recs = recs[:0]
 		// The scan path always re-verifies the FULL predicate set: nothing has been proven
 		// by an index here, so residuals must not be used.
-		err := storage.ScanSegmentTimeRange(seg.Path, start, end, func(rec model.LogEntry) bool {
-			keepAll(rec)
-			return true
-		})
-		return recs, skipIfGone(err)
+		err := storage.ScanSegmentPages(seg.Path, start, end, q.Direction == Backward, skipPage,
+			func(rec model.LogEntry) bool {
+				if matchAll(q.Preds, rec, r) {
+					acc.add(rec)
+				}
+				return true
+			})
+		return skipIfGone(err)
 	}
 
 	if forceScan {
@@ -302,11 +320,11 @@ func (e *Engine) querySegment(seg *storage.SegmentMeta, q Query, start, end int6
 			return true
 		}
 		if matchAll(residuals, rec, r) {
-			recs = append(recs, rec)
+			acc.add(rec)
 		}
 		return true
 	})
-	return recs, skipIfGone(err)
+	return skipIfGone(err)
 }
 
 // skipIfGone turns a "segment file no longer exists" error into a clean empty result:
