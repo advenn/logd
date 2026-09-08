@@ -34,11 +34,18 @@ type plannedLookup struct {
 // segment (active or crash-recovered) pushes nothing. A predicate whose field/key isn't
 // indexed here is left as a residual (handled by the full re-verify), which keeps
 // pushdown results identical to scan. Returns nil to mean "scan this segment".
-func (e *Engine) plan(seg *storage.SegmentMeta, preds []Predicate) []plannedLookup {
+// It also returns the RESIDUAL predicates: those the index has not already proven. A
+// predicate is settled (and so omitted from the residuals) only when the index answer is
+// exact — see losslessKind. Settled predicates are skipped during re-verify on the
+// index-fetch path, which is where the Aho-Corasick re-extraction cost lived; they are
+// never skipped on any scan fallback, where nothing has been proven.
+func (e *Engine) plan(seg *storage.SegmentMeta, preds []Predicate) ([]plannedLookup, []Predicate) {
 	if !seg.Indexed {
-		return nil
+		return nil, preds
 	}
 	var lookups []plannedLookup
+	var residuals []Predicate
+	keepResidual := func(p Predicate) { residuals = append(residuals, p) }
 	for _, p := range preds {
 		switch pred := p.(type) {
 		case TypedCompare:
@@ -48,9 +55,16 @@ func (e *Engine) plan(seg *storage.SegmentMeta, preds []Predicate) []plannedLook
 			// cross-kind (mistyped) predicate must NOT push — the key would be encoded in
 			// the wrong kind-space. Left as a residual, the scan path handles it.
 			if pred.Op == OpNe || !ok || pred.Value.Kind != kind {
+				keepResidual(p)
 				continue
 			}
-			field, run := pred.Field, typedRun(pred)
+			// A lossless kind's key IS the value, and with exact (non-widened) bounds the
+			// lookup returns precisely the matching records — so the predicate is proven
+			// and needs no re-extraction. A lossy str key stays a residual.
+			if !losslessKind(kind) {
+				keepResidual(p)
+			}
+			field, run := pred.Field, typedRun(pred, losslessKind(kind))
 			lookups = append(lookups, plannedLookup{run: func(segBase string) ([]uint64, bool) {
 				r, err := index.OpenReader(index.TidxPath(segBase, field))
 				if err != nil {
@@ -59,6 +73,10 @@ func (e *Engine) plan(seg *storage.SegmentMeta, preds []Predicate) []plannedLook
 				return run(r), true
 			}})
 		case LineContains:
+			// Always a residual. The existence index would very likely settle it, but
+			// re-verifying is a strings.Contains that never touches the extraction engine,
+			// so there is no cost to recover and no reason to take the risk.
+			keepResidual(p)
 			if e.ex == nil {
 				continue
 			}
@@ -82,6 +100,11 @@ func (e *Engine) plan(seg *storage.SegmentMeta, preds []Predicate) []plannedLook
 			// index (only records that HAVE k) can't surface. LabelNotEqual is a residual.
 			// A key whose value-cardinality cap breached in this segment has over-cap
 			// values only in Extra, not the index — pushing it would miss them, so scan.
+			// Always a residual: after the single-key resolver change a label compare is
+			// ~200ns and allocation-free, so settling it from the index would trade a real
+			// (if small) divergence risk — the index was built at ingest under the then-
+			// current allowlist — for no measurable gain.
+			keepResidual(p)
 			if model.IsReservedLabelKey(pred.Key) || pred.Value == "" || !e.labelAllowed(pred.Key) || segCapped(seg, pred.Key) {
 				continue
 			}
@@ -93,25 +116,46 @@ func (e *Engine) plan(seg *storage.SegmentMeta, preds []Predicate) []plannedLook
 				}
 				return r.LabelOffsets(key, value), true
 			}})
+		default:
+			keepResidual(p) // no pushdown case for this type: always re-verified
 		}
 	}
 	if len(lookups) == 0 {
-		return nil
+		return nil, preds
 	}
-	return lookups
+	return lookups, residuals
 }
 
-// typedRun builds the reader-level lookup for a typed comparison, with bounds widened
-// inclusively so a lossy str key equal to the bound is never dropped (re-verify filters
-// > vs >=).
-func typedRun(pred TypedCompare) func(r *index.Reader) []uint64 {
+// losslessKind reports whether a kind's 16-byte index key preserves the value exactly, so
+// an index hit is proof the predicate holds and re-verification is redundant.
+//
+// int is a sign-flipped int64 and float an IEEE-754 total-order transform (both bijective
+// in 8 bytes with 8 bytes of padding); uuid IS the 16 raw bytes. Only str is lossy — it is
+// a truncated 16-byte prefix, which is precisely why re-verify exists (core/index/key.go).
+func losslessKind(k index.ValueKind) bool {
+	return k == index.KindInt || k == index.KindFloat || k == index.KindUUID
+}
+
+// typedRun builds the reader-level lookup for a typed comparison.
+//
+// For a LOSSY (str) kind the bounds are widened inclusively so a truncated key equal to the
+// bound is never dropped, and re-verify then filters > from >=. For a LOSSLESS kind the key
+// is the exact value, so the strict bound can be used directly — the lookup returns
+// precisely the matching records and no re-verification is needed.
+func typedRun(pred TypedCompare, lossless bool) func(r *index.Reader) []uint64 {
 	key := index.EncodeKey(pred.Value)
 	switch pred.Op {
 	case OpEq:
 		return func(r *index.Reader) []uint64 { return r.LookupEqual(key) }
-	case OpGt, OpGe:
+	case OpGt:
+		incLo := !lossless // lossy: keep the bound, re-verify drops equals
+		return func(r *index.Reader) []uint64 { return r.LookupRange(key, maxKey, incLo, true) }
+	case OpGe:
 		return func(r *index.Reader) []uint64 { return r.LookupRange(key, maxKey, true, true) }
-	case OpLt, OpLe:
+	case OpLt:
+		incHi := !lossless
+		return func(r *index.Reader) []uint64 { return r.LookupRange(zeroKey, key, true, incHi) }
+	case OpLe:
 		return func(r *index.Reader) []uint64 { return r.LookupRange(zeroKey, key, true, true) }
 	default:
 		return func(*index.Reader) []uint64 { return nil }
@@ -231,7 +275,7 @@ func (e *Engine) Explain(q Query) []SegmentPlan {
 	var plans []SegmentPlan
 	for _, sh := range e.shards {
 		for _, seg := range sh.Manifest().Filter(q.Start, end) {
-			lookups := e.plan(seg, q.Preds)
+			lookups, _ := e.plan(seg, q.Preds)
 			if lookups == nil {
 				plans = append(plans, SegmentPlan{SegmentID: seg.ID, Mode: "scan"})
 				continue

@@ -245,15 +245,17 @@ func (e *Engine) collectShard(sh Shard, preds []Predicate, start, end int64, for
 // against the FULL predicate set, so the two paths return identical results.
 func (e *Engine) querySegment(seg *storage.SegmentMeta, q Query, start, end int64, r Resolver, forceScan bool) ([]model.LogEntry, error) {
 	var recs []model.LogEntry
-	keep := func(rec model.LogEntry) {
+	keepAll := func(rec model.LogEntry) {
 		if matchAll(q.Preds, rec, r) {
 			recs = append(recs, rec)
 		}
 	}
 	scan := func() ([]model.LogEntry, error) {
 		recs = recs[:0]
+		// The scan path always re-verifies the FULL predicate set: nothing has been proven
+		// by an index here, so residuals must not be used.
 		err := storage.ScanSegmentTimeRange(seg.Path, start, end, func(rec model.LogEntry) bool {
-			keep(rec)
+			keepAll(rec)
 			return true
 		})
 		return recs, skipIfGone(err)
@@ -262,7 +264,7 @@ func (e *Engine) querySegment(seg *storage.SegmentMeta, q Query, start, end int6
 	if forceScan {
 		return scan()
 	}
-	lookups := e.plan(seg, q.Preds)
+	lookups, residuals := e.plan(seg, q.Preds)
 	if lookups == nil {
 		return scan() // nothing pushable, or non-indexed segment
 	}
@@ -277,14 +279,18 @@ func (e *Engine) querySegment(seg *storage.SegmentMeta, q Query, start, end int6
 	if costGuardTrips(seg, len(offsets)) {
 		return scan()
 	}
-	// Materialize candidates and re-verify exactly (lossy keys mean the .tidx set is a
-	// superset). The per-record time filter is applied here because .tidx offsets are
-	// not time-pruned.
+	// Materialize candidates and re-verify the RESIDUAL predicates — those the index has
+	// not already proven. A predicate settled by an exact (lossless-kind) lookup is
+	// skipped here, which is what removes the per-candidate re-extraction; everything else
+	// is still checked exactly, so a lossy key's false positives are filtered as before.
+	// The per-record time filter is applied here because .tidx offsets are not time-pruned.
 	err := storage.FetchRecords(seg.Path, offsets, func(rec model.LogEntry) bool {
 		if ts := rec.TS.UnixNano(); ts < start || ts > end {
 			return true
 		}
-		keep(rec)
+		if matchAll(residuals, rec, r) {
+			recs = append(recs, rec)
+		}
 		return true
 	})
 	return recs, skipIfGone(err)
