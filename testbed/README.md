@@ -83,53 +83,85 @@ VictoriaLogs  _stream:{app="checkout"} "took=" | extract "took=<latency_ms>ms" |
 Loki's line filter `|= "took="` is deliberately included. Omitting it would sandbag Loki,
 and the first reader would say so.
 
-### Query latency — it depends entirely on selectivity (500,000 lines)
+### Query latency — 500,000 lines
 
-500,000 lines, 12–15 interleaved samples per engine, medians. Every row verified to return
-the identical result set from all engines first.
+Medians of 10–15 interleaved samples per engine. Every row verified to return the identical
+result set from all engines first.
 
 | `latency_ms >` | rows | logd (index) | logd (scan) | Loki (`pattern`) | Loki (`regexp`) | vs Loki |
 |---|---|---|---|---|---|---|
-| 200 | 26,996 (5.4%) | 386 ms | 3320 ms | 369 ms | 450 ms | **0.96× — tied** |
-| 1000 | 3,935 (0.79%) | 110 ms | 3152 ms | 241 ms | 317 ms | **2.2×** |
-| 3000 | 1,046 (0.21%) | 77 ms | 3155 ms | 239 ms | 299 ms | **3.1×** |
-| 5000 | 482 (0.10%) | 61 ms | 2967 ms | 207 ms | 298 ms | **3.4×** |
+| 200 | 26,996 (5.4%) | **151 ms** | 1665 ms | 435 ms | 530 ms | **2.9×** |
+| 1000 | 3,935 (0.79%) | **56 ms** | 1732 ms | 344 ms | 441 ms | **6.1×** |
+| 3000 | 1,046 (0.21%) | **41 ms** | 1681 ms | 307 ms | 398 ms | **7.5×** |
+| 5000 | 482 (0.10%) | **38 ms** | 1681 ms | 304 ms | 388 ms | **8.0×** |
 
-**The shape is the result, not any single row.** logd's time tracks the size of the
-*answer* (386 → 61 ms as the result set shrinks 56×). Loki's is comparatively flat
-(369 → 207 ms) because it re-scans and re-parses every line regardless of how few match.
-logd's own forced-scan column is flat too (~3000 ms), which confirms that flatness is the
-signature of scanning rather than anything specific to Loki.
+**The shape is the result.** logd's time tracks the size of the *answer* (151 → 38 ms as the
+result set shrinks 56×). Loki's is comparatively flat (435 → 304 ms) because it re-scans and
+re-parses every line regardless of how few match. logd's own forced-scan column is flat too
+(~1700 ms), confirming flatness is the signature of scanning rather than anything specific
+to Loki.
 
-That is precisely what the typed index is for: converting work proportional to the *data*
-into work proportional to the *answer*.
+That is what the typed index is for: converting work proportional to the *data* into work
+proportional to the *answer*.
 
-**Where logd does not win.** At 5.4% selectivity it is a tie. Returning 27,000 rows means
-JSON serialization dominates both engines equally and the index advantage is swamped. If
-your queries routinely match millions of lines, this index buys you nothing — the win is in
-needle-in-haystack lookups, which is what a typed range index is for.
+⚠️ These numbers post-date a round of read-path optimization (see *Optimization history*).
+An earlier measurement had logd at 386 ms for the 5.4% row — a **tie** with Loki — because
+the query was dominated by result serialization rather than lookup. Loki's own numbers also
+moved between the two runs (369 → 435 ms at 5.4%), so treat the cross-engine ratios as
+same-run comparisons only, not as evidence about Loki.
 
-Against Loki's `| regexp` form — what most people actually type — logd is 4.9× at the
-selective end.
+### "Last N lines" — the query every Explore session opens with
+
+| limit | logd | Loki |
+|---|---|---|
+| 1 | 14.4 ms | 13.8 ms |
+| 100 | **16.4 ms** | 14.3 ms |
+| 1000 | 21.1 ms | 15.7 ms |
+
+This was logd's worst result by a wide margin — **1558 ms against Loki's 15 ms**, a ~100×
+gap — because the engine collected every matching record, sorted all of them, and only then
+applied the limit. It is now at parity.
 
 ### logd vs itself (500,000 lines)
 
-The cross-engine numbers above always invite "you configured Loki wrong". This one cannot:
-same binary, same data, same page cache, one variable — whether the `.tidx` is consulted.
+The cross-engine numbers always invite "you configured Loki wrong". This one cannot: same
+binary, same data, same page cache, one variable — whether the `.tidx` is consulted.
 
 | `latency_ms >` | index | forced scan | speedup |
 |---|---|---|---|
-| 200 | 386 ms | 3320 ms | **8.6×** |
-| 1000 | 110 ms | 3152 ms | **28.6×** |
-| 3000 | 77 ms | 3155 ms | **41.2×** |
-| 5000 | 61 ms | 2967 ms | **48.9×** |
+| 200 | 151 ms | 1665 ms | **11×** |
+| 1000 | 56 ms | 1732 ms | **31×** |
+| 3000 | 41 ms | 1681 ms | **41×** |
+| 5000 | 38 ms | 1681 ms | **44×** |
 
 `make compare` runs this and refuses to print timings if the two paths disagree on a row.
 
-At the 50,000-line scale the index narrowed 50,000 records to 2,824 candidates, then
-re-verified down to the exact 2,806. The 18 extra are lossy-key false positives that the
-re-verify pass removes — by design, the index over-approximates and is never trusted for
-the final answer.
+### Optimization history
+
+The read path was profiled and reworked in four commits. Benchmarks are
+`core/query/bench_test.go` (200k records, medians of 3):
+
+| | LabelOnly/100 | LabelOnly/1 | TypedSelective | TypedBroad |
+|---|---|---|---|---|
+| baseline | 426 ms | 436 ms | 26 ms | 781 ms |
+| single-key label resolution | 262 | 244 | 22 | 651 |
+| index reader cache + cost guard | 156 | 156 | 10 | 479 |
+| **limit pushdown** | **9.3** | **9.4** | **9.8** | **37** |
+
+What each fixed, in order of how much it mattered:
+
+1. **The limit was never pushed down.** `execute` collected every match, sorted, then
+   truncated — so `limit=1` cost the same as `limit=100`. Now a bounded top-K accumulator
+   prunes whole segments and pages that cannot beat what it already holds.
+2. **No index reader cache.** Every query re-read and re-decoded each sidecar from disk, per
+   segment *per predicate* — 7.2 MB for one field's `.tidx` here. That, not the sort, is why
+   a broad indexed query used to be *slower* than the scan it fell back to.
+3. **The label blob was JSON-parsed per record, per predicate** (28.7% of query CPU),
+   building a whole map to read one key. A single-key scanner is ~21× faster and
+   allocation-free.
+4. **Re-verification re-extracted every candidate** (20.6% of CPU), re-running Aho-Corasick
+   to re-derive what the index already knew. Skipped now for int/float/uuid, whose 16-byte
+   keys are exact; `str` keys are lossy prefixes and still re-verify.
 
 ### Storage — logd loses, clearly (50,000 lines)
 
@@ -173,8 +205,12 @@ Loki and VictoriaLogs do and what shippers already expect. Pinned by
 Read these before quoting any number above.
 
 - **Selectivity decides the answer.** Quoting one speedup figure for "logd vs Loki" is
-  meaningless — the same corpus gives 0.96× and 3.4× depending only on how many rows match.
+  meaningless — the same corpus gives 2.9× and 8.0× depending only on how many rows match.
   Quote the table, or quote nothing.
+- **The cross-engine numbers come from separate runs.** Loki's own timings moved between
+  measurement rounds (369 → 435 ms on the same query and corpus), so a ratio that improved
+  is not by itself evidence that logd improved — the logd-vs-itself column and the
+  `core/query` benchmarks are the controlled comparisons.
 - **500,000 lines is still modest**, and one node. Both engines fit the working set in
   page cache, so none of this says anything about behaviour at disk-bound scale.
 - **Shared dev box**, other containers running throughout. Latency figures are medians of
