@@ -86,7 +86,7 @@ type Writer struct {
 	labelBuf   *label.Builder     // per-active-segment label index (stream dict + postings), flushed at seal
 	card       *label.Cardinality // per-active-segment value-cardinality cap (§6.2)
 	segRecords uint64             // record count of the active segment (for the cost guard), reset on rotate
-	compressed int                // sealed segments successfully compressed (diagnostics)
+	compressWG sync.WaitGroup     // in-flight background segment compressions
 	lastSync   time.Time          // when the active segment was last fsynced (group commit)
 	needsSync  bool               // a page has been written but not yet fsynced
 
@@ -417,6 +417,9 @@ func (w *Writer) shutdown(graceful bool) {
 		if w.idxWriter != nil {
 			w.idxWriter.Close()
 		}
+		// Even on a simulated crash, wait for any background compression: it must not
+		// outlive the Writer and race a test (or a restart) that reopens the directory.
+		w.compressWG.Wait()
 		return
 	}
 
@@ -432,6 +435,11 @@ func (w *Writer) shutdown(graceful bool) {
 		}
 	}
 	w.persistLookup()
+	// Drain background compressions LAST, so Close is a real barrier: when it returns,
+	// no goroutine is still rewriting a segment under the caller's feet. Each rewrite is
+	// atomic, so being interrupted would not corrupt anything — but a test that inspects
+	// the directory right after Close deserves a settled answer.
+	w.compressWG.Wait()
 }
 
 // ---- writer goroutine ----
@@ -883,16 +891,22 @@ func (w *Writer) sealCurrentSegment() error {
 		return err
 	}
 
-	// Compress LAST, after the manifest already describes a complete sealed segment. The
-	// rewrite is atomic (write + fsync + rename, then unlink the raw file), so a crash
-	// during it leaves either the raw file or the compressed one — never neither, and the
-	// reader prefers whichever exists. A failure here is logged and left raw rather than
-	// failing the seal: the segment is already durable and queryable either way.
-	if ok, err := CompressSegment(segPath, w.opts.BlockPages); err != nil {
-		log.Printf("storage: compressing %s (left uncompressed): %v", segPath, err)
-	} else if ok {
-		w.compressed++
-	}
+	// Compress OFF the writer goroutine. Inline, it doubled ingest latency on a 500k load
+	// (6.2s -> 12.7s): a seal blocked every subsequent write while ~64MB was deflated.
+	//
+	// Deferring is safe because the segment is already durable, already in the manifest and
+	// already queryable in its raw form, and the rewrite itself is atomic (write + fsync +
+	// rename, then unlink the raw file). Readers prefer .logz and fall back to .log, so the
+	// segment reads correctly before, during and after — or forever, if the process dies
+	// first and it is simply never compressed. A failure leaves it raw rather than failing
+	// the seal.
+	w.compressWG.Add(1)
+	go func() {
+		defer w.compressWG.Done()
+		if _, err := CompressSegment(segPath, w.opts.BlockPages); err != nil && !os.IsNotExist(err) {
+			log.Printf("storage: compressing %s (left uncompressed): %v", segPath, err)
+		}
+	}()
 	return nil
 }
 
