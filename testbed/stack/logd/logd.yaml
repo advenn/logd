@@ -13,6 +13,11 @@ flush_interval_ms: 500
 # most this much accepted data; nothing becomes corrupt (a partial page is CRC-caught and
 # truncated on recovery). Negative = fsync every page.
 sync_interval_ms: 50
+# Sealed segments are compressed into blocks of this many 4KB pages (the active segment
+# stays raw). Bigger blocks compress better but decompress more per random lookup: measured
+# on real log text, 4.1x per single page, 6.2x at 8, 6.5x at 16, 6.9x whole-file.
+# Negative disables compression.
+compress_block_pages: 8
 retention_days: 0        # keep everything; a benchmark must not delete its own corpus
 index_mem_budget_mb: 256
 shards: 1

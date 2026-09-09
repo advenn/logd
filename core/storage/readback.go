@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"os"
 	"sort"
 
 	"github.com/advenn/logd/core/model"
@@ -21,11 +20,11 @@ func FetchRecords(path string, offsets []uint64, visit func(model.LogEntry) bool
 	copy(sorted, offsets)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 
-	f, err := os.Open(path)
+	src, err := openPageSource(path)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer src.Close()
 
 	page := make([]byte, PageSize)
 	curPage := ^uint64(0) // sentinel: no page loaded
@@ -35,7 +34,7 @@ func FetchRecords(path string, offsets []uint64, visit func(model.LogEntry) bool
 		if pageNum != curPage {
 			curPage = pageNum
 			pageOK = false
-			if _, err := f.ReadAt(page, PageOffset(pageNum)); err == nil {
+			if err := src.readPage(pageNum, page); err == nil {
 				pageOK = ValidatePage(page) == nil
 			}
 		}
@@ -81,22 +80,17 @@ func ReadAll(dir string) ([]model.LogEntry, error) {
 
 // readSegmentEntries reads all decodable entries from one segment file, read-only.
 func readSegmentEntries(path string) ([]model.LogEntry, error) {
-	f, err := os.Open(path)
+	src, err := openPageSource(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	numPages := uint64(info.Size() / PageSize)
+	defer src.Close()
+	numPages := src.numPages()
 
 	var out []model.LogEntry
 	page := make([]byte, PageSize)
 	for p := uint64(1); p < numPages; p++ { // page 0 is the placeholder
-		if _, err := f.ReadAt(page, PageOffset(p)); err != nil {
+		if err := src.readPage(p, page); err != nil {
 			break
 		}
 		if err := ValidatePage(page); err != nil {
@@ -159,16 +153,12 @@ func ScanSegmentTimeRange(path string, start, end int64, visit func(model.LogEnt
 // feeding bogus bounds into a pruning decision and silently dropping records. The 32-byte
 // header-only fast path is deliberately not used here for that reason.
 func ScanSegmentPages(path string, start, end int64, reverse bool, skipPage func(minTS, maxTS int64) bool, visit func(model.LogEntry) bool) error {
-	f, err := os.Open(path)
+	src, err := openPageSource(path)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	numPages := uint64(info.Size() / PageSize)
+	defer src.Close()
+	numPages := src.numPages()
 	if numPages <= 1 {
 		return nil // page 0 is the reserved placeholder
 	}
@@ -179,7 +169,7 @@ func ScanSegmentPages(path string, start, end int64, reverse bool, skipPage func
 		if reverse {
 			p = numPages - 1 - n
 		}
-		if _, err := f.ReadAt(page, PageOffset(p)); err != nil {
+		if err := src.readPage(p, page); err != nil {
 			if reverse {
 				continue
 			}
@@ -215,21 +205,17 @@ func ScanSegmentPages(path string, start, end int64, reverse bool, skipPage func
 }
 
 func readSegmentRecords(path string) ([]Record, error) {
-	f, err := os.Open(path)
+	src, err := openPageSource(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	numPages := uint64(info.Size() / PageSize)
+	defer src.Close()
+	numPages := src.numPages()
 
 	var out []Record
 	page := make([]byte, PageSize)
 	for p := uint64(1); p < numPages; p++ {
-		if _, err := f.ReadAt(page, PageOffset(p)); err != nil {
+		if err := src.readPage(p, page); err != nil {
 			break
 		}
 		if err := ValidatePage(page); err != nil {

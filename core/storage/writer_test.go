@@ -370,9 +370,20 @@ func TestRetentionDeletesSealedSegments(t *testing.T) {
 	if len(recs) != 30 {
 		t.Fatalf("after retention: got %d records, want 30 (the recent ones)", len(recs))
 	}
-	// Old segments' files are gone.
-	if logs, _ := filepath.Glob(filepath.Join(dir, "segments", "*.log")); len(logs) != 1 {
-		t.Fatalf("expected 1 surviving segment file, got %d", len(logs))
+	// Old segments' files are gone. Counted across BOTH extensions: a sealed segment is
+	// rewritten to .logz, so counting only .log would pass for the wrong reason (or, as
+	// here, fail for one) the moment compression is enabled.
+	raw, _ := filepath.Glob(filepath.Join(dir, "segments", "*.log"))
+	comp, _ := filepath.Glob(filepath.Join(dir, "segments", "*.logz"))
+	if len(raw)+len(comp) != 1 {
+		t.Fatalf("expected 1 surviving segment file, got %d raw + %d compressed", len(raw), len(comp))
+	}
+	// A segment must never be left as both: the compressed rewrite unlinks the raw file
+	// only after the sidecar is durable, so seeing both means that sequence broke.
+	for _, c := range comp {
+		if _, err := os.Stat(strings.TrimSuffix(c, ".logz") + ".log"); err == nil {
+			t.Errorf("%s has both a raw and a compressed file", c)
+		}
 	}
 }
 
