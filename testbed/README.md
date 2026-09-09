@@ -83,55 +83,76 @@ VictoriaLogs  _stream:{app="checkout"} "took=" | extract "took=<latency_ms>ms" |
 Loki's line filter `|= "took="` is deliberately included. Omitting it would sandbag Loki,
 and the first reader would say so.
 
-### Query latency — 500,000 lines
+### Query latency — 500,000 lines, all three fed identically
 
-Medians of 10–15 interleaved samples per engine. Every row verified to return the identical
-result set from all engines first.
+Medians of 7 runs, 3 warm-ups discarded. Every row verified to return the identical result
+set from all three first (26,996 / 3,935 / 1,046 / 482 — matching the manifest exactly).
 
-| `latency_ms >` | rows | logd (index) | logd (scan) | Loki (`pattern`) | Loki (`regexp`) | vs Loki |
-|---|---|---|---|---|---|---|
-| 200 | 26,996 (5.4%) | **151 ms** | 1665 ms | 435 ms | 530 ms | **2.9×** |
-| 1000 | 3,935 (0.79%) | **56 ms** | 1732 ms | 344 ms | 441 ms | **6.1×** |
-| 3000 | 1,046 (0.21%) | **41 ms** | 1681 ms | 307 ms | 398 ms | **7.5×** |
-| 5000 | 482 (0.10%) | **38 ms** | 1681 ms | 304 ms | 388 ms | **8.0×** |
+**Typed range over a value inside unstructured text** — the differentiator:
 
-**The shape is the result.** logd's time tracks the size of the *answer* (151 → 38 ms as the
-result set shrinks 56×). Loki's is comparatively flat (435 → 304 ms) because it re-scans and
-re-parses every line regardless of how few match. logd's own forced-scan column is flat too
-(~1700 ms), confirming flatness is the signature of scanning rather than anything specific
-to Loki.
+| `latency_ms >` | rows | logd | Loki | VictoriaLogs |
+|---|---|---|---|---|
+| 200 | 26,996 (5.4%) | 230 ms | 703 ms | **145 ms** |
+| 1000 | 3,935 (0.79%) | **128 ms** | 455 ms | 148 ms |
+| 3000 | 1,046 (0.21%) | **71 ms** | 411 ms | 133 ms |
+| 5000 | 482 (0.10%) | **69 ms** | 391 ms | 124 ms |
 
-That is what the typed index is for: converting work proportional to the *data* into work
-proportional to the *answer*.
+**VictoriaLogs is the real competitor here, not Loki.** It is flat and fast across the whole
+sweep (124–148 ms) — it is clearly not brute-forcing the way Loki is (703 → 391 ms). logd
+only wins once the query is *selective*: it is 1.8× faster at 0.10% but **loses at 5.4%**.
+The honest summary is that logd beats Loki everywhere by 3–5.7×, and beats VictoriaLogs only
+on needle-in-haystack lookups.
 
-⚠️ These numbers post-date a round of read-path optimization (see *Optimization history*).
-An earlier measurement had logd at 386 ms for the 5.4% row — a **tie** with Loki — because
-the query was dominated by result serialization rather than lookup. Loki's own numbers also
-moved between the two runs (369 → 435 ms at 5.4%), so treat the cross-engine ratios as
-same-run comparisons only, not as evidence about Loki.
+logd's time tracks the size of the *answer* (230 → 69 ms as the result shrinks 56×), which
+is what the typed index is for. Loki's tracks the size of the *data*. VictoriaLogs' tracks
+neither, which is worth understanding before claiming a win over it.
 
-### "Last N lines" — the query every Explore session opens with
+**"Last N lines"** — the query every Explore session opens with:
 
-| limit | logd | Loki |
+| limit | logd | Loki | VictoriaLogs |
+|---|---|---|---|
+| 1 | 29.3 ms | **21.2 ms** | 48.8 ms |
+| 100 | 26.2 ms | **24.9 ms** | 53.2 ms |
+| 1000 | **25.1 ms** | 27.4 ms | 70.6 ms |
+
+Effectively a three-way tie. This was logd's worst result by far — **1558 ms against Loki's
+15 ms** — before the limit was pushed down.
+
+### Ingest — logd's weakest result
+
+Identical 500 requests of 1,000 entries, closed-loop, zero retries everywhere:
+
+| | accept time | vs logd |
 |---|---|---|
-| 1 | 14.4 ms | 13.8 ms |
-| 100 | **16.4 ms** | 14.3 ms |
-| 1000 | 21.1 ms | 15.7 ms |
+| VictoriaLogs | **2.18 s** | 27× faster |
+| Loki | 4.65 s | 13× faster |
+| logd | 59.9 s | — |
 
-This was logd's worst result by a wide margin — **1558 ms against Loki's 15 ms**, a ~100×
-gap — because the engine collected every matching record, sorted all of them, and only then
-applied the limit. It is now at parity.
+Part of this is a real durability difference — logd group-commits whole pages to disk on the
+write path, while Loki holds chunks in memory until a flush threshold — but a 13–27× gap is
+not explained by fsync alone. The write path has not been profiled; all the optimization so
+far went into reads.
 
-### logd vs itself (500,000 lines)
+### Storage — 500,000 identical lines
 
-The cross-engine numbers always invite "you configured Loki wrong". This one cannot: same
-binary, same data, same page cache, one variable — whether the `.tidx` is consulted.
+| | on disk | vs logd |
+|---|---|---|
+| VictoriaLogs | **7.75 MB** | 12× smaller |
+| Loki | 60.1 MB | 1.5× smaller |
+| logd | 92.7 MB | — (82.1 data + 10.6 index) |
+
+logd stores records uncompressed in 4 KB pages. There is no block compression anywhere in
+the write path, and against VictoriaLogs it is not close.
+
+### logd vs itself
+
+The cross-engine numbers always invite "you configured it wrong". This one cannot: same
+binary, same data, same page cache, one variable — whether the `.tidx` is consulted. Earlier
+run, same corpus:
 
 | `latency_ms >` | index | forced scan | speedup |
 |---|---|---|---|
 | 200 | 151 ms | 1665 ms | **11×** |
-| 1000 | 56 ms | 1732 ms | **31×** |
-| 3000 | 41 ms | 1681 ms | **41×** |
 | 5000 | 38 ms | 1681 ms | **44×** |
 
 `make compare` runs this and refuses to print timings if the two paths disagree on a row.
@@ -163,25 +184,11 @@ What each fixed, in order of how much it mattered:
    to re-derive what the index already knew. Skipped now for int/float/uuid, whose 16-byte
    keys are exact; `str` keys are lossy prefixes and still re-verify.
 
-### Storage — logd loses, clearly (50,000 lines)
+### Earlier 50,000-line run
 
-| | on disk | vs logd |
-|---|---|---|
-| VictoriaLogs | **0.81 MB** | 12× smaller |
-| Loki | 5.14 MB | 1.9× smaller |
-| logd | 9.60 MB | — (8.52 data + 1.06 index) |
-
-logd stores records uncompressed in 4 KB pages. There is no block compression anywhere in
-the write path. This is a real, structural disadvantage and it is not close.
-
-### Ingest (50,000 lines)
-
-Both a finding and a fix. The first run showed logd requiring **225 retries** to absorb
-50,000 lines while Loki and VictoriaLogs needed zero, and — worse — storing **169,692 rows
-for 50,000 pushed lines**. See the bug below. After the fix: zero retries, exact counts,
-and end-to-end throughput up from 3,158 to ~10,200–11,100 lines/s.
-
----
+Superseded by the 500k numbers above, but the ingest figures there are what surfaced the
+duplication bug described next: logd needed **225 retries** to absorb 50,000 lines while
+Loki and VictoriaLogs needed zero, and stored **169,692 rows for 50,000 pushed lines**.
 
 ## The bug this harness found on its first real run
 
@@ -204,9 +211,12 @@ Loki and VictoriaLogs do and what shippers already expect. Pinned by
 
 Read these before quoting any number above.
 
-- **Selectivity decides the answer.** Quoting one speedup figure for "logd vs Loki" is
-  meaningless — the same corpus gives 2.9× and 8.0× depending only on how many rows match.
-  Quote the table, or quote nothing.
+- **Selectivity decides the answer, and which competitor you name decides it too.** On the
+  same corpus logd is 3–5.7× faster than Loki at every threshold, but versus VictoriaLogs it
+  ranges from 0.63× (slower, at 5.4%) to 1.8× (faster, at 0.10%). Quote the table, or quote
+  nothing.
+- **logd wins on query, loses on ingest and disk.** A fair summary has to include all three:
+  27× slower to ingest and 12× larger on disk than VictoriaLogs.
 - **The cross-engine numbers come from separate runs.** Loki's own timings moved between
   measurement rounds (369 → 435 ms on the same query and corpus), so a ratio that improved
   is not by itself evidence that logd improved — the logd-vs-itself column and the
