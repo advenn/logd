@@ -19,12 +19,17 @@ import (
 // config package: the elaborate extraction/label config (design §7.1) is a later
 // phase, and the storage engine should not depend on it.
 type Options struct {
-	SegmentSizeBytes    int64             // seal + rotate once the active segment reaches this size
-	FlushInterval       time.Duration     // group-commit cadence for partial pages
-	Schema              []index.FieldType // indexed fields; each segment builds a per-field .tidx for these at seal
-	Retention           time.Duration     // delete sealed segments older than this (0 = keep forever)
-	IndexMemBudget      int64             // seal early when the active segment's in-RAM index exceeds this (0 = no cap)
-	MaxLabelCardinality int               // max distinct values indexed per label key per segment (§6.2; 0 = unlimited)
+	SegmentSizeBytes int64             // seal + rotate once the active segment reaches this size
+	FlushInterval    time.Duration     // group-commit cadence for partial pages
+	Schema           []index.FieldType // indexed fields; each segment builds a per-field .tidx for these at seal
+	Retention        time.Duration     // delete sealed segments older than this (0 = keep forever)
+	IndexMemBudget   int64             // seal early when the active segment's in-RAM index exceeds this (0 = no cap)
+	// SyncInterval bounds how long a written page may sit unsynced. 0 fsyncs every page
+	// (the strongest durability, and by far the slowest: fsync dominates the write path).
+	// A positive value group-commits, trading a bounded loss window for throughput — the
+	// "per page or per N ms" choice design §8 leaves open.
+	SyncInterval        time.Duration
+	MaxLabelCardinality int // max distinct values indexed per label key per segment (§6.2; 0 = unlimited)
 	// Reindex re-derives a record's typed-range keys and label set (the same work the
 	// ingest layer does). If set, crash recovery re-runs it over the recovered segment's
 	// records to rebuild its in-RAM index, so a recovered segment seals fully-indexed
@@ -77,6 +82,8 @@ type Writer struct {
 	labelBuf   *label.Builder     // per-active-segment label index (stream dict + postings), flushed at seal
 	card       *label.Cardinality // per-active-segment value-cardinality cap (§6.2)
 	segRecords uint64             // record count of the active segment (for the cost guard), reset on rotate
+	lastSync   time.Time          // when the active segment was last fsynced (group commit)
+	needsSync  bool               // a page has been written but not yet fsynced
 
 	// liveStreams holds the ACTIVE segment's label streams for immediate discovery
 	// (sealed segments are served from their .lidx). Concurrency-safe: written by the
@@ -448,6 +455,12 @@ func (w *Writer) writerLoop() {
 				}
 				w.resetPage()
 			}
+			// Also the group-commit deadline check, so a page written just before the
+			// stream went quiet cannot sit unsynced indefinitely. The effective loss
+			// window is therefore bounded by SyncInterval + FlushInterval.
+			if err := w.syncIfDue(time.Now()); err != nil {
+				log.Printf("storage: group-commit sync: %v", err)
+			}
 		case <-w.retentionC:
 			// Runs on the writer goroutine so its manifest Save serializes with seal/
 			// flush (no concurrent Save race on the manifest tmp file).
@@ -641,6 +654,38 @@ func (w *Writer) enforceRetention(now time.Time) {
 	}
 }
 
+// syncIfDue fsyncs the active segment when the group-commit interval has elapsed. With
+// SyncInterval == 0 that is every page, which is the old behaviour.
+//
+// Durability: pages written since the last sync may be lost on a machine crash, bounded by
+// SyncInterval. That is safe by construction rather than by luck — a partially written page
+// is caught by the full-page CRC on recovery and truncated, which is the same mechanism
+// that already handled a torn trailing page. The loss window widens; nothing becomes
+// corrupt, and nothing is silently half-read.
+func (w *Writer) syncIfDue(now time.Time) error {
+	if !w.needsSync {
+		return nil
+	}
+	if w.opts.SyncInterval > 0 && now.Sub(w.lastSync) < w.opts.SyncInterval {
+		return nil
+	}
+	return w.syncNow(now)
+}
+
+// syncNow forces the active segment durable. Called on the group-commit deadline and
+// unconditionally at seal, rotate and Close, where the protocol requires it.
+func (w *Writer) syncNow(now time.Time) error {
+	if w.currSeg == nil {
+		return nil
+	}
+	if err := w.currSeg.Sync(); err != nil {
+		return fmt.Errorf("syncing segment: %w", err)
+	}
+	w.needsSync = false
+	w.lastSync = now
+	return nil
+}
+
 // deleteSegmentFiles removes a segment's .log and every sidecar (<base>.idx, per-field
 // .tidx, .labels.lidx) — all matched by the single glob <base>.*. Returns the first
 // non-ENOENT error (an already-absent file is fine).
@@ -703,15 +748,12 @@ func (w *Writer) flushPage() error {
 	if err := w.idxWriter.WriteEntry(w.hdr.MinTS, pageNum); err != nil {
 		return fmt.Errorf("writing index entry: %w", err)
 	}
-
-	// Group commit: make the page (and its index entry) durable together.
-	if err := w.currSeg.Sync(); err != nil {
-		return fmt.Errorf("syncing segment: %w", err)
-	}
-	if err := w.idxWriter.Sync(); err != nil {
-		return fmt.Errorf("syncing index: %w", err)
-	}
-	return nil
+	// The sparse .idx is deliberately NOT fsynced here. It is a derived accelerator that
+	// nothing reads today (the query path prunes on page-header bounds) and that recovery
+	// rebuilds from the segment's pages anyway, so paying an fsync per page for it bought
+	// nothing — it just doubled the syscall that dominates this path. It is synced at seal.
+	w.needsSync = true
+	return w.syncIfDue(time.Now())
 }
 
 // ---- segment lifecycle ----
@@ -774,8 +816,15 @@ func (w *Writer) sealCurrentSegment() error {
 	if w.currSeg == nil {
 		return nil
 	}
-	if err := w.currSeg.Sync(); err != nil {
+	if err := w.syncNow(time.Now()); err != nil {
 		return fmt.Errorf("syncing segment on seal: %w", err)
+	}
+	// The sparse .idx is synced here rather than per page (see flushPage): once at seal is
+	// enough for a derived structure, and it keeps the sealed segment self-consistent.
+	if w.idxWriter != nil {
+		if err := w.idxWriter.Sync(); err != nil {
+			return fmt.Errorf("syncing sparse index on seal: %w", err)
+		}
 	}
 	if err := w.persistLookupIfGrown(); err != nil {
 		return fmt.Errorf("persisting service lookup on seal: %w", err)

@@ -17,6 +17,7 @@ type Config struct {
 	RetentionDays        int         `yaml:"retention_days"`           // delete sealed segments older than this (0 = keep forever)
 	IndexMemBudgetMB     int         `yaml:"index_mem_budget_mb"`      // seal early when the active segment's in-RAM index exceeds this (0 = no cap)
 	IndexCacheMB         int         `yaml:"index_cache_mb"`           // query-side cache of opened index sidecars (0 = disabled)
+	SyncIntervalMs       int         `yaml:"sync_interval_ms"`         // group-commit window; default 50, negative = fsync every page
 	Shards               int         `yaml:"shards"`                   // number of shard writers (shared-nothing folders); default 1
 	MaxLabelValuesPerKey int         `yaml:"max_label_values_per_key"` // §6.2 cardinality cap; default 1000
 	Multitenancy         bool        `yaml:"multitenancy"`             // tag+isolate by X-Scope-OrgID (§12); default false
@@ -93,6 +94,35 @@ func (c *Config) FlushInterval() time.Duration {
 func (c *Config) Retention() time.Duration {
 	return time.Duration(c.RetentionDays) * 24 * time.Hour
 }
+
+// SyncInterval returns the group-commit window: how long a written page may sit unsynced.
+//
+// This is the write path's dominant cost and its one real durability knob. fsync per page
+// measures ~21k lines/s on NVMe; a 50ms window measures ~1.05M — a 51x difference that is
+// entirely syscall, not work.
+//
+// The default is 50ms. On a machine crash that risks at most ~50ms of accepted logs, which
+// is still markedly stronger than the systems logd is compared against: Loki holds chunks
+// in memory until a flush threshold, and VictoriaLogs defaults to a 5s in-memory flush
+// interval. Nothing becomes CORRUPT either way — a partially written page is caught by the
+// full-page CRC and truncated on recovery, the same mechanism that already handled a torn
+// trailing page.
+//
+// Set a NEGATIVE value for fsync-every-page (strongest, ~50x slower). Zero means unset and
+// takes the default, matching how max_label_values_per_key already behaves.
+func (c *Config) SyncInterval() time.Duration {
+	switch {
+	case c.SyncIntervalMs < 0:
+		return 0 // storage.Options: 0 == fsync every page
+	case c.SyncIntervalMs == 0:
+		return defaultSyncInterval
+	default:
+		return time.Duration(c.SyncIntervalMs) * time.Millisecond
+	}
+}
+
+// defaultSyncInterval is the shipped group-commit window. See SyncInterval for the trade.
+const defaultSyncInterval = 50 * time.Millisecond
 
 // IndexCacheBytes returns the query-side sidecar cache budget in bytes.
 //

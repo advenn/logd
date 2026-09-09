@@ -3,6 +3,11 @@ port: 7100
 data_dir: ./data
 segment_size_mb: 64
 flush_interval_ms: 500
+# Group commit: how long a written page may sit unsynced. fsync is the write path's entire
+# bottleneck — per-page fsync measures ~21k lines/s, 50ms measures ~1.05M. A crash risks at
+# most this much accepted data; nothing becomes corrupt (a partial page is CRC-caught and
+# truncated on recovery). Negative = fsync every page.
+sync_interval_ms: 50
 retention_days: 30   # delete sealed segments older than this (0 = keep forever)
 index_mem_budget_mb: 256   # seal a segment early if its in-RAM index exceeds this (0 = no cap)
 shards: 1   # number of shared-nothing writer folders (data_root/shard-NNNN/); queries fan in across them
