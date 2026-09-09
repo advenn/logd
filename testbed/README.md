@@ -159,12 +159,47 @@ lines/s there and tells you nothing. `core/storage/write_bench_test.go` requires
 
 | | on disk | vs logd |
 |---|---|---|
-| VictoriaLogs | **7.79 MB** | 12× smaller |
-| Loki | 57.4 MB | 1.6× smaller |
-| logd | 92.3 MB | — (82.1 data + 10.6 index) |
+| VictoriaLogs | **7.82 MB** | 3.1× smaller |
+| logd | **23.9 MB** | — (13.3 data + 9.4 .tidx + 1.2 other) |
+| Loki | 56.5 MB | 2.4× larger |
 
-logd stores records uncompressed in 4 KB pages. There is no block compression anywhere in
-the write path, and against VictoriaLogs it is not close.
+logd was **92.3 MB** before sealed segments were compressed — larger than Loki and 12×
+larger than VictoriaLogs. It is now 2.4× *smaller* than Loki and 3.1× larger than
+VictoriaLogs.
+
+Compression could not simply gzip the file: records are addressable by segment-relative
+byte offset (the `.tidx` stores exactly those, and the query path divides to get
+`(page, in-page offset)`), and a variable-length stream has no O(1) offset mapping. So
+sealed segments are rewritten into a `.logz` sidecar with a block directory that preserves
+logical page numbering exactly. The active segment stays raw.
+
+Block size is the tradeoff — measured on a real 64 MB segment of application logs:
+
+| block | ratio |
+|---|---|
+| 4 KB (1 page) | 4.1× |
+| **32 KB (8 pages, default)** | **6.2×** |
+| 64 KB (16 pages) | 6.5× |
+| whole file | 6.9× |
+
+**`.tidx` is now 39% of logd's total** (9.4 MB of 23.9 MB) — 24-byte fixed records whose
+offsets ascend monotonically and whose keys repeat heavily. Delta-encoding it is the obvious
+next target and has not been done.
+
+### Compression costs query latency
+
+Not free, and worth stating plainly — every page read now decompresses a 32 KB block:
+
+| query | before | after |
+|---|---|---|
+| `latency_ms > 200` | 230 ms | 372 ms |
+| `latency_ms > 5000` | 69 ms | 89 ms |
+| last 100 lines | 26 ms | 66 ms |
+
+Roughly 1.3–2.5× slower reads for 3.9× less disk. `compress_block_pages` tunes the trade
+(smaller blocks decompress less per lookup and compress worse); a negative value turns
+compression off entirely. The before/after figures come from separate runs on a shared box,
+so treat the smaller deltas as directional.
 
 ### logd vs itself
 
@@ -237,9 +272,12 @@ Read these before quoting any number above.
   same corpus logd is 3–5.7× faster than Loki at every threshold, but versus VictoriaLogs it
   ranges from 0.63× (slower, at 5.4%) to 1.8× (faster, at 0.10%). Quote the table, or quote
   nothing.
-- **logd wins on query, still loses on ingest and disk.** A fair summary includes all
-  three: after the write-path work logd is 2.6× slower to ingest than VictoriaLogs (was
-  27×) and still 12× larger on disk, with no compression anywhere in its write path.
+- **logd wins on query, still trails on ingest and disk.** A fair summary includes all
+  three. After the write-path and compression work logd is 2.9× slower to ingest than
+  VictoriaLogs (was 27×) and 3.1× larger on disk (was 12×) — but 2.4× *smaller* than Loki,
+  which it used to lose to.
+- **Compression trades read latency for disk.** 3.9× less disk cost roughly 1.3–2.5× on
+  query latency. Tunable via `compress_block_pages`, disableable entirely.
 - **The cross-engine numbers come from separate runs.** Loki's own timings moved between
   measurement rounds (369 → 435 ms on the same query and corpus), so a ratio that improved
   is not by itself evidence that logd improved — the logd-vs-itself column and the
