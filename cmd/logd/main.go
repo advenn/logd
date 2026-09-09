@@ -58,6 +58,7 @@ func run(configPath string) error {
 		Retention:           cfg.Retention(),
 		IndexMemBudget:      cfg.IndexMemBudgetBytes(),
 		SyncInterval:        cfg.SyncInterval(),
+		BlockPages:          cfg.BlockPages(),
 		MaxLabelCardinality: cfg.MaxLabelValues(),
 		// Rebuild a crash-recovered segment's index by re-extracting its records (§8),
 		// using the same extraction + allowlist as live ingest so index == scan.

@@ -55,3 +55,18 @@ func TestDefaultsAreSane(t *testing.T) {
 		t.Errorf("ShardCount default: got %d, want 1", got)
 	}
 }
+
+// TestBlockPagesEncoding: same zero-means-default convention, and the duplicated default
+// must not drift from storage.DefaultBlockPages (core/config is a dependency-free leaf, so
+// the constant is copied rather than imported).
+func TestBlockPagesEncoding(t *testing.T) {
+	if got := (&Config{}).BlockPages(); got != defaultCompressBlockPages {
+		t.Errorf("unset: got %d, want %d", got, defaultCompressBlockPages)
+	}
+	if got := (&Config{CompressBlockPages: -1}).BlockPages(); got != -1 {
+		t.Errorf("negative should disable compression, got %d", got)
+	}
+	if got := (&Config{CompressBlockPages: 16}).BlockPages(); got != 16 {
+		t.Errorf("explicit: got %d, want 16", got)
+	}
+}

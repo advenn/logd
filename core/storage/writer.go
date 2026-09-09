@@ -30,6 +30,10 @@ type Options struct {
 	// "per page or per N ms" choice design §8 leaves open.
 	SyncInterval        time.Duration
 	MaxLabelCardinality int // max distinct values indexed per label key per segment (§6.2; 0 = unlimited)
+	// BlockPages compresses a SEALED segment into blocks of this many 4KB pages. The active
+	// segment is never compressed, so writes and crash recovery keep operating on raw pages.
+	// 0 = DefaultBlockPages, negative = leave sealed segments uncompressed.
+	BlockPages int
 	// Reindex re-derives a record's typed-range keys and label set (the same work the
 	// ingest layer does). If set, crash recovery re-runs it over the recovered segment's
 	// records to rebuild its in-RAM index, so a recovered segment seals fully-indexed
@@ -82,6 +86,7 @@ type Writer struct {
 	labelBuf   *label.Builder     // per-active-segment label index (stream dict + postings), flushed at seal
 	card       *label.Cardinality // per-active-segment value-cardinality cap (§6.2)
 	segRecords uint64             // record count of the active segment (for the cost guard), reset on rotate
+	compressed int                // sealed segments successfully compressed (diagnostics)
 	lastSync   time.Time          // when the active segment was last fsynced (group commit)
 	needsSync  bool               // a page has been written but not yet fsynced
 
@@ -873,7 +878,22 @@ func (w *Writer) sealCurrentSegment() error {
 		w.idxWriter.Close()
 		w.idxWriter = nil
 	}
-	return w.currSeg.Close()
+	segPath := w.currSeg.Path
+	if err := w.currSeg.Close(); err != nil {
+		return err
+	}
+
+	// Compress LAST, after the manifest already describes a complete sealed segment. The
+	// rewrite is atomic (write + fsync + rename, then unlink the raw file), so a crash
+	// during it leaves either the raw file or the compressed one — never neither, and the
+	// reader prefers whichever exists. A failure here is logged and left raw rather than
+	// failing the seal: the segment is already durable and queryable either way.
+	if ok, err := CompressSegment(segPath, w.opts.BlockPages); err != nil {
+		log.Printf("storage: compressing %s (left uncompressed): %v", segPath, err)
+	} else if ok {
+		w.compressed++
+	}
+	return nil
 }
 
 // persistLookupIfGrown atomically persists lookup.bin when new services have been
