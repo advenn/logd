@@ -159,47 +159,59 @@ lines/s there and tells you nothing. `core/storage/write_bench_test.go` requires
 
 | | on disk | vs logd |
 |---|---|---|
-| VictoriaLogs | **7.82 MB** | 3.1× smaller |
-| logd | **23.9 MB** | — (13.3 data + 9.4 .tidx + 1.2 other) |
-| Loki | 56.5 MB | 2.4× larger |
+| VictoriaLogs | **7.80 MB** | 2.1× smaller |
+| logd | **16.4 MB** | — |
+| Loki | 57.5 MB | **3.5× larger** |
 
-logd was **92.3 MB** before sealed segments were compressed — larger than Loki and 12×
-larger than VictoriaLogs. It is now 2.4× *smaller* than Loki and 3.1× larger than
-VictoriaLogs.
+logd was **92.3 MB** before any compression — larger than Loki and 12× larger than
+VictoriaLogs. Two changes got it here:
 
-Compression could not simply gzip the file: records are addressable by segment-relative
-byte offset (the `.tidx` stores exactly those, and the query path divides to get
-`(page, in-page offset)`), and a variable-length stream has no O(1) offset mapping. So
-sealed segments are rewritten into a `.logz` sidecar with a block directory that preserves
-logical page numbering exactly. The active segment stays raw.
+| | before | after | |
+|---|---|---|---|
+| `.logz` (segment data) | 81.7 MB | 13.2 MB | 6.2× |
+| `.tidx` (typed-range index) | 9.35 MB | **1.86 MB** | **5.0×** |
+| `.lidx` + `.idx` | 1.27 MB | 1.27 MB | — |
+| **total** | **92.3 MB** | **16.4 MB** | **5.6×** |
 
-Block size is the tradeoff — measured on a real 64 MB segment of application logs:
+**Segments** could not simply be gzipped: records are addressable by segment-relative byte
+offset (the `.tidx` stores exactly those, and the query path divides to get
+`(page, in-page offset)`), and a variable-length stream has no O(1) offset mapping. Sealed
+segments are therefore rewritten into a `.logz` sidecar with a block directory that
+preserves logical page numbering. Block size is the tradeoff — 4 KB pages give 4.1×, 32 KB
+blocks 6.2× (default), whole-file 6.9×.
 
-| block | ratio |
-|---|---|
-| 4 KB (1 page) | 4.1× |
-| **32 KB (8 pages, default)** | **6.2×** |
-| 64 KB (16 pages) | 6.5× |
-| whole file | 6.9× |
+**`.tidx` had no such constraint**, which is why it was a much smaller change: `OpenReader`
+already loads the whole file and materializes every record, and the `Reader` holds no file
+handle at all — lookups binary-search an in-memory slice. So the record region is simply
+deflated wholesale. It compresses 5× because an int key puts its value in bytes `[8:16]` and
+zero-pads `[0:8]` (keys alone: **178×**), and literal-existence fields key *every* entry
+under the all-zero key.
 
-**`.tidx` is now 39% of logd's total** (9.4 MB of 23.9 MB) — 24-byte fixed records whose
-offsets ascend monotonically and whose keys repeat heavily. Delta-encoding it is the obvious
-next target and has not been done.
+`.logz` is now 81% of what remains. Further disk work means attacking the log text itself —
+a stronger codec or a shared dictionary — which is a different kind of change.
 
 ### Compression costs query latency
 
 Not free, and worth stating plainly — every page read now decompresses a 32 KB block:
 
-| query | before | after |
-|---|---|---|
-| `latency_ms > 200` | 230 ms | 372 ms |
-| `latency_ms > 5000` | 69 ms | 89 ms |
-| last 100 lines | 26 ms | 66 ms |
+| query | uncompressed | after segment compression | after `.tidx` too |
+|---|---|---|---|
+| `latency_ms > 200` | 230 ms | 372 ms | 364 ms |
+| `latency_ms > 5000` | 69 ms | 89 ms | 94 ms |
+| last 100 lines | 26 ms | 66 ms | 71 ms |
 
-Roughly 1.3–2.5× slower reads for 3.9× less disk. `compress_block_pages` tunes the trade
-(smaller blocks decompress less per lookup and compress worse); a negative value turns
-compression off entirely. The before/after figures come from separate runs on a shared box,
-so treat the smaller deltas as directional.
+**Segment compression cost roughly 1.3–2.5× on reads; `.tidx` compression cost nothing
+measurable** — the index is decompressed once per file at open and then cached, whereas
+segment pages are inflated per block on every read.
+
+The one visible `.tidx` cost is a colder first query: 144 ms immediately after a restart vs
+83 ms warm, the ~61 ms being two `.tidx` files inflating into the reader cache. Bounded, and
+paid once per file.
+
+`compress_block_pages` tunes the segment trade (smaller blocks decompress less per lookup
+and compress worse); a negative value turns segment compression off entirely. The
+before/after columns come from separate runs on a shared box, so treat the smaller deltas as
+directional.
 
 ### logd vs itself
 
@@ -216,7 +228,8 @@ run, same corpus:
 
 ### Optimization history
 
-The read path was profiled and reworked in four commits. Benchmarks are
+Four rounds of work: read path, write path, segment compression, index compression. The read
+path was profiled and reworked in four commits. Benchmarks are
 `core/query/bench_test.go` (200k records, medians of 3):
 
 | | LabelOnly/100 | LabelOnly/1 | TypedSelective | TypedBroad |
@@ -274,10 +287,11 @@ Read these before quoting any number above.
   nothing.
 - **logd wins on query, still trails on ingest and disk.** A fair summary includes all
   three. After the write-path and compression work logd is 2.9× slower to ingest than
-  VictoriaLogs (was 27×) and 3.1× larger on disk (was 12×) — but 2.4× *smaller* than Loki,
-  which it used to lose to.
-- **Compression trades read latency for disk.** 3.9× less disk cost roughly 1.3–2.5× on
-  query latency. Tunable via `compress_block_pages`, disableable entirely.
+  VictoriaLogs (was 27×) and 2.1× larger on disk (was 12×) — but 3.5× *smaller* than Loki,
+  which it used to lose to on both.
+- **Segment compression trades read latency for disk**; `.tidx` compression did not. 5.6×
+  less disk overall cost roughly 1.3–2.5× on query latency, all of it from the segment side.
+  Tunable via `compress_block_pages`, disableable entirely.
 - **The cross-engine numbers come from separate runs.** Loki's own timings moved between
   measurement rounds (369 → 435 ms on the same query and corpus), so a ratio that improved
   is not by itself evidence that logd improved — the logd-vs-itself column and the
