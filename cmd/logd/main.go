@@ -57,6 +57,7 @@ func run(configPath string) error {
 		FlushInterval:       cfg.FlushInterval(),
 		Retention:           cfg.Retention(),
 		IndexMemBudget:      cfg.IndexMemBudgetBytes(),
+		SyncInterval:        cfg.SyncInterval(),
 		MaxLabelCardinality: cfg.MaxLabelValues(),
 		// Rebuild a crash-recovered segment's index by re-extracting its records (§8),
 		// using the same extraction + allowlist as live ingest so index == scan.
