@@ -118,28 +118,50 @@ neither, which is worth understanding before claiming a win over it.
 Effectively a three-way tie. This was logd's worst result by far — **1558 ms against Loki's
 15 ms** — before the limit was pushed down.
 
-### Ingest — logd's weakest result
+### Ingest
 
-Identical 500 requests of 1,000 entries, closed-loop, zero retries everywhere:
+Identical 500 requests of 1,000 entries, closed-loop, zero retries everywhere, fresh
+volumes:
 
-| | accept time | vs logd |
-|---|---|---|
-| VictoriaLogs | **2.18 s** | 27× faster |
-| Loki | 4.65 s | 13× faster |
-| logd | 59.9 s | — |
+| | accept time | lines/s | vs logd |
+|---|---|---|---|
+| VictoriaLogs | 2.37 s | 211k | 2.6× faster |
+| Loki | 3.48 s | 144k | 1.8× faster |
+| logd | **6.23 s** | **80k** | — |
 
-Part of this is a real durability difference — logd group-commits whole pages to disk on the
-write path, while Loki holds chunks in memory until a flush threshold — but a 13–27× gap is
-not explained by fsync alone. The write path has not been profiled; all the optimization so
-far went into reads.
+logd was **59.9 s (8.3k lines/s)** before the write path was profiled — 27× behind
+VictoriaLogs and 13× behind Loki. It is now 2.6× and 1.8× behind. What changed:
+
+- **fsync was the whole bottleneck.** `flushPage` fsynced *twice* per 4 KB page; at ~35
+  records per page that is ~28,000 fsyncs for this corpus. One of the two was pure waste —
+  the sparse `.idx` is a derived accelerator that nothing reads and recovery rebuilds, so
+  it is now synced once at seal instead of every page. That alone was 13.7k → 20.8k lines/s
+  with no durability change.
+- **Group commit** (`sync_interval_ms`, default 50 ms) took the isolated writer from 20.8k
+  to **1.05M lines/s** — 51×. A crash risks at most ~50 ms of accepted logs; a partial page
+  is still CRC-caught and truncated on recovery, so data is never corrupt, only absent.
+  Negative restores fsync-every-page.
+- **Label derivation** was then the biggest remaining per-record cost (46%, 31 of 38
+  allocations) — it built the whole label map to keep 3 allowlisted keys, the same waste
+  already fixed on the read path. 6998 → 4811 ns/record.
+
+⚠️ The isolated writer benchmark shows 51×; end-to-end shows 9.4×. That gap is the point:
+once fsync stopped dominating, HTTP, snappy/protobuf decode and extraction became the
+bottleneck, under a 2-CPU cgroup limit. There is more to get here, and it is no longer in
+storage.
+
+⚠️ **Benchmark these on a real disk.** `b.TempDir()` honours `$TMPDIR`, and `/tmp` is tmpfs
+on most Linux dev boxes, where `fsync` is a no-op — the write benchmark reports ~1.3M
+lines/s there and tells you nothing. `core/storage/write_bench_test.go` requires
+`LOGD_BENCH_DIR` and skips rather than silently producing a RAM-disk number.
 
 ### Storage — 500,000 identical lines
 
 | | on disk | vs logd |
 |---|---|---|
-| VictoriaLogs | **7.75 MB** | 12× smaller |
-| Loki | 60.1 MB | 1.5× smaller |
-| logd | 92.7 MB | — (82.1 data + 10.6 index) |
+| VictoriaLogs | **7.79 MB** | 12× smaller |
+| Loki | 57.4 MB | 1.6× smaller |
+| logd | 92.3 MB | — (82.1 data + 10.6 index) |
 
 logd stores records uncompressed in 4 KB pages. There is no block compression anywhere in
 the write path, and against VictoriaLogs it is not close.
@@ -215,8 +237,9 @@ Read these before quoting any number above.
   same corpus logd is 3–5.7× faster than Loki at every threshold, but versus VictoriaLogs it
   ranges from 0.63× (slower, at 5.4%) to 1.8× (faster, at 0.10%). Quote the table, or quote
   nothing.
-- **logd wins on query, loses on ingest and disk.** A fair summary has to include all three:
-  27× slower to ingest and 12× larger on disk than VictoriaLogs.
+- **logd wins on query, still loses on ingest and disk.** A fair summary includes all
+  three: after the write-path work logd is 2.6× slower to ingest than VictoriaLogs (was
+  27×) and still 12× larger on disk, with no compression anywhere in its write path.
 - **The cross-engine numbers come from separate runs.** Loki's own timings moved between
   measurement rounds (369 → 435 ms on the same query and corpus), so a ratio that improved
   is not by itself evidence that logd improved — the logd-vs-itself column and the
