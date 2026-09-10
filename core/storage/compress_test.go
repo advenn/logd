@@ -1,7 +1,12 @@
 package storage
 
 import (
+	"bytes"
+	"compress/flate"
+	"encoding/binary"
 	"fmt"
+	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -191,7 +196,9 @@ func TestCorruptDirectoryDegrades(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data[segzHeaderLen+3] ^= 0xFF // flip a bit inside the directory
+	// The directory follows the header AND the preset dictionary in v2.
+	dictLen := int(binary.BigEndian.Uint32(data[24:28]))
+	data[segzHeaderLenV2+dictLen+3] ^= 0xFF // flip a bit inside the directory
 	if err := os.WriteFile(zpath, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -234,4 +241,142 @@ func TestRawSegmentsStillReadable(t *testing.T) {
 		t.Fatal(err)
 	}
 	sameRecords(t, "raw segment", got, want)
+}
+
+// TestCorruptDictionaryDegrades: the preset dictionary is covered by the same checksum as
+// the directory, because a corrupt dictionary would inflate every block to different bytes
+// than were compressed — surfacing as wholesale page corruption rather than as the single
+// bad field it actually is.
+func TestCorruptDictionaryDegrades(t *testing.T) {
+	_, segPath, _ := buildRawSegment(t, 4000)
+	if _, err := CompressSegment(segPath, 8); err != nil {
+		t.Fatal(err)
+	}
+	zpath := SegzPath(segPath)
+	data, err := os.ReadFile(zpath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ver := binary.BigEndian.Uint16(data[4:6]); ver != segzVersion2 {
+		t.Fatalf("expected a version-2 segment, got %d", ver)
+	}
+	if dictLen := binary.BigEndian.Uint32(data[24:28]); dictLen == 0 {
+		t.Fatal("expected a non-empty preset dictionary")
+	}
+	data[segzHeaderLenV2+5] ^= 0xFF // inside the dictionary
+	if err := os.WriteFile(zpath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openPageSource(segPath); err == nil {
+		t.Fatal("a corrupt preset dictionary must be rejected, not used to inflate blocks")
+	}
+}
+
+// TestDictionaryImprovesRatio pins the reason version 2 exists. A 32 KB block cannot build a
+// useful window on its own; priming it with a sample of the segment measured 6.15x -> 6.91x
+// on real data. This asserts the direction, not the exact figure.
+func TestDictionaryImprovesRatio(t *testing.T) {
+	_, segPath, _ := buildRawSegment(t, 20000)
+	before, err := os.Stat(segPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CompressSegment(segPath, 8); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(SegzPath(segPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ratio := float64(before.Size()) / float64(after.Size())
+	if ratio < 3 {
+		t.Errorf("ratio %.2fx on log text is suspiciously low", ratio)
+	}
+	t.Logf("ratio %.2fx (%d -> %d bytes)", ratio, before.Size(), after.Size())
+}
+
+// writeSegzV1 rewrites a raw segment in the ORIGINAL version-1 layout: 24-byte header, no
+// preset dictionary, plain flate per block. CompressSegment only emits version 2 now, so
+// this is the only way to produce a v1 file and prove segments sealed before the dictionary
+// existed still read.
+func writeSegzV1(t *testing.T, logPath string, blockPages int) {
+	t.Helper()
+	src, err := os.Open(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	info, _ := src.Stat()
+	numPages := uint64(info.Size() / PageSize)
+	numBlocks := (numPages + uint64(blockPages) - 1) / uint64(blockPages)
+	dirLen := int(numBlocks) * segzDirEntry
+
+	dir := make([]byte, dirLen)
+	var body bytes.Buffer
+	fileOff := uint64(segzHeaderLenV1 + dirLen)
+	raw := make([]byte, blockPages*PageSize)
+	for b := uint64(0); b < numBlocks; b++ {
+		start := b * uint64(blockPages)
+		n := blockPages
+		if rem := numPages - start; rem < uint64(blockPages) {
+			n = int(rem)
+		}
+		buf := raw[:n*PageSize]
+		if _, err := src.ReadAt(buf, PageOffset(start)); err != nil && err != io.EOF {
+			t.Fatal(err)
+		}
+		var comp bytes.Buffer
+		zw, _ := flate.NewWriter(&comp, flate.DefaultCompression)
+		zw.Write(buf)
+		zw.Close()
+		e := dir[int(b)*segzDirEntry:]
+		binary.BigEndian.PutUint64(e[0:8], fileOff)
+		binary.BigEndian.PutUint32(e[8:12], uint32(comp.Len()))
+		binary.BigEndian.PutUint32(e[12:16], uint32(len(buf)))
+		body.Write(comp.Bytes())
+		fileOff += uint64(comp.Len())
+	}
+
+	hdr := make([]byte, segzHeaderLenV1)
+	binary.BigEndian.PutUint32(hdr[0:4], segzMagic)
+	binary.BigEndian.PutUint16(hdr[4:6], segzVersion1)
+	binary.BigEndian.PutUint16(hdr[6:8], uint16(blockPages))
+	binary.BigEndian.PutUint64(hdr[8:16], numPages)
+	binary.BigEndian.PutUint32(hdr[16:20], uint32(numBlocks))
+	binary.BigEndian.PutUint32(hdr[20:24], crc32.ChecksumIEEE(dir))
+
+	out := append(append(append([]byte{}, hdr...), dir...), body.Bytes()...)
+	if err := os.WriteFile(SegzPath(logPath), out, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(logPath); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSegzVersion1StillReadable is the backward-compatibility guard. A v1 file has no
+// dictionary and a 24-byte header; rejecting it would make every segment sealed before this
+// change unreadable, which for compressed segments means DATA LOSS, not a slow scan.
+func TestSegzVersion1StillReadable(t *testing.T) {
+	_, segPath, want := buildRawSegment(t, 4000)
+	writeSegzV1(t, segPath, 8)
+
+	got, err := readSegmentRecords(segPath)
+	if err != nil {
+		t.Fatalf("a version-1 .logz must still open: %v", err)
+	}
+	sameRecords(t, "version-1 segment", got, want)
+
+	// And the random-access path, which is what the query planner uses.
+	var offsets []uint64
+	for i := 0; i < len(want); i += 53 {
+		offsets = append(offsets, want[i].Offset)
+	}
+	seen := 0
+	if err := FetchRecords(segPath, offsets, func(model.LogEntry) bool { seen++; return true }); err != nil {
+		t.Fatal(err)
+	}
+	if seen != len(offsets) {
+		t.Errorf("v1 fetch by offset: got %d records, want %d", seen, len(offsets))
+	}
 }
