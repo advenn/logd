@@ -159,36 +159,50 @@ lines/s there and tells you nothing. `core/storage/write_bench_test.go` requires
 
 | | on disk | vs logd |
 |---|---|---|
-| VictoriaLogs | **7.80 MB** | 2.1× smaller |
-| logd | **16.4 MB** | — |
-| Loki | 57.5 MB | **3.5× larger** |
+| VictoriaLogs | **7.81 MB** | 1.9× smaller |
+| logd | **15.0 MB** | — |
+| Loki | 57.5 MB | **3.8× larger** |
 
 logd was **92.3 MB** before any compression — larger than Loki and 12× larger than
-VictoriaLogs. Two changes got it here:
+VictoriaLogs. Three changes got it here:
 
 | | before | after | |
 |---|---|---|---|
-| `.logz` (segment data) | 81.7 MB | 13.2 MB | 6.2× |
-| `.tidx` (typed-range index) | 9.35 MB | **1.86 MB** | **5.0×** |
+| `.logz` (segment data) | 81.7 MB | 11.8 MB | 6.9× |
+| `.tidx` (typed-range index) | 9.35 MB | 1.86 MB | 5.0× |
 | `.lidx` + `.idx` | 1.27 MB | 1.27 MB | — |
-| **total** | **92.3 MB** | **16.4 MB** | **5.6×** |
+| **total** | **92.3 MB** | **15.0 MB** | **6.2×** |
 
 **Segments** could not simply be gzipped: records are addressable by segment-relative byte
 offset (the `.tidx` stores exactly those, and the query path divides to get
 `(page, in-page offset)`), and a variable-length stream has no O(1) offset mapping. Sealed
-segments are therefore rewritten into a `.logz` sidecar with a block directory that
-preserves logical page numbering. Block size is the tradeoff — 4 KB pages give 4.1×, 32 KB
-blocks 6.2× (default), whole-file 6.9×.
+segments are rewritten into a `.logz` sidecar with a block directory that preserves logical
+page numbering.
 
-**`.tidx` had no such constraint**, which is why it was a much smaller change: `OpenReader`
-already loads the whole file and materializes every record, and the `Reader` holds no file
-handle at all — lookups binary-search an in-memory slice. So the record region is simply
-deflated wholesale. It compresses 5× because an int key puts its value in bytes `[8:16]` and
-zero-pads `[0:8]` (keys alone: **178×**), and literal-existence fields key *every* entry
-under the all-zero key.
+**A preset dictionary matters more than the compression level.** A 32 KB block cannot build
+a useful window for itself — deflate starts each block empty, so the repeated shape of log
+lines is re-learned 2,048 times per segment. Priming it with a sample of the segment's own
+content, stored in the file:
 
-`.logz` is now 81% of what remains. Further disk work means attacking the log text itself —
-a stronger codec or a shared dictionary — which is a different kind of change.
+| | ratio |
+|---|---|
+| flate -6 | 6.15× |
+| flate -9 | 6.32× |
+| flate -6 + dictionary | 6.72× |
+| **flate -7 + dictionary** | **6.91×** |
+| flate -9 + dictionary | 7.04× (3.3× the seal cost) |
+
+No dependency was added, and the measurements are why: stdlib `flate -7 +dict` (6.91×) beats
+`zstd -9` (6.81×), and `flate -9 +dict` (7.04×) matches `zstd -19` (7.03×). Only `zstd -19`
+with a trained dictionary did better (7.87×).
+
+**`.tidx` had no offset constraint at all**, which is why it was a much smaller change:
+`OpenReader` already loads the whole file and the `Reader` holds no file handle, so the
+record region is simply deflated wholesale. It compresses 5× because an int key puts its
+value in bytes `[8:16]` and zero-pads `[0:8]` (keys alone: **178×**).
+
+`.logz` is still 79% of what remains. Closing the last gap to VictoriaLogs would mean
+changing what is stored, not how it is compressed.
 
 ### Compression costs query latency
 
@@ -203,6 +217,14 @@ Not free, and worth stating plainly — every page read now decompresses a 32 KB
 **Segment compression cost roughly 1.3–2.5× on reads; `.tidx` compression cost nothing
 measurable** — the index is decompressed once per file at open and then cached, whereas
 segment pages are inflated per block on every read.
+
+**The preset dictionary cost nothing either**, which is worth stating because a later run
+appeared to show it had: logd's numbers rose ~1.3×, but so did Loki's and VictoriaLogs'
+(117 → 149 ms on a query touching neither of the changed files), so the whole session was
+slow. An isolated benchmark settles it — inflating dictionary-primed blocks is *faster*
+(603 vs 487 MB/s), because the blocks are smaller and the 32 KB window prefill is a cheap
+memcpy. **Cross-session latency comparisons on this box are unreliable; only same-run
+comparisons and isolated benchmarks are.**
 
 The one visible `.tidx` cost is a colder first query: 144 ms immediately after a restart vs
 83 ms warm, the ~61 ms being two `.tidx` files inflating into the reader cache. Bounded, and
@@ -286,8 +308,8 @@ Read these before quoting any number above.
   ranges from 0.63× (slower, at 5.4%) to 1.8× (faster, at 0.10%). Quote the table, or quote
   nothing.
 - **logd wins on query, still trails on ingest and disk.** A fair summary includes all
-  three. After the write-path and compression work logd is 2.9× slower to ingest than
-  VictoriaLogs (was 27×) and 2.1× larger on disk (was 12×) — but 3.5× *smaller* than Loki,
+  three. After the write-path and compression work logd is 2.8× slower to ingest than
+  VictoriaLogs (was 27×) and 1.9× larger on disk (was 12×) — but 3.8× *smaller* than Loki,
   which it used to lose to on both.
 - **Segment compression trades read latency for disk**; `.tidx` compression did not. 5.6×
   less disk overall cost roughly 1.3–2.5× on query latency, all of it from the segment side.
