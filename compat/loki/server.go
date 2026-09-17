@@ -6,6 +6,8 @@ package loki
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"sort"
@@ -19,6 +21,7 @@ import (
 	"github.com/advenn/logd/core/ingest"
 	"github.com/advenn/logd/core/model"
 	"github.com/advenn/logd/core/query"
+	"github.com/advenn/logd/core/storage"
 )
 
 // Server wires the Loki HTTP endpoints to the native ingest + query engines.
@@ -120,11 +123,25 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 	// your 1000 entries", so failing partway through leaves the client to retry the whole
 	// batch and duplicate everything already stored. Expressing backpressure as latency
 	// (which is what Loki and VictoriaLogs do) keeps the request effectively atomic.
+	rejected := 0
 	for i := range entries {
 		if err := s.ig.IngestCtx(r.Context(), entries[i]); err != nil {
+			// A line too large to store is a property of that one entry, not of the batch:
+			// store the rest and report the rejection. The answer is a 4xx, which shippers
+			// do not retry, so the entries that were stored are not duplicated.
+			if errors.Is(err, storage.ErrEntryTooLarge) {
+				rejected++
+				continue
+			}
 			s.writeError(w, http.StatusServiceUnavailable, err.Error())
 			return
 		}
+	}
+	if rejected > 0 {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf(
+			"%d of %d entries rejected: line too large (a record — line, labels and a 27-byte prefix — must fit in %d bytes); the other entries were stored",
+			rejected, len(entries), storage.MaxRecordSize))
+		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

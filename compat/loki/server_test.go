@@ -154,6 +154,58 @@ func TestLokiEndToEnd(t *testing.T) {
 	}
 }
 
+// A push carrying one line too large for a page must store the other lines and say what was
+// rejected, instead of answering 204 and silently dropping the long line later.
+func TestPushStoresValidLinesRejectsOversized(t *testing.T) {
+	srv, w := setup(t)
+	h := srv.Handler()
+
+	body := pushJSON([]struct {
+		labels map[string]string
+		values [][2]string
+	}{
+		{map[string]string{"region": "eu"}, [][2]string{
+			{ns(1), "req took 250ms"},
+			{ns(2), "stack trace " + strings.Repeat("x", 5000)},
+			{ns(3), "req took 50ms"},
+		}},
+	})
+	rr := do(t, h, "POST", "/loki/api/v1/push", body, "application/json")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("push with an oversized line: got %d, want 400; body %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "1 of 3 entries rejected") {
+		t.Fatalf("error should say how many entries were rejected: %s", rr.Body.String())
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rr = do(t, h, "GET", "/loki/api/v1/query_range?query="+urlEncode(`{region="eu"}`)+"&start="+ns(0)+"&end="+ns(10), "", "")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("query_range: %d %s", rr.Code, rr.Body.String())
+	}
+	var qr struct {
+		Data struct {
+			Result []struct {
+				Values [][2]string `json:"values"`
+			} `json:"result"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &qr); err != nil {
+		t.Fatal(err)
+	}
+	var lines []string
+	for _, s := range qr.Data.Result {
+		for _, v := range s.Values {
+			lines = append(lines, v[1])
+		}
+	}
+	if len(lines) != 2 {
+		t.Fatalf("stored lines = %q, want the two that fit", lines)
+	}
+}
+
 // A metric query_range returns a Loki matrix with per-step counts.
 func TestLokiMetricQueryRange(t *testing.T) {
 	srv, w := setup(t)

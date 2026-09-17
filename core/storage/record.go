@@ -40,6 +40,11 @@ const (
 	// maxFieldSize bounds Message and Extra. It is dictated by the 2-byte length
 	// prefixes: a uint16 cannot describe more than 65535 bytes.
 	maxFieldSize = 65535
+
+	// MaxRecordSize is the largest encoded record the storage engine can hold. Records never
+	// span pages, so a whole record (27-byte prefix + message + Extra) must fit in one page
+	// after its header. In practice this, not maxFieldSize, is the limit a caller hits.
+	MaxRecordSize = PageSize - PageHeaderSize
 )
 
 // EncodedSize returns the exact number of bytes EncodeEntry will produce, without

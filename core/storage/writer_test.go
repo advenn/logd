@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -130,6 +131,50 @@ func TestSealWritesSchemaField(t *testing.T) {
 	}
 	if segs[0].Schema == nil {
 		t.Fatal("schema field missing from sealed manifest (must be present, even if empty)")
+	}
+}
+
+// TestWriteRejectsRecordLargerThanPage: a record that cannot fit in one page must be refused
+// when it is written, not accepted and then dropped by the writer goroutine, where no caller
+// can see the failure. A record of exactly MaxRecordSize must still be stored.
+func TestWriteRejectsRecordLargerThanPage(t *testing.T) {
+	dir := t.TempDir()
+	w, err := NewWriter(dir, noTickOpts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Start(nil)
+
+	extra := `{"app":"checkout"}`
+	fits := model.LogEntry{
+		TS:      time.Unix(1700000000, 0).UTC(),
+		Level:   model.LogLevelError,
+		Extra:   extra,
+		Message: strings.Repeat("a", MaxRecordSize-recordPrefixSize-len(extra)),
+	}
+	if EncodedSize(fits) != MaxRecordSize {
+		t.Fatalf("test setup: record is %d bytes, want exactly %d", EncodedSize(fits), MaxRecordSize)
+	}
+	tooBig := fits
+	tooBig.Message += "b"
+
+	if err := w.Write(fits); err != nil {
+		t.Fatalf("a record of exactly MaxRecordSize must be accepted: %v", err)
+	}
+	if err := w.Write(tooBig); !errors.Is(err, ErrEntryTooLarge) {
+		t.Fatalf("Write of %d bytes: got %v, want ErrEntryTooLarge", EncodedSize(tooBig), err)
+	}
+	if err := w.WriteExtractedCtx(context.Background(), tooBig, nil, nil); !errors.Is(err, ErrEntryTooLarge) {
+		t.Fatalf("WriteExtractedCtx of %d bytes: got %v, want ErrEntryTooLarge", EncodedSize(tooBig), err)
+	}
+	w.Close()
+
+	got, err := ReadAll(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Message != fits.Message {
+		t.Fatalf("stored %d records, want only the one that fits", len(got))
 	}
 }
 

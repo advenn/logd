@@ -335,7 +335,11 @@ func (w *Writer) Write(e model.LogEntry) error {
 // allowlisted label set the ingest layer produced for it (design §7.4: extraction and
 // label derivation run in handler goroutines; the writer interns the labels and pairs
 // keys with the record's on-disk offset). Non-blocking: a full queue drops and errors.
+// A record larger than MaxRecordSize is rejected with ErrEntryTooLarge.
 func (w *Writer) WriteExtracted(e model.LogEntry, keys []index.KeyedValue, labels label.Set) error {
+	if err := checkRecordSize(e); err != nil {
+		return err
+	}
 	select {
 	case w.writeCh <- record{entry: e, keys: keys, labels: labels}:
 		return nil
@@ -358,6 +362,9 @@ func (w *Writer) WriteExtracted(e model.LogEntry, keys []index.KeyedValue, label
 // what shippers already expect. The caller's context bounds the wait, and a closed writer
 // is reported rather than deadlocking on a channel nobody is draining.
 func (w *Writer) WriteExtractedCtx(ctx context.Context, e model.LogEntry, keys []index.KeyedValue, labels label.Set) error {
+	if err := checkRecordSize(e); err != nil {
+		return err
+	}
 	select {
 	case w.writeCh <- record{entry: e, keys: keys, labels: labels}:
 		return nil
@@ -366,6 +373,17 @@ func (w *Writer) WriteExtractedCtx(ctx context.Context, e model.LogEntry, keys [
 	case <-ctx.Done():
 		return fmt.Errorf("waiting for write queue: %w", ctx.Err())
 	}
+}
+
+// checkRecordSize rejects a record that cannot fit in a page while the caller can still be
+// told. The writer goroutine used to discover this only after the entry was enqueued — by
+// which time a push had already been answered 204 — and could do nothing but log and drop
+// it, so long lines (stack traces, large JSON) disappeared without any client-visible error.
+func checkRecordSize(e model.LogEntry) error {
+	if size := EncodedSize(e); size > MaxRecordSize {
+		return fmt.Errorf("%w: record is %d bytes, max %d (line + labels + 27-byte prefix)", ErrEntryTooLarge, size, MaxRecordSize)
+	}
+	return nil
 }
 
 // Close drains the queue, flushes the final partial page, seals the active segment,
@@ -500,9 +518,10 @@ func (w *Writer) processEntry(rec record) {
 	// under an id from the old segment's dictionary (a wrong-stream bug the .tidx buffer
 	// doesn't have because its keys carry no per-segment id).
 	size := EncodedSize(e)
-	maxUsable := PageSize - PageHeaderSize
-	if size > maxUsable {
-		log.Printf("storage: entry too large for a page: %d bytes (max %d)", size, maxUsable)
+	if size > MaxRecordSize {
+		// Unreachable through WriteExtracted/WriteExtractedCtx, which reject such records
+		// before enqueueing; kept as a backstop so a page can never overflow.
+		log.Printf("storage: entry too large for a page: %d bytes (max %d)", size, MaxRecordSize)
 		return
 	}
 	if size > PageSize-int(w.hdr.FreeSpaceOffset) {
