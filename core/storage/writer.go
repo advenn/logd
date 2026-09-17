@@ -307,6 +307,11 @@ func (w *Writer) Start(ctx context.Context) error {
 		w.retentionC = w.retentionTicker.C
 	}
 
+	// Snapshot the segments sealed by a PREVIOUS run before this run can seal any: only
+	// those can have a compression that died with the old process, and none of them can be
+	// compressed concurrently by this run's seal path.
+	w.finishInterruptedCompressions(w.manifest.All())
+
 	w.wg.Add(1)
 	go w.writerLoop()
 
@@ -954,6 +959,92 @@ func (w *Writer) sealCurrentSegment() error {
 		}
 	}()
 	return nil
+}
+
+// finishInterruptedCompressions completes, in the background, the compressions a previous
+// process did not finish. Compression runs off the writer goroutine after seal, so a crash
+// or kill at the wrong moment used to leave a sealed segment raw for the rest of its life,
+// possibly with a .logz.tmp or a leftover .log next to a finished .logz. Close waits for this
+// work like any other compression, and it stops early once the writer is closing.
+func (w *Writer) finishInterruptedCompressions(segs []*SegmentMeta) {
+	type sealed struct {
+		id, path string
+		maxTS    int64
+	}
+	var todo []sealed
+	for _, s := range segs {
+		if s.State == SegmentSealed {
+			todo = append(todo, sealed{id: s.ID, path: s.Path, maxTS: s.MaxTS})
+		}
+	}
+	if len(todo) == 0 {
+		return
+	}
+	w.compressWG.Add(1)
+	go func() {
+		defer w.compressWG.Done()
+		for _, s := range todo {
+			if w.opts.Retention > 0 && s.maxTS < time.Now().Add(-w.opts.Retention).UnixNano() {
+				continue // about to be deleted by retention; not worth compressing
+			}
+			w.finishCompression(s.id, s.path)
+			// Checked AFTER each segment, so a Close issued right after Start still settles at
+			// least one, but a shutdown never waits for a whole backlog. Whatever is left is
+			// picked up by the next start.
+			select {
+			case <-w.closeCh:
+				return
+			default:
+			}
+		}
+	}()
+}
+
+// finishCompression brings one sealed segment to its settled on-disk form.
+func (w *Writer) finishCompression(id, logPath string) {
+	zpath := SegzPath(logPath)
+	dir := filepath.Dir(logPath)
+
+	// A compression interrupted before its rename leaves only this temp file behind.
+	if err := os.Remove(zpath + ".tmp"); err == nil {
+		_ = syncDir(dir)
+	}
+	if _, err := os.Stat(logPath); err != nil {
+		return // no raw file: already compressed (or gone)
+	}
+
+	// Both files present: the rename completed but the unlink of the raw file did not. The
+	// .logz is only ever created by that rename after an fsync, so if it opens it is whole
+	// and the raw copy can go. If it does not open, readers would fail on it even though the
+	// raw pages are intact, so it is removed and rebuilt from them below.
+	if f, err := os.Open(zpath); err == nil {
+		_, verr := newCompressedSource(f) // validates header, dictionary and directory CRC
+		f.Close()
+		if verr == nil {
+			if err := os.Remove(logPath); err == nil {
+				_ = syncDir(dir)
+			}
+			return
+		}
+		log.Printf("storage: %s is unreadable (%v); rebuilding it from the raw segment", zpath, verr)
+		if err := os.Remove(zpath); err != nil {
+			return
+		}
+		_ = syncDir(dir)
+	}
+
+	if w.opts.BlockPages < 0 {
+		return // compression disabled: a raw segment is the intended state
+	}
+	if _, err := CompressSegment(logPath, w.opts.BlockPages); err != nil && !os.IsNotExist(err) {
+		log.Printf("storage: compressing %s (left uncompressed): %v", logPath, err)
+		return
+	}
+	// Retention may have dropped the segment while it was being compressed; do not leave an
+	// orphaned sidecar behind.
+	if w.manifest.Get(id) == nil {
+		_ = os.Remove(zpath)
+	}
 }
 
 // persistLookupIfGrown atomically persists lookup.bin when new services have been

@@ -292,6 +292,97 @@ func TestUndecodableBlockSkippedInBothDirections(t *testing.T) {
 	sameRecords(t, "read back around the bad block", got, want)
 }
 
+// reopen starts and closes a writer on dir with the given block size. Close waits for the
+// background work Start launched, so the directory is settled when it returns.
+func reopen(t *testing.T, dir string, blockPages int) {
+	t.Helper()
+	w, err := NewWriter(dir, Options{SegmentSizeBytes: 1 << 40, FlushInterval: time.Hour, BlockPages: blockPages})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(nil); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+}
+
+func exists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// TestStartCompressesSegmentLeftRaw: compression runs in the background after seal, so a
+// process that dies first leaves a sealed segment raw. The next start must finish the job
+// rather than leave it raw forever.
+func TestStartCompressesSegmentLeftRaw(t *testing.T) {
+	dir, segPath, want := buildRawSegment(t, 3000) // sealed with compression disabled
+
+	reopen(t, dir, 8)
+
+	if exists(segPath) || !exists(SegzPath(segPath)) {
+		t.Fatalf("after restart: raw exists=%v, compressed exists=%v; want only the compressed file",
+			exists(segPath), exists(SegzPath(segPath)))
+	}
+	got, err := readSegmentRecords(segPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sameRecords(t, "compressed at start", got, want)
+}
+
+// TestStartFinishesCompressionInterruptedAfterRename: a crash between renaming the .logz into
+// place and unlinking the raw .log leaves both. The finished .logz is kept, the raw copy goes.
+func TestStartFinishesCompressionInterruptedAfterRename(t *testing.T) {
+	dir, segPath, want := buildRawSegment(t, 3000)
+	raw, err := os.ReadFile(segPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CompressSegment(segPath, 8); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(segPath, raw, 0o644); err != nil { // the unlink "did not happen"
+		t.Fatal(err)
+	}
+
+	reopen(t, dir, 8)
+
+	if exists(segPath) || !exists(SegzPath(segPath)) {
+		t.Fatalf("after restart: raw exists=%v, compressed exists=%v; want only the compressed file",
+			exists(segPath), exists(SegzPath(segPath)))
+	}
+	got, err := readSegmentRecords(segPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sameRecords(t, "after finishing the unlink", got, want)
+}
+
+// TestStartRemovesStaleCompressionTemp: a crash before the rename leaves a .logz.tmp that
+// nothing else would ever remove (retention only deletes whole segments). With compression
+// disabled the raw segment must otherwise stay as it is.
+func TestStartRemovesStaleCompressionTemp(t *testing.T) {
+	dir, segPath, want := buildRawSegment(t, 1000)
+	tmp := SegzPath(segPath) + ".tmp"
+	if err := os.WriteFile(tmp, []byte("half-written sidecar"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reopen(t, dir, -1)
+
+	if exists(tmp) {
+		t.Fatal("stale .logz.tmp should be removed at start")
+	}
+	if !exists(segPath) || exists(SegzPath(segPath)) {
+		t.Fatal("with compression disabled the raw segment must be left as it is")
+	}
+	got, err := readSegmentRecords(segPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sameRecords(t, "raw segment untouched", got, want)
+}
+
 // TestCompressedSegmentIsSmaller is a sanity check that the feature does what it claims on
 // realistic log text — not a ratio assertion, just that it is not a pessimization.
 func TestCompressedSegmentIsSmaller(t *testing.T) {
