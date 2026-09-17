@@ -28,6 +28,11 @@ const (
 type FieldSchema struct {
 	Name string `json:"name"`
 	Type string `json:"type"` // "int" | "float" | "str" | "uuid" (design §6.3); unused in Phase 2
+	// Pattern is the template pattern (or literal) the field's .tidx was built from. The
+	// planner pushes a predicate into this index only if the live config defines the field
+	// with the same pattern. Empty for segments sealed before patterns were recorded, which
+	// the planner therefore scans for typed predicates.
+	Pattern string `json:"pattern,omitempty"`
 }
 
 // SegmentMeta describes a segment file, its time bounds, and the schema it was
@@ -53,6 +58,26 @@ type SegmentMeta struct {
 	// planner must SCAN it and never prune). Without this flag an all-zero-match
 	// indexed segment and a recovered scan-only segment are indistinguishable.
 	Indexed bool `json:"indexed"`
+	// LabelKeys is the label allowlist in force while this segment was written, i.e. the
+	// keys its label index is complete for. The planner pushes a label predicate only for a
+	// key in this list: a key allowlisted after the segment was sealed is absent from its
+	// label index, and pushing it would silently return nothing. LabelKeysRecorded
+	// distinguishes an empty allowlist from a segment that did not record one (sealed before
+	// this field existed, or written without Options.LabelKeys); for those the planner falls
+	// back to the keys actually present in the segment's label index.
+	LabelKeys         []string `json:"label_keys,omitempty"`
+	LabelKeysRecorded bool     `json:"label_keys_recorded,omitempty"`
+}
+
+// SealInfo is everything the writer knows about a segment when it seals it.
+type SealInfo struct {
+	MinTS, MaxTS      int64
+	Schema            []FieldSchema
+	Indexed           bool
+	Records           uint64
+	CappedKeys        []string
+	LabelKeys         []string
+	LabelKeysRecorded bool
 }
 
 // Manifest is the per-shard catalog of segments, held in memory and persisted to
@@ -190,11 +215,14 @@ func (m *Manifest) SetBounds(id string, minTS, maxTS int64) {
 // that read those fields. The schema is the set of fields that have a .tidx for this
 // segment; an empty schema means "scan this segment" (design §7.3), which is how a
 // crash-recovered segment (whose in-RAM index was incomplete) is marked.
-func (m *Manifest) SealSegment(id string, minTS, maxTS int64, schema []FieldSchema, indexed bool, records uint64, cappedKeys []string) {
+func (m *Manifest) SealSegment(id string, info SealInfo) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s, ok := m.segments[id]; ok {
-		s.MinTS, s.MaxTS, s.State, s.Schema, s.Indexed, s.Records, s.CappedKeys = minTS, maxTS, SegmentSealed, schema, indexed, records, cappedKeys
+		s.State = SegmentSealed
+		s.MinTS, s.MaxTS = info.MinTS, info.MaxTS
+		s.Schema, s.Indexed, s.Records, s.CappedKeys = info.Schema, info.Indexed, info.Records, info.CappedKeys
+		s.LabelKeys, s.LabelKeysRecorded = info.LabelKeys, info.LabelKeysRecorded
 		m.sortLocked()
 	}
 }

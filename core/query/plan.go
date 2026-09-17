@@ -48,12 +48,15 @@ func (e *Engine) plan(seg *storage.SegmentMeta, preds []Predicate) ([]plannedLoo
 	for _, p := range preds {
 		switch pred := p.(type) {
 		case TypedCompare:
-			kind, ok := schemaKind(seg, pred.Field)
+			kind, pattern, ok := schemaField(seg, pred.Field)
 			// Push only when: not != (not selective); the field is indexed in this
-			// segment; and the query value's Kind MATCHES the field's indexed kind. A
-			// cross-kind (mistyped) predicate must NOT push — the key would be encoded in
-			// the wrong kind-space. Left as a residual, the scan path handles it.
-			if pred.Op == OpNe || !ok || pred.Value.Kind != kind {
+			// segment; the query value's Kind MATCHES the field's indexed kind (a cross-kind
+			// predicate would encode its key in the wrong kind-space); and the index was
+			// built from the SAME pattern that defines the field now. The scan path extracts
+			// with the live config, so an index built from an edited — or since removed —
+			// template would answer for a different field than the scan does. Otherwise the
+			// predicate stays a residual and the scan path handles it.
+			if pred.Op == OpNe || !ok || pred.Value.Kind != kind || !e.patternMatches(pred.Field, pattern) {
 				keepResidual(p)
 				continue
 			}
@@ -109,6 +112,13 @@ func (e *Engine) plan(seg *storage.SegmentMeta, preds []Predicate) ([]plannedLoo
 			if model.IsReservedLabelKey(pred.Key) || pred.Value == "" || !e.labelAllowed(pred.Key) || segCapped(seg, pred.Key) {
 				continue
 			}
+			// The engine's allowlist says what is indexed NOW; the segment's label index is
+			// complete only for the keys allowlisted when it was written. A key added since
+			// is simply absent from it, and pushing it would return no rows for a segment
+			// full of matches.
+			if !e.segmentIndexesLabel(seg, pred.Key) {
+				continue
+			}
 			key, value := pred.Key, pred.Value
 			cache := e.cache
 			lookups = append(lookups, plannedLookup{run: func(segBase string) ([]uint64, bool) {
@@ -162,6 +172,42 @@ func typedRun(pred TypedCompare, lossless bool) func(r *index.Reader) []uint64 {
 	default:
 		return func(*index.Reader) []uint64 { return nil }
 	}
+}
+
+// patternMatches reports whether a segment's index for field was built from the pattern the
+// query engine currently defines field with. A segment that recorded no pattern (sealed
+// before patterns were recorded) never matches: its index cannot be proven to agree with the
+// scan, so it is scanned.
+func (e *Engine) patternMatches(field, segPattern string) bool {
+	if e.ex == nil || segPattern == "" {
+		return false
+	}
+	live, ok := e.ex.FieldPattern(field)
+	return ok && live == segPattern
+}
+
+// segmentIndexesLabel reports whether a segment's label index is complete for key.
+//
+// A segment that recorded its allowlist answers directly. One that did not falls back to the
+// keys present in its label index: a key that appears there was allowlisted for the whole
+// segment (the allowlist cannot change while a segment is being written, and a crash-recovered
+// segment is re-indexed from scratch), so the index is complete for it. A key that does not
+// appear stays a residual — scanned, never wrongly pruned. If the index cannot be opened the
+// lookup is still planned; it then fails and degrades the segment to a scan as before.
+func (e *Engine) segmentIndexesLabel(seg *storage.SegmentMeta, key string) bool {
+	if seg.LabelKeysRecorded {
+		for _, k := range seg.LabelKeys {
+			if k == key {
+				return true
+			}
+		}
+		return false
+	}
+	r, err := e.cache.lidx(label.IndexPath(strings.TrimSuffix(seg.Path, ".log")))
+	if err != nil {
+		return true
+	}
+	return r.HasKey(key)
 }
 
 func (e *Engine) labelAllowed(key string) bool {
@@ -282,28 +328,28 @@ func schemaHas(seg *storage.SegmentMeta, field string) bool {
 	return false
 }
 
-// schemaKind returns the indexed value kind of a field in the segment's schema. ok is
-// false if the field isn't indexed here or its recorded type is unrecognized (either
-// way → don't push, scan instead).
-func schemaKind(seg *storage.SegmentMeta, field string) (index.ValueKind, bool) {
+// schemaField returns the indexed value kind of a field in the segment's schema and the
+// pattern its index was built from. ok is false if the field isn't indexed here or its
+// recorded type is unrecognized (either way → don't push, scan instead).
+func schemaField(seg *storage.SegmentMeta, field string) (kind index.ValueKind, pattern string, ok bool) {
 	for _, f := range seg.Schema {
 		if f.Name != field {
 			continue
 		}
 		switch f.Type {
 		case "int":
-			return index.KindInt, true
+			return index.KindInt, f.Pattern, true
 		case "float":
-			return index.KindFloat, true
+			return index.KindFloat, f.Pattern, true
 		case "str":
-			return index.KindStr, true
+			return index.KindStr, f.Pattern, true
 		case "uuid":
-			return index.KindUUID, true
+			return index.KindUUID, f.Pattern, true
 		default:
-			return 0, false
+			return 0, "", false
 		}
 	}
-	return 0, false
+	return 0, "", false
 }
 
 // SegmentPlan is how Explain reports the chosen access path per segment.

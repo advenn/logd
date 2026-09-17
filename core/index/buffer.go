@@ -22,6 +22,7 @@ type Buffer struct {
 
 type fieldEntries struct {
 	kind    ValueKind
+	pattern string // carried through to the written schema (see FieldType.Pattern)
 	entries []Entry
 }
 
@@ -31,7 +32,7 @@ type fieldEntries struct {
 func NewBuffer(schema []FieldType) *Buffer {
 	b := &Buffer{byField: make(map[string]*fieldEntries, len(schema))}
 	for _, f := range schema {
-		b.byField[f.Name] = &fieldEntries{kind: f.Kind}
+		b.byField[f.Name] = &fieldEntries{kind: f.Kind, pattern: f.Pattern}
 	}
 	return b
 }
@@ -77,7 +78,7 @@ func (b *Buffer) Flush(segBase string, segmentID uint64) ([]FieldType, error) {
 		if err := WriteTIDX(path, fe.kind, segmentID, fe.entries); err != nil {
 			return written, fmt.Errorf("writing %s: %w", path, err)
 		}
-		written = append(written, FieldType{Name: field, Kind: fe.kind})
+		written = append(written, FieldType{Name: field, Kind: fe.kind, Pattern: fe.pattern})
 	}
 	return written, nil
 }

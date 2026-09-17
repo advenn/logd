@@ -86,7 +86,7 @@ func Compile(cfg config.IndexConfig) (*Engine, error) {
 					return nil, fmt.Errorf("duplicate queryable field %q (template %q)", f.field, tc.Name)
 				}
 				fieldNames[f.field] = true
-				e.schema = append(e.schema, index.FieldType{Name: f.field, Kind: f.kind})
+				e.schema = append(e.schema, index.FieldType{Name: f.field, Kind: f.kind, Pattern: tc.Pattern})
 			} else {
 				litSet[f.literal] = struct{}{}
 			}
@@ -116,7 +116,7 @@ func Compile(cfg config.IndexConfig) (*Engine, error) {
 		fieldNames[field] = true
 		e.bareLiterals = append(e.bareLiterals, lit)
 		e.bareLitField[lit] = field
-		e.schema = append(e.schema, index.FieldType{Name: field, Kind: index.KindStr})
+		e.schema = append(e.schema, index.FieldType{Name: field, Kind: index.KindStr, Pattern: lit})
 		litSet[lit] = struct{}{}
 	}
 
@@ -137,6 +137,19 @@ func (e *Engine) IndexedFields() []index.FieldType { return e.schema }
 func (e *Engine) LiteralField(sub string) (string, bool) {
 	f, ok := e.bareLitField[sub]
 	return f, ok
+}
+
+// FieldPattern reports the pattern that currently defines an indexed field — the template
+// pattern for a capture field, the literal for a literal field — or false if this engine
+// does not extract the field at all. The planner compares it with the pattern recorded in a
+// segment's schema: an index built from a different pattern cannot answer for this one.
+func (e *Engine) FieldPattern(name string) (string, bool) {
+	for _, f := range e.schema {
+		if f.Name == name {
+			return f.Pattern, true
+		}
+	}
+	return "", false
 }
 
 // FieldKind reports whether name is a queryable TEMPLATE CAPTURE field (e.g.

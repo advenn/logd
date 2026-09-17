@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +35,11 @@ type Options struct {
 	// segment is never compressed, so writes and crash recovery keep operating on raw pages.
 	// 0 = DefaultBlockPages, negative = leave sealed segments uncompressed.
 	BlockPages int
+	// LabelKeys is the label allowlist the ingest layer derives label sets with. It is
+	// recorded in each sealed segment's manifest entry so the planner knows which keys that
+	// segment's label index is complete for, even after the allowlist changes. Nil = not
+	// recorded (the planner then trusts only the keys present in the segment's label index).
+	LabelKeys []string
 	// Reindex re-derives a record's typed-range keys and label set (the same work the
 	// ingest layer does). If set, crash recovery re-runs it over the recovered segment's
 	// records to rebuild its in-RAM index, so a recovered segment seals fully-indexed
@@ -904,7 +910,20 @@ func (w *Writer) sealCurrentSegment() error {
 	// Mutate the segment's bounds/state/schema under the manifest lock (never touch the
 	// shared *SegmentMeta fields directly — a concurrent reader could see a torn write).
 	// indexed=false for a recovered segment marks it scan-only for the planner.
-	w.manifest.SealSegment(w.currSeg.ID, w.currSeg.MinTS, w.currSeg.MaxTS, schema, !w.indexIncomplete, w.segRecords, cappedKeys)
+	info := SealInfo{
+		MinTS:      w.currSeg.MinTS,
+		MaxTS:      w.currSeg.MaxTS,
+		Schema:     schema,
+		Indexed:    !w.indexIncomplete,
+		Records:    w.segRecords,
+		CappedKeys: cappedKeys,
+	}
+	if w.opts.LabelKeys != nil {
+		info.LabelKeys = append([]string{}, w.opts.LabelKeys...)
+		sort.Strings(info.LabelKeys)
+		info.LabelKeysRecorded = true
+	}
+	w.manifest.SealSegment(w.currSeg.ID, info)
 	if err := w.manifest.Save(w.dir); err != nil {
 		return fmt.Errorf("saving manifest after seal: %w", err)
 	}
@@ -1005,7 +1024,7 @@ func schemaToManifest(fields []index.FieldType) []FieldSchema {
 	// empty schema means "this segment has no typed-range index, scan it".
 	out := make([]FieldSchema, len(fields))
 	for i, f := range fields {
-		out[i] = FieldSchema{Name: f.Name, Type: kindString(f.Kind)}
+		out[i] = FieldSchema{Name: f.Name, Type: kindString(f.Kind), Pattern: f.Pattern}
 	}
 	return out
 }

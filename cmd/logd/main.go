@@ -60,6 +60,10 @@ func run(configPath string) error {
 		SyncInterval:        cfg.SyncInterval(),
 		BlockPages:          cfg.BlockPages(),
 		MaxLabelCardinality: cfg.MaxLabelValues(),
+		// Recorded per sealed segment, so the planner knows which keys each segment's label
+		// index covers after the allowlist changes. Non-nil even when empty: an empty
+		// allowlist is a recorded fact, not an unknown.
+		LabelKeys: append([]string{}, labels...),
 		// Rebuild a crash-recovered segment's index by re-extracting its records (§8),
 		// using the same extraction + allowlist as live ingest so index == scan.
 		Reindex: func(e model.LogEntry) ([]index.KeyedValue, label.Set) {

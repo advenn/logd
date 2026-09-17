@@ -134,6 +134,51 @@ func TestSealWritesSchemaField(t *testing.T) {
 	}
 }
 
+// TestSealRecordsBuildConfig: a sealed segment records the configuration its indexes were
+// built with — each field's pattern and the label allowlist — so the planner can refuse to
+// use an index after the configuration has changed.
+func TestSealRecordsBuildConfig(t *testing.T) {
+	dir := t.TempDir()
+	opts := noTickOpts()
+	opts.Schema = []index.FieldType{{Name: "latency_ms", Kind: index.KindInt, Pattern: "took {ms:int}ms"}}
+	opts.LabelKeys = []string{"region", "env"}
+	w, err := NewWriter(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Start(nil)
+	if err := w.WriteExtracted(makeEntry(0, 1), []index.KeyedValue{intKV("latency_ms", 250)}, nil); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+
+	m, err := LoadManifest(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seg := m.All()[0]
+	if len(seg.Schema) != 1 || seg.Schema[0].Pattern != "took {ms:int}ms" {
+		t.Fatalf("schema = %+v, want latency_ms with its pattern", seg.Schema)
+	}
+	if !seg.LabelKeysRecorded || strings.Join(seg.LabelKeys, ",") != "env,region" {
+		t.Fatalf("label keys = %v (recorded=%v), want sorted [env region]", seg.LabelKeys, seg.LabelKeysRecorded)
+	}
+
+	// Without Options.LabelKeys nothing is claimed about the allowlist.
+	dir2 := t.TempDir()
+	w2, err := NewWriter(dir2, noTickOpts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	w2.Start(nil)
+	w2.Write(makeEntry(0, 1))
+	w2.Close()
+	m2, _ := LoadManifest(dir2)
+	if m2.All()[0].LabelKeysRecorded {
+		t.Fatal("a writer without Options.LabelKeys must not record an allowlist")
+	}
+}
+
 // TestWriteRejectsRecordLargerThanPage: a record that cannot fit in one page must be refused
 // when it is written, not accepted and then dropped by the writer goroutine, where no caller
 // can see the failure. A record of exactly MaxRecordSize must still be stored.

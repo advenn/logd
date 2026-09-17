@@ -151,6 +151,16 @@ func (r *Reader) Keys() []string {
 	return sortedKeys(seen)
 }
 
+// HasKey reports whether any stream in this index carries key.
+func (r *Reader) HasKey(key string) bool {
+	for i := range r.streams {
+		if _, ok := r.streams[i].set.Get(key); ok {
+			return true
+		}
+	}
+	return false
+}
+
 // Values returns all distinct values for a key, sorted.
 func (r *Reader) Values(key string) []string {
 	seen := map[string]struct{}{}

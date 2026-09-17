@@ -55,9 +55,16 @@ type KeyedValue struct {
 // FieldType names an indexed field and its type. The writer records the set of these
 // as a segment's schema so the planner later consults the segment's own schema, not
 // live config (design §7.3).
+//
+// Pattern is what produced the field's values: the template pattern for a capture field
+// (e.g. "took {ms:int}ms"), the literal itself for a literal existence field. It is part of
+// the field's identity. A field name alone is not enough: editing a template's pattern
+// while keeping its name keeps the field name, and an index built from the old pattern would
+// then answer for a different definition of the field than a scan with the new one.
 type FieldType struct {
-	Name string
-	Kind ValueKind
+	Name    string
+	Kind    ValueKind
+	Pattern string
 }
 
 // EncodeKey produces the 16-byte order-preserving key for a value. See the encoding
