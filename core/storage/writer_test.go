@@ -133,6 +133,93 @@ func TestSealWritesSchemaField(t *testing.T) {
 	}
 }
 
+// TestDataDirRelocatable: moving a shard directory must not lose its data. The manifest used
+// to store full paths built from the configured data_dir, so after a move every sealed segment
+// was "not found" — which the query path reads as a retention race, i.e. an empty result with
+// no error.
+func TestDataDirRelocatable(t *testing.T) {
+	root := t.TempDir()
+	oldDir, newDir := filepath.Join(root, "old"), filepath.Join(root, "moved", "shard")
+	w, err := NewWriter(oldDir, Options{SegmentSizeBytes: 2 * PageSize, FlushInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Start(nil)
+	const n = 300
+	for i := 0; i < n; i++ {
+		w.Write(makeEntry(i, 1))
+	}
+	w.Close() // seals, and waits for the background compressions
+
+	raw, err := os.ReadFile(filepath.Join(oldDir, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), oldDir) {
+		t.Fatalf("manifest.json still stores absolute paths under %s", oldDir)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(newDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(oldDir, newDir); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadAll(newDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPrefixMatches(t, got, n)
+
+	// A writer reopened at the new location sees every segment where it now is.
+	w2, err := NewWriter(newDir, noTickOpts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+	for _, s := range w2.Manifest().All() {
+		if !strings.HasPrefix(s.Path, newDir) {
+			t.Fatalf("segment %s resolved to %s, outside the moved directory", s.ID, s.Path)
+		}
+	}
+}
+
+// TestLegacyManifestPathIgnored: a manifest written before paths became relative stores
+// whatever data_dir was configured at the time. Those strings must not be trusted over the
+// segment files that are actually present.
+func TestLegacyManifestPathIgnored(t *testing.T) {
+	dir := t.TempDir()
+	w, err := NewWriter(dir, Options{SegmentSizeBytes: 2 * PageSize, FlushInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Start(nil)
+	const n = 300
+	for i := 0; i < n; i++ {
+		w.Write(makeEntry(i, 1))
+	}
+	w.Close()
+
+	mpath := filepath.Join(dir, "manifest.json")
+	raw, err := os.ReadFile(mpath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := strings.ReplaceAll(string(raw), `"path": "segments/`, `"path": "/no/such/old-data-dir/shard-0000/segments/`)
+	if legacy == string(raw) {
+		t.Fatal("test setup: expected relative segment paths to rewrite")
+	}
+	if err := os.WriteFile(mpath, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ReadAll(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPrefixMatches(t, got, n)
+}
+
 // TestCrashRecoveryRepublishesBounds is the regression for the SIGKILL data-loss
 // bug: a crash before seal never persisted the active segment's real time bounds,
 // so on restart it loaded with sentinel bounds and dropped out of time-range

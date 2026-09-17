@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -31,9 +33,12 @@ type FieldSchema struct {
 // SegmentMeta describes a segment file, its time bounds, and the schema it was
 // built with.
 type SegmentMeta struct {
-	ID      string        `json:"id"` // ULID: globally unique, sortable, no coordination (§10)
-	MinTS   int64         `json:"min_ts"`
-	MaxTS   int64         `json:"max_ts"`
+	ID    string `json:"id"` // ULID: globally unique, sortable, no coordination (§10)
+	MinTS int64  `json:"min_ts"`
+	MaxTS int64  `json:"max_ts"`
+	// Path is the segment's .log path. In memory it is always resolved against the shard
+	// directory the manifest was loaded from (see SegmentPath); on disk it is stored relative
+	// to that directory, so a shard folder can be moved or mounted elsewhere.
 	Path    string        `json:"path"`
 	State   SegmentState  `json:"state"`
 	Schema  []FieldSchema `json:"schema"`  // fields with a .tidx for this segment
@@ -82,11 +87,63 @@ func LoadManifest(dir string) (*Manifest, error) {
 		return nil, fmt.Errorf("parsing manifest: %w", err)
 	}
 	for _, e := range entries {
+		e.Path = resolveSegmentPath(dir, e)
 		m.segments[e.ID] = e
 		m.byMinTS = append(m.byMinTS, e)
 	}
 	m.sortLocked()
 	return m, nil
+}
+
+// SegmentPath returns the .log path of a segment inside a shard directory. Segment file
+// names are derived from the segment ID alone, so the path never has to be trusted from the
+// manifest.
+func SegmentPath(dir, id string) string {
+	return filepath.Join(dir, "segments", "seg-"+id+".log")
+}
+
+// resolveSegmentPath finds a loaded segment's files relative to the directory the manifest
+// was loaded from.
+//
+// Manifests written before this existed stored the full path built from the configured
+// data_dir. Trusting that string meant a moved or re-mounted data directory made every
+// sealed segment "not found", which the query path deliberately reads as a retention race —
+// an empty result with no error, so all historical data silently vanished. The ID-derived
+// path is therefore tried first; the stored path is only a fallback for files that exist
+// under some other name.
+func resolveSegmentPath(dir string, e *SegmentMeta) string {
+	derived := SegmentPath(dir, e.ID)
+	if segmentFilesExist(derived) {
+		return derived
+	}
+	if e.Path != "" && !filepath.IsAbs(e.Path) {
+		if joined := filepath.Join(dir, e.Path); segmentFilesExist(joined) {
+			return joined
+		}
+	}
+	if e.Path != "" && segmentFilesExist(e.Path) {
+		return e.Path
+	}
+	return derived
+}
+
+// segmentFilesExist reports whether a segment is present, raw or compressed.
+func segmentFilesExist(logPath string) bool {
+	if _, err := os.Stat(logPath); err == nil {
+		return true
+	}
+	_, err := os.Stat(SegzPath(logPath))
+	return err == nil
+}
+
+// relativeSegmentPath is the form a segment path is persisted in: relative to the shard
+// directory when the segment lives inside it, unchanged otherwise.
+func relativeSegmentPath(dir, path string) string {
+	rel, err := filepath.Rel(dir, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return path
+	}
+	return rel
 }
 
 // Add registers a new segment, assigning it a fresh ULID (returned in meta.ID) under the
@@ -224,8 +281,15 @@ func (m *Manifest) Save(dir string) error {
 	// Marshal while holding the read lock so a concurrent writer cannot mutate a
 	// *SegmentMeta's fields mid-serialization (a torn read). Save is not on the hot
 	// path (seal/rotate/recovery only), so holding the lock across marshal is fine.
+	// Paths are written relative to dir (copies, so the in-memory entries keep their
+	// resolved paths).
 	m.mu.RLock()
-	data, err := json.MarshalIndent(m.byMinTS, "", "  ")
+	out := make([]SegmentMeta, len(m.byMinTS))
+	for i, s := range m.byMinTS {
+		out[i] = *s
+		out[i].Path = relativeSegmentPath(dir, s.Path)
+	}
+	data, err := json.MarshalIndent(out, "", "  ")
 	m.mu.RUnlock()
 	if err != nil {
 		return fmt.Errorf("serializing manifest: %w", err)

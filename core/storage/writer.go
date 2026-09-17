@@ -790,7 +790,7 @@ func (w *Writer) rotateSegment() error {
 	// from that ID (never read manifest.nextID outside the lock).
 	meta := &SegmentMeta{State: SegmentActive, MinTS: emptyMinTS, MaxTS: emptyMaxTS, Schema: []FieldSchema{}}
 	w.manifest.Add(meta)
-	meta.Path = fmt.Sprintf("%s/seg-%s.log", w.segDir, meta.ID)
+	meta.Path = SegmentPath(w.dir, meta.ID)
 
 	seg, err := CreateSegment(meta.Path)
 	if err != nil {
