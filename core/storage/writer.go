@@ -526,13 +526,17 @@ func (w *Writer) processEntry(rec record) {
 	// then encode (skipped for a recovered scan-only segment).
 	indexing := !w.indexIncomplete
 	var streamID uint32
+	var canon string // rec.labels.Canonical(), computed once when the record is interned
 	if indexing && w.labelBuf != nil {
 		// Enforce the per-key value-cardinality cap: over-cap pairs are dropped from the
 		// INDEXED set (they remain in the record's Extra, found by scan) so the label
 		// index can't explode on a high-cardinality key. The reduced set is what we intern,
 		// track for discovery, and post — keeping index and scan consistent.
 		rec.labels = w.card.Apply(rec.labels)
-		streamID = w.labelBuf.Intern(rec.labels)
+		// One Canonical() serves both the interning dictionary and the live-discovery map
+		// below; it allocates, and this runs per record.
+		canon = rec.labels.Canonical()
+		streamID = w.labelBuf.InternCanonical(canon, rec.labels)
 		e.StreamID = streamID
 	}
 
@@ -554,9 +558,13 @@ func (w *Writer) processEntry(rec record) {
 
 	w.segRecords++
 	if indexing && len(rec.labels) > 0 {
-		// Track the active segment's label streams for immediate discovery.
+		// Track the active segment's label streams for immediate discovery, reusing the
+		// canonical string already computed for interning.
+		if canon == "" {
+			canon = rec.labels.Canonical()
+		}
 		w.liveMu.Lock()
-		w.liveStreams[rec.labels.Canonical()] = rec.labels
+		w.liveStreams[canon] = rec.labels
 		w.liveMu.Unlock()
 	}
 

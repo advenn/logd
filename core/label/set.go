@@ -40,8 +40,41 @@ func NewSet(m map[string]string) Set {
 	for k, v := range m {
 		s = append(s, Pair{Key: k, Value: v})
 	}
-	sort.Slice(s, func(i, j int) bool { return s[i].Key < s[j].Key })
+	sortByKey(s)
 	return s
+}
+
+// NewSetPairs canonicalizes pairs in place: sorted by key, duplicates collapsed to the
+// LAST occurrence, which is what building a map and ranging over it would have produced.
+// It exists so a caller that already knows its keys need not build a throwaway map just to
+// get those two properties — on the ingest path that map was allocated and discarded once
+// per record.
+func NewSetPairs(pairs []Pair) Set {
+	if len(pairs) == 0 {
+		return nil
+	}
+	sortByKey(pairs)
+	out := pairs[:1]
+	for _, p := range pairs[1:] {
+		if p.Key == out[len(out)-1].Key {
+			out[len(out)-1] = p // last wins, as a map assignment would
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// sortByKey is a stable insertion sort. Label sets are tiny (an allowlist is a handful of
+// keys), where insertion sort beats a general sort outright — and crucially sort.Slice is
+// reflection-based, so it ALLOCATES: it was 15% of the ingest path's allocations, entirely
+// to order two pairs.
+func sortByKey(s []Pair) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j].Key < s[j-1].Key; j-- {
+			s[j], s[j-1] = s[j-1], s[j]
+		}
+	}
 }
 
 // Canonical returns a stable, UNAMBIGUOUS string identity for the set, used as the dedup

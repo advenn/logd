@@ -120,3 +120,46 @@ func TestReaderRejectsCorruptFile(t *testing.T) {
 		t.Fatal("OpenReader accepted a corrupt .lidx (should error so caller scans)")
 	}
 }
+
+// NewSetPairs replaced a map+NewSet round trip on the ingest path, so it must be exactly
+// equivalent to it — including the two properties the map was providing for free: keys
+// sorted, and a duplicate key collapsing to its LAST occurrence.
+func TestNewSetPairsMatchesNewSet(t *testing.T) {
+	cases := [][]Pair{
+		{},
+		{{Key: "region", Value: "eu"}},
+		{{Key: "region", Value: "eu"}, {Key: "env", Value: "prod"}},
+		{{Key: "z", Value: "1"}, {Key: "a", Value: "2"}, {Key: "m", Value: "3"}},
+		{{Key: "dup", Value: "first"}, {Key: "dup", Value: "last"}},
+		{{Key: "b", Value: "1"}, {Key: "dup", Value: "first"}, {Key: "a", Value: "2"}, {Key: "dup", Value: "last"}},
+	}
+	for _, pairs := range cases {
+		m := make(map[string]string, len(pairs))
+		for _, p := range pairs {
+			m[p.Key] = p.Value // last wins, which is what the old code relied on
+		}
+		want := NewSet(m)
+
+		got := NewSetPairs(append([]Pair(nil), pairs...))
+		if got.Canonical() != want.Canonical() {
+			t.Fatalf("NewSetPairs(%v) = %v, want %v", pairs, got, want)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("NewSetPairs(%v) has %d pairs, want %d", pairs, len(got), len(want))
+		}
+	}
+}
+
+// The sort must be stable, or a duplicate key would collapse to an arbitrary occurrence
+// instead of the last one and two identical records could intern to different streams.
+func TestNewSetPairsDuplicateTakesLast(t *testing.T) {
+	s := NewSetPairs([]Pair{
+		{Key: "k", Value: "a"}, {Key: "k", Value: "b"}, {Key: "k", Value: "c"},
+	})
+	if len(s) != 1 {
+		t.Fatalf("got %d pairs, want 1: %v", len(s), s)
+	}
+	if v, _ := s.Get("k"); v != "c" {
+		t.Fatalf("k = %q, want c (the last occurrence)", v)
+	}
+}

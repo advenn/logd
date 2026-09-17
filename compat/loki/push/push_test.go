@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/advenn/logd/core/model"
+	"github.com/golang/snappy"
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
@@ -107,4 +108,74 @@ func TestDecodeJSONBasic(t *testing.T) {
 	if e.Level.String() != "WARN" {
 		t.Fatalf("level from label not applied: %s", e.Level)
 	}
+}
+
+// The stream-level label marshal is hoisted out of the per-entry loop, so this pins the
+// invariant that makes that safe: every entry under one stream must carry byte-identical
+// Extra and the same stream-derived level, and an entry that DOES carry structured
+// metadata must still get its own overlaid Extra rather than the hoisted one.
+func TestDecodeStreamLabelsHoistedIdentically(t *testing.T) {
+	labels := `{app="checkout",level="warn",region="eu"}`
+	var stream []byte
+	stream = protowire.AppendTag(stream, 1, protowire.BytesType)
+	stream = protowire.AppendString(stream, labels)
+	for i := 0; i < 3; i++ {
+		stream = appendTestEntry(stream, int64(i), "line", nil)
+	}
+	// A fourth entry overlays region=us via structured metadata.
+	stream = appendTestEntry(stream, 3, "line", map[string]string{"region": "us"})
+
+	entries, err := decodeProtoStream(t, stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 4 {
+		t.Fatalf("decoded %d entries, want 4", len(entries))
+	}
+
+	want := `{"app":"checkout","level":"warn","region":"eu"}`
+	for i, e := range entries[:3] {
+		if e.Extra != want {
+			t.Fatalf("entry %d Extra = %q, want %q", i, e.Extra, want)
+		}
+		if e.Level != model.LogLevelWarn {
+			t.Fatalf("entry %d Level = %v, want warn", i, e.Level)
+		}
+	}
+	if entries[3].Extra == want {
+		t.Fatal("the structured-metadata entry reused the hoisted stream Extra; its region=us overlay was lost")
+	}
+	if entries[3].Extra != `{"app":"checkout","level":"warn","region":"us"}` {
+		t.Fatalf("metadata entry Extra = %q", entries[3].Extra)
+	}
+}
+
+func appendTestEntry(dst []byte, ts int64, line string, meta map[string]string) []byte {
+	var tsMsg []byte
+	tsMsg = protowire.AppendTag(tsMsg, 1, protowire.VarintType)
+	tsMsg = protowire.AppendVarint(tsMsg, uint64(ts))
+	var msg []byte
+	msg = protowire.AppendTag(msg, 1, protowire.BytesType)
+	msg = protowire.AppendBytes(msg, tsMsg)
+	msg = protowire.AppendTag(msg, 2, protowire.BytesType)
+	msg = protowire.AppendString(msg, line)
+	for k, v := range meta {
+		var pair []byte
+		pair = protowire.AppendTag(pair, 1, protowire.BytesType)
+		pair = protowire.AppendString(pair, k)
+		pair = protowire.AppendTag(pair, 2, protowire.BytesType)
+		pair = protowire.AppendString(pair, v)
+		msg = protowire.AppendTag(msg, 3, protowire.BytesType)
+		msg = protowire.AppendBytes(msg, pair)
+	}
+	dst = protowire.AppendTag(dst, 2, protowire.BytesType)
+	return protowire.AppendBytes(dst, msg)
+}
+
+func decodeProtoStream(t *testing.T, stream []byte) ([]model.LogEntry, error) {
+	t.Helper()
+	var req []byte
+	req = protowire.AppendTag(req, 1, protowire.BytesType)
+	req = protowire.AppendBytes(req, stream)
+	return decodeProto(snappy.Encode(nil, req))
 }

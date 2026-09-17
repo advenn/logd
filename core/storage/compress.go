@@ -138,6 +138,17 @@ func CompressSegment(logPath string, blockPages int) (bool, error) {
 	raw := make([]byte, blockPages*PageSize)
 	fileOff := uint64(segzHeaderLenV2 + len(dict) + dirLen)
 	var comp bytes.Buffer
+
+	// One compressor, reused across every block. flate.NewWriterDict allocates the whole
+	// deflate state — a 32 KB window plus the match hash tables, ~660 KB — and a segment
+	// has thousands of blocks, so constructing one per block made sealing allocate over a
+	// gigabyte for a 64 MB segment. Reset is documented to leave the writer equivalent to
+	// a fresh NewWriterDict with the same level and dictionary, so each block is still
+	// compressed independently and the bytes are unchanged.
+	zw, err := flate.NewWriterDict(&comp, segzLevel, dict)
+	if err != nil {
+		return false, err
+	}
 	for b := uint64(0); b < numBlocks; b++ {
 		startPage := b * uint64(blockPages)
 		n := blockPages
@@ -149,10 +160,7 @@ func CompressSegment(logPath string, blockPages int) (bool, error) {
 			return false, fmt.Errorf("reading pages for block %d: %w", b, err)
 		}
 		comp.Reset()
-		zw, err := flate.NewWriterDict(&comp, segzLevel, dict)
-		if err != nil {
-			return false, err
-		}
+		zw.Reset(&comp)
 		if _, err := zw.Write(buf); err != nil {
 			return false, err
 		}

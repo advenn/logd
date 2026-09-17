@@ -43,7 +43,15 @@ func NewBuilder() *Builder {
 // Intern returns the StreamID for a label set, assigning a new one the first time the
 // set is seen in this segment.
 func (b *Builder) Intern(s Set) uint32 {
-	c := s.Canonical()
+	return b.InternCanonical(s.Canonical(), s)
+}
+
+// InternCanonical is Intern for a caller that has already computed s.Canonical(). The
+// writer needs the same string for its live-stream discovery map, and Canonical allocates
+// (it builds a length-prefixed encoding of every pair), so recomputing it made the label
+// index cost two identical allocations per record instead of one. c MUST be s.Canonical()
+// — passing anything else would merge or split streams.
+func (b *Builder) InternCanonical(c string, s Set) uint32 {
 	if id, ok := b.byCanon[c]; ok {
 		return id
 	}

@@ -380,3 +380,68 @@ func TestSegzVersion1StillReadable(t *testing.T) {
 		t.Errorf("v1 fetch by offset: got %d records, want %d", seen, len(offsets))
 	}
 }
+
+// Sealing a segment compresses it, and CompressSegment used to construct a flate writer
+// per block — ~660 KB of deflate window and hash tables for every 32 KB of data. Sealing
+// runs off the writer goroutine, so it never blocked ingest directly, but it still competes
+// for CPU with it, and on a core-limited deployment that is the same thing.
+//
+// The benchmark also guards the ratio: reusing one writer via Reset must produce identical
+// output to a fresh NewWriterDict per block, so a regression in compression would show up
+// here as a changed compressed-bytes metric.
+func BenchmarkCompressSegment(b *testing.B) {
+	dir := b.TempDir()
+	w, err := NewWriter(dir, Options{SegmentSizeBytes: 1 << 40, FlushInterval: time.Hour, BlockPages: -1})
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := w.Start(nil); err != nil {
+		b.Fatal(err)
+	}
+	base := time.Unix(1700000000, 0).UTC()
+	const records = 100000
+	for i := 0; i < records; i++ {
+		e := model.LogEntry{
+			TS:      base.Add(time.Duration(i) * time.Second),
+			Level:   model.LogLevel(i % 4),
+			Extra:   `{"app":"bench","region":"eu"}`,
+			Message: fmt.Sprintf("GET /api/v1/orders/%d 200 took=%dms trace_id=%016x", i, 10+i%3000, i),
+		}
+		for w.WriteExtracted(e, nil, nil) != nil {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	w.Close()
+	golden := w.Manifest().All()[0].Path
+	raw, err := os.ReadFile(golden)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	var compressed int64
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		path := filepath.Join(b.TempDir(), "seg.log")
+		if err := os.WriteFile(path, raw, 0o644); err != nil {
+			b.Fatal(err)
+		}
+		b.StartTimer()
+
+		ok, err := CompressSegment(path, 8)
+		if err != nil || !ok {
+			b.Fatalf("CompressSegment: ok=%v err=%v", ok, err)
+		}
+
+		b.StopTimer()
+		fi, err := os.Stat(SegzPath(path))
+		if err != nil {
+			b.Fatal(err)
+		}
+		compressed = fi.Size()
+		b.StartTimer()
+	}
+	b.ReportMetric(float64(len(raw))/float64(compressed), "ratio")
+	b.ReportMetric(float64(len(raw))/1e6/(b.Elapsed().Seconds()/float64(b.N)), "MB/s")
+}

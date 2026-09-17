@@ -105,7 +105,10 @@ func DeriveLabels(extra string, labelKeys []string) label.Set {
 	// model.ExtraLabel is proven equivalent to ParseExtraLabels(extra)[key] by a
 	// differential test and a fuzz target, so the derived label set — and therefore the
 	// label index built from it — is unchanged.
-	var m map[string]string
+	// Collect straight into pairs rather than into a map that NewSet would immediately
+	// convert back into pairs: the map was allocated, filled and discarded once per record
+	// purely to sort and deduplicate a handful of keys, which NewSetPairs does in place.
+	var pairs []label.Pair
 	for _, k := range labelKeys {
 		if model.IsReservedLabelKey(k) {
 			continue // level/service resolve from entry fields, never from Extra (see model)
@@ -114,10 +117,10 @@ func DeriveLabels(extra string, labelKeys []string) label.Set {
 		if !ok {
 			continue
 		}
-		if m == nil {
-			m = make(map[string]string, len(labelKeys))
+		if pairs == nil {
+			pairs = make([]label.Pair, 0, len(labelKeys))
 		}
-		m[k] = v
+		pairs = append(pairs, label.Pair{Key: k, Value: v})
 	}
-	return label.NewSet(m)
+	return label.NewSetPairs(pairs)
 }
