@@ -7,9 +7,11 @@ data_dir: /data                 # persist on a Docker volume, NOT the container 
 segment_size_mb: 64
 flush_interval_ms: 500
 # Group commit: how long a written page may sit unsynced. fsync is the write path's entire
-# bottleneck — per-page fsync measures ~21k lines/s, 50ms measures ~1.05M. A crash risks at
-# most this much accepted data; nothing becomes corrupt (a partial page is CRC-caught and
-# truncated on recovery). Negative = fsync every page.
+# bottleneck — per-page fsync measures ~21k lines/s, 50ms measures ~1.05M. Pushes are
+# acknowledged once queued, not once durable: a process crash can lose queued entries and the
+# page still being filled (up to flush_interval_ms); a machine crash can also lose pages not
+# yet fsynced (up to sync_interval_ms plus one flush tick). Nothing becomes corrupt (a partial
+# page is CRC-caught and truncated on recovery). Negative = fsync every page.
 sync_interval_ms: 50
 # Sealed segments are compressed into blocks of this many 4KB pages (the active segment
 # stays raw). Bigger blocks compress better but decompress more per random lookup: measured

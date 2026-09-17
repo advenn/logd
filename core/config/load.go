@@ -102,12 +102,14 @@ func (c *Config) Retention() time.Duration {
 // measures ~21k lines/s on NVMe; a 50ms window measures ~1.05M — a 51x difference that is
 // entirely syscall, not work.
 //
-// The default is 50ms. On a machine crash that risks at most ~50ms of accepted logs, which
-// is still markedly stronger than the systems logd is compared against: Loki holds chunks
-// in memory until a flush threshold, and VictoriaLogs defaults to a 5s in-memory flush
-// interval. Nothing becomes CORRUPT either way — a partially written page is caught by the
-// full-page CRC and truncated on recovery, the same mechanism that already handled a torn
-// trailing page.
+// The default is 50ms. This window is only the LAST stage of the loss window, not all of it:
+// a push is acknowledged once its entries are queued for the writer, not once they are
+// durable. A process crash loses whatever is still queued plus the page being filled, which
+// is written when it fills or on the flush tick (flush_interval_ms, 500ms by default), so at
+// low ingest rates that — not this setting — bounds the loss. A machine crash can additionally
+// lose pages written but not yet fsynced: up to this interval plus one flush tick. Nothing
+// becomes CORRUPT either way — a partially written page is caught by the full-page CRC and
+// truncated on recovery, the same mechanism that already handled a torn trailing page.
 //
 // Set a NEGATIVE value for fsync-every-page (strongest, ~50x slower). Zero means unset and
 // takes the default, matching how max_label_values_per_key already behaves.

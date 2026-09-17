@@ -138,9 +138,12 @@ VictoriaLogs and 13× behind Loki. It is now 2.6× and 1.8× behind. What change
   it is now synced once at seal instead of every page. That alone was 13.7k → 20.8k lines/s
   with no durability change.
 - **Group commit** (`sync_interval_ms`, default 50 ms) took the isolated writer from 20.8k
-  to **1.05M lines/s** — 51×. A crash risks at most ~50 ms of accepted logs; a partial page
-  is still CRC-caught and truncated on recovery, so data is never corrupt, only absent.
-  Negative restores fsync-every-page.
+  to **1.05M lines/s** — 51×. Pushes are acknowledged once queued, so the window of
+  accepted-but-lost logs is wider than the sync interval alone: a process crash loses the
+  queue and the page being filled (up to `flush_interval_ms`, 500 ms by default), and a
+  machine crash can additionally lose pages not yet fsynced (up to `sync_interval_ms` plus
+  one flush tick). A partial page is still CRC-caught and truncated on recovery, so data is
+  never corrupt, only absent. Negative restores fsync-every-page.
 - **Label derivation** was then the biggest remaining per-record cost (46%, 31 of 38
   allocations) — it built the whole label map to keep 3 allowlisted keys, the same waste
   already fixed on the read path. 6998 → 4811 ns/record.
