@@ -269,6 +269,11 @@ type pageSource struct {
 	cachedBlock uint64
 	cached      []byte
 	haveCache   bool
+
+	// The last block that failed to inflate. Every page of a bad block would otherwise retry
+	// the same doomed decompression, once per page.
+	failedBlock uint64
+	failedErr   error
 }
 
 // openPageSource opens a segment for reading, preferring the compressed sidecar.
@@ -371,7 +376,11 @@ func (s *pageSource) readPage(n uint64, buf []byte) error {
 	}
 	block := n / uint64(s.blockPages)
 	if !s.haveCache || s.cachedBlock != block {
+		if s.failedErr != nil && s.failedBlock == block {
+			return s.failedErr
+		}
 		if err := s.loadBlock(block); err != nil {
+			s.failedBlock, s.failedErr = block, err
 			return err
 		}
 	}

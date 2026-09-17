@@ -207,6 +207,91 @@ func TestCorruptDirectoryDegrades(t *testing.T) {
 	}
 }
 
+// corruptBlockStart makes one compressed block undecodable by overwriting the start of its
+// deflate stream with 0xFF (BTYPE=11 is reserved, so inflating fails outright rather than
+// producing garbage that page CRCs would catch). It returns the logical pages that block
+// holds.
+func corruptBlockStart(t *testing.T, segPath string, block uint32) (firstPage, lastPage uint64) {
+	t.Helper()
+	zpath := SegzPath(segPath)
+	data, err := os.ReadFile(zpath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockPages := uint64(binary.BigEndian.Uint16(data[6:8]))
+	numBlocks := binary.BigEndian.Uint32(data[16:20])
+	if block >= numBlocks {
+		t.Fatalf("block %d out of range (%d blocks)", block, numBlocks)
+	}
+	dictLen := binary.BigEndian.Uint32(data[24:28])
+	entry := data[segzHeaderLenV2+int(dictLen)+int(block)*segzDirEntry:]
+	fileOff := binary.BigEndian.Uint64(entry[0:8])
+	copy(data[fileOff:fileOff+4], []byte{0xFF, 0xFF, 0xFF, 0xFF})
+	if err := os.WriteFile(zpath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return uint64(block) * blockPages, uint64(block)*blockPages + blockPages - 1
+}
+
+// TestUndecodableBlockSkippedInBothDirections: when one block fails to inflate, every reader
+// must lose exactly that block's pages and nothing else. A forward scan used to stop at the
+// bad block and drop the rest of the segment, while a backward scan and FetchRecords skipped
+// only the block — three different answers to the same question.
+func TestUndecodableBlockSkippedInBothDirections(t *testing.T) {
+	_, segPath, all := buildRawSegment(t, 6000)
+	if _, err := CompressSegment(segPath, 8); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(SegzPath(segPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	numBlocks := binary.BigEndian.Uint32(data[16:20])
+	first, last := corruptBlockStart(t, segPath, numBlocks/2)
+
+	var want []Record
+	var offsets []uint64
+	for _, r := range all {
+		offsets = append(offsets, r.Offset)
+		if p := r.Offset / PageSize; p < first || p > last {
+			want = append(want, r)
+		}
+	}
+	if len(want) == len(all) || len(want) == 0 {
+		t.Fatalf("the corrupted block should hold some but not all records (kept %d of %d)", len(want), len(all))
+	}
+
+	for _, reverse := range []bool{false, true} {
+		n := 0
+		if err := ScanSegmentPages(segPath, 0, 1<<62, reverse, nil, func(model.LogEntry) bool {
+			n++
+			return true
+		}); err != nil {
+			t.Fatalf("reverse=%v: %v", reverse, err)
+		}
+		if n != len(want) {
+			t.Errorf("reverse=%v: scanned %d records, want %d (everything outside the bad block)", reverse, n, len(want))
+		}
+	}
+
+	fetched := 0
+	if err := FetchRecords(segPath, offsets, func(model.LogEntry) bool {
+		fetched++
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if fetched != len(want) {
+		t.Errorf("FetchRecords returned %d records, want %d", fetched, len(want))
+	}
+
+	got, err := readSegmentRecords(segPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sameRecords(t, "read back around the bad block", got, want)
+}
+
 // TestCompressedSegmentIsSmaller is a sanity check that the feature does what it claims on
 // realistic log text — not a ratio assertion, just that it is not a pessimization.
 func TestCompressedSegmentIsSmaller(t *testing.T) {

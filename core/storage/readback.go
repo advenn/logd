@@ -91,7 +91,7 @@ func readSegmentEntries(path string) ([]model.LogEntry, error) {
 	page := make([]byte, PageSize)
 	for p := uint64(1); p < numPages; p++ { // page 0 is the placeholder
 		if err := src.readPage(p, page); err != nil {
-			break
+			continue // unreadable page (e.g. a block that fails to inflate): skip it, not the rest
 		}
 		if err := ValidatePage(page); err != nil {
 			continue // skip a corrupt/torn page
@@ -169,11 +169,13 @@ func ScanSegmentPages(path string, start, end int64, reverse bool, skipPage func
 		if reverse {
 			p = numPages - 1 - n
 		}
+		// An unreadable page is skipped in BOTH directions. Stopping here on a forward scan
+		// used to drop every later page of the segment when one compressed block failed to
+		// inflate, while a backward scan and FetchRecords skipped only that block's pages — so
+		// the index path, the forward scan and the backward scan returned three different
+		// answers for the same query.
 		if err := src.readPage(p, page); err != nil {
-			if reverse {
-				continue
-			}
-			break
+			continue
 		}
 		if err := ValidatePage(page); err != nil {
 			continue
@@ -216,7 +218,7 @@ func readSegmentRecords(path string) ([]Record, error) {
 	page := make([]byte, PageSize)
 	for p := uint64(1); p < numPages; p++ {
 		if err := src.readPage(p, page); err != nil {
-			break
+			continue // same degrade as the scan and fetch paths: skip the page, keep going
 		}
 		if err := ValidatePage(page); err != nil {
 			continue
