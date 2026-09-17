@@ -310,7 +310,19 @@ func (e *Engine) extractValues(message string, count bool) []FieldValue {
 // This is the INGEST entry point, so it is where the per-template counters are updated:
 // one increment per record ingested, independent of how often that record is later read.
 func (e *Engine) Extract(message string) []index.KeyedValue {
-	vals := e.extractValues(message, true)
+	return encodeKeys(e.extractValues(message, true))
+}
+
+// ReExtract returns exactly what Extract returns but leaves the per-template counters
+// untouched. It is for re-deriving keys from records that were already ingested — crash
+// recovery rebuilding a segment's index — which Extract would count a second time, inflating
+// the candidates/matches/failures that /logd/api/v1/index_stats reports.
+func (e *Engine) ReExtract(message string) []index.KeyedValue {
+	return encodeKeys(e.extractValues(message, false))
+}
+
+// encodeKeys turns extracted values into index keys, de-duplicated on (field, key).
+func encodeKeys(vals []FieldValue) []index.KeyedValue {
 	if len(vals) == 0 {
 		return nil
 	}

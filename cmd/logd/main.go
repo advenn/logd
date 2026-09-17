@@ -69,7 +69,8 @@ func run(configPath string) error {
 		Reindex: func(e model.LogEntry) ([]index.KeyedValue, label.Set) {
 			var keys []index.KeyedValue
 			if engine != nil {
-				keys = engine.Extract(e.Message)
+				// ReExtract: these records were already counted when first ingested.
+				keys = engine.ReExtract(e.Message)
 			}
 			return keys, ingest.DeriveLabels(e.Extra, labels)
 		},

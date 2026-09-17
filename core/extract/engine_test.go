@@ -102,6 +102,40 @@ func TestExtractParseFailureCounted(t *testing.T) {
 	}
 }
 
+// ReExtract is used by crash recovery to rebuild the index of records that were already
+// ingested (and counted). It must produce the same keys as Extract without counting them
+// again.
+func TestReExtractMatchesExtractWithoutCounting(t *testing.T) {
+	e := mustCompile(t, sampleCfg())
+	msgs := []string{"req took 250ms", "took xxms", "no anchor here", "took 5ms then took 7ms"}
+	for _, m := range msgs {
+		e.Extract(m)
+	}
+	before := e.Stats()
+
+	fresh := mustCompile(t, sampleCfg())
+	for _, m := range msgs {
+		want := fresh.Extract(m)
+		got := e.ReExtract(m)
+		if len(got) != len(want) {
+			t.Fatalf("%q: ReExtract returned %d keys, Extract %d", m, len(got), len(want))
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("%q: key %d differs: %+v vs %+v", m, i, got[i], want[i])
+			}
+		}
+	}
+
+	after := e.Stats()
+	for i := range before {
+		b, a := before[i], after[i]
+		if b.Candidates != a.Candidates || b.Matches != a.Matches || b.Failures != a.Failures {
+			t.Fatalf("ReExtract moved the counters for %s: %+v -> %+v", before[i].Name, before[i], after[i])
+		}
+	}
+}
+
 func TestExtractSignedNumbers(t *testing.T) {
 	e := mustCompile(t, config.IndexConfig{Templates: []config.Template{
 		{Name: "d", Pattern: "delta {n:int} done"},
