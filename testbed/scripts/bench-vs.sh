@@ -25,13 +25,23 @@ fi
 # wrong place and silently hands curl a garbage URL.
 SEP=$'\x1f'
 ENGINES=()
-add() { ENGINES+=("$1${SEP}$2${SEP}$3"); }
+add() { ENGINES+=("$1${SEP}$2${SEP}$3${SEP}$4"); } # name, url, query, response format
 
 APP="${APP:-checkout}"
-add "logd (typed index)"  "http://localhost:7100/loki/api/v1/query_range" "{app=\"$APP\"} | latency_ms > 200"
-add "logd (forced scan)"  "http://localhost:7100/logd/api/v1/query_scan"  "{app=\"$APP\"} | latency_ms > 200"
-add "Loki (| pattern)"    "http://localhost:3100/loki/api/v1/query_range" "{app=\"$APP\"} |= \"took=\" | pattern \"<_>took=<latency_ms>ms<_>\" | latency_ms > 200"
-add "Loki (| regexp)"     "http://localhost:3100/loki/api/v1/query_range" "{app=\"$APP\"} |= \"took=\" | regexp \"took=(?P<latency_ms>[0-9]+)ms\" | latency_ms > 200"
+# The threshold is a variable so the same script can walk a selectivity sweep: on the shipped
+# corpus > 200 matches 5.4% of lines and > 5000 matches 0.09%, which is the range where the
+# answer changes (an index wins on the selective end, a scan-based store is flat).
+T="${THRESHOLD:-200}"
+# Each engine carries the response format its row count has to be read from: Loki's JSON for
+# logd and Loki, one JSON object per line for VictoriaLogs' LogsQL endpoint.
+add "logd (typed index)"  "http://localhost:7100/loki/api/v1/query_range" "{app=\"$APP\"} | latency_ms > $T" loki
+add "logd (forced scan)"  "http://localhost:7100/logd/api/v1/query_scan"  "{app=\"$APP\"} | latency_ms > $T" loki
+add "Loki (| pattern)"    "http://localhost:3100/loki/api/v1/query_range" "{app=\"$APP\"} |= \"took=\" | pattern \"<_>took=<latency_ms>ms<_>\" | latency_ms > $T" loki
+add "Loki (| regexp)"     "http://localhost:3100/loki/api/v1/query_range" "{app=\"$APP\"} |= \"took=\" | regexp \"took=(?P<latency_ms>[0-9]+)ms\" | latency_ms > $T" loki
+# VictoriaLogs speaks the Loki PUSH protocol but not the Loki QUERY API, so it is measured on
+# its own endpoint in LogsQL. Without this row the comparison quietly omits the engine that the
+# earlier measurements found to be the real competitor.
+add "VictoriaLogs (extract)" "http://localhost:9428/select/logsql/query" "_stream:{app=\"$APP\"} \"took=\" | extract \"took=<latency_ms>ms\" | latency_ms:>$T" jsonl
 
 hit() { # url query outfile
   curl -sS -G "$1" \
@@ -41,7 +51,12 @@ hit() { # url query outfile
     --data-urlencode "limit=200000" -o "$3"
 }
 
-rows() { python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(sum(len(r['values']) for r in d['data']['result']))" "$1"; }
+rows() { # file format
+  case "$2" in
+    jsonl) grep -c . "$1" || true ;;  # one JSON object per matching record
+    *) python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(sum(len(r['values']) for r in d['data']['result']))" "$1" ;;
+  esac
+}
 
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 
@@ -52,9 +67,9 @@ tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 echo "Row counts (must all agree, and be non-zero):"
 gate_rows=""
 for e in "${ENGINES[@]}"; do
-  IFS="$SEP" read -r name url q <<<"$e"
+  IFS="$SEP" read -r name url q fmt <<<"$e"
   hit "$url" "$q" "$tmp/check"
-  n=$(rows "$tmp/check")
+  n=$(rows "$tmp/check" "$fmt")
   printf "  %-22s %s rows\n" "$name" "$n"
   if [[ "$n" == "0" ]]; then
     echo >&2; echo "ABORT: '$name' returned 0 rows — nothing to measure. Check the query, the app label and the time window." >&2
@@ -69,7 +84,7 @@ done
 echo
 
 for e in "${ENGINES[@]}"; do
-  IFS="$SEP" read -r name url q <<<"$e"
+  IFS="$SEP" read -r name url q fmt <<<"$e"
   for ((i=0; i<WARMUP; i++)); do hit "$url" "$q" /dev/null; done
   : > "$tmp/$(echo "$name" | tr -c 'a-zA-Z0-9' '_').samples"
 done
@@ -77,7 +92,7 @@ done
 echo "Collecting $RUNS interleaved samples per engine..."
 for ((r=0; r<RUNS; r++)); do
   for e in "${ENGINES[@]}"; do
-    IFS="$SEP" read -r name url q <<<"$e"
+    IFS="$SEP" read -r name url q fmt <<<"$e"
     f="$tmp/$(echo "$name" | tr -c 'a-zA-Z0-9' '_').samples"
     t0=$(date +%s%N); hit "$url" "$q" /dev/null; t1=$(date +%s%N)
     echo "scale=2; ($t1-$t0)/1000000" | bc >> "$f"
@@ -88,7 +103,7 @@ echo
 printf "%-22s %9s %9s %9s\n" "engine" "median" "min" "max"
 printf "%-22s %9s %9s %9s\n" "----------------------" "---------" "---------" "---------"
 for e in "${ENGINES[@]}"; do
-  IFS="$SEP" read -r name url q <<<"$e"
+  IFS="$SEP" read -r name url q fmt <<<"$e"
   f="$tmp/$(echo "$name" | tr -c 'a-zA-Z0-9' '_').samples"
   python3 - "$name" "$f" <<'PY'
 import statistics, sys
