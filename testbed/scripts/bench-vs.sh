@@ -59,6 +59,14 @@ rows() { # file format
 }
 
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+# RESULTS_DIR keeps every raw sample, so percentiles can be recomputed and plots rebuilt from the
+# same run instead of re-measuring (the thesis methodology asks for the raw output).
+if [[ -n "${RESULTS_DIR:-}" ]]; then mkdir -p "$RESULTS_DIR"; fi
+save_samples() { # label file
+  [[ -z "${RESULTS_DIR:-}" ]] && return 0
+  local out="$RESULTS_DIR/t${T}_$(echo "$1" | tr -c 'a-zA-Z0-9' '_').csv"
+  { echo "ms"; cat "$2"; } > "$out"
+}
 
 # Correctness gate. A latency number next to a different answer is meaningless, and a
 # latency number next to an EMPTY answer is worse: it looks plausible and inverts the
@@ -100,15 +108,18 @@ for ((r=0; r<RUNS; r++)); do
 done
 echo
 
-printf "%-22s %9s %9s %9s\n" "engine" "median" "min" "max"
-printf "%-22s %9s %9s %9s\n" "----------------------" "---------" "---------" "---------"
+printf "%-24s %8s %8s %8s %8s %8s %6s\n" "engine" "median" "p95" "p99" "min" "max" "n"
+printf "%-24s %8s %8s %8s %8s %8s %6s\n" "------------------------" "--------" "--------" "--------" "--------" "--------" "------"
 for e in "${ENGINES[@]}"; do
   IFS="$SEP" read -r name url q fmt <<<"$e"
   f="$tmp/$(echo "$name" | tr -c 'a-zA-Z0-9' '_').samples"
+  save_samples "$name" "$f"
   python3 - "$name" "$f" <<'PY'
 import statistics, sys
 name, path = sys.argv[1], sys.argv[2]
 v = sorted(float(x) for x in open(path) if x.strip())
-print(f"{name:<22} {statistics.median(v):9.1f} {v[0]:9.1f} {v[-1]:9.1f}")
+def pct(p):  # nearest-rank; with few samples p99 is effectively the max, which is why n is printed
+    return v[min(len(v) - 1, int(round(p / 100 * len(v) + 0.5)) - 1)]
+print(f"{name:<24} {statistics.median(v):8.1f} {pct(95):8.1f} {pct(99):8.1f} {v[0]:8.1f} {v[-1]:8.1f} {len(v):6d}")
 PY
 done
