@@ -301,7 +301,10 @@ func (s *Server) handleTail(w http.ResponseWriter, r *http.Request) {
 			}
 		case e, ok := <-ch:
 			if !ok {
-				return // writer shut down
+				// The writer shut down. Say so before closing the socket, so the client
+				// sees a deliberate end of stream rather than a dropped connection.
+				ws.writeClose(wsCloseGoingAway)
+				return
 			}
 			msg, err := json.Marshal(tailResponse{Streams: groupStreams(drainTail(ch, e)), DroppedEntries: []any{}})
 			if err != nil {

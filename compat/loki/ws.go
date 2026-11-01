@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -23,13 +24,19 @@ const (
 	maxWSFrame      = 1 << 20          // cap an inbound (client) data frame
 	maxControlFrame = 125              // RFC 6455: control-frame payloads are ≤125 bytes
 	wsWriteTimeout  = 10 * time.Second // bound a single frame write so a non-reading client can't pin the goroutine
+
+	wsCloseGoingAway = 1001 // RFC 6455 §7.4.1: the server is going away
 )
 
+// errWSClosed is returned for a write after this side has sent its Close frame.
+var errWSClosed = errors.New("websocket: close frame already sent")
+
 type wsConn struct {
-	conn net.Conn
-	br   *bufio.Reader
-	bw   *bufio.Writer
-	wmu  sync.Mutex // serializes frame writes: handleTail (data/keepalive) vs readLoop (pong)
+	conn      net.Conn
+	br        *bufio.Reader
+	bw        *bufio.Writer
+	wmu       sync.Mutex // serializes frame writes: handleTail (data/keepalive/close) vs readLoop (pong/close)
+	closeSent bool       // guarded by wmu: nothing may follow a Close frame (RFC 6455 §5.5.1)
 }
 
 // wsUpgrade performs the handshake and hijacks the connection. It returns an error WITHOUT
@@ -82,6 +89,13 @@ func headerHasToken(header, token string) bool {
 func (c *wsConn) writeText(payload []byte) error { return c.writeFrame(0x1, payload) }
 func (c *wsConn) writePing() error               { return c.writeFrame(0x9, nil) }
 
+// writeClose sends a Close frame carrying a status code. A second Close is not sent.
+func (c *wsConn) writeClose(code uint16) error {
+	var p [2]byte
+	binary.BigEndian.PutUint16(p[:], code)
+	return c.writeFrame(0x8, p[:])
+}
+
 // writeFrame writes a single final, unmasked frame (server→client frames are never
 // masked). It holds wmu so the readLoop goroutine's pong writes cannot interleave with
 // handleTail's data/keepalive writes on the shared buffer, and sets a write deadline so a
@@ -89,6 +103,10 @@ func (c *wsConn) writePing() error               { return c.writeFrame(0x9, nil)
 func (c *wsConn) writeFrame(opcode byte, payload []byte) error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
+	if c.closeSent {
+		return errWSClosed
+	}
+	c.closeSent = opcode == 0x8
 	if c.conn != nil {
 		c.conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 	}
@@ -128,7 +146,11 @@ func (c *wsConn) readLoop(done chan<- struct{}) {
 			return
 		}
 		switch opcode {
-		case 0x8: // close
+		case 0x8: // close: answer with a Close echoing the status code (RFC 6455 §5.5.1)
+			if len(payload) > 2 {
+				payload = payload[:2]
+			}
+			c.writeFrame(0x8, payload) // a no-op if this side already sent its Close
 			return
 		case 0x9: // ping → pong
 			if err := c.writeFrame(0xA, payload); err != nil {
