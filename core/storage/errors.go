@@ -26,4 +26,8 @@ var (
 	// instant (and poison the page/segment time bounds), so it is rejected at the
 	// edge rather than corrupted.
 	ErrTimestampRange = errors.New("timestamp out of representable range")
+
+	// ErrWriterClosed is returned by the Write methods once Close has begun. The record
+	// was not stored.
+	ErrWriterClosed = errors.New("writer is closed")
 )

@@ -3,6 +3,9 @@ package storage_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -103,28 +106,102 @@ func TestWriteExtractedCtxSucceedsOnceDrained(t *testing.T) {
 	}
 }
 
-// TestWriteExtractedCtxReportsClosedWriter: a blocked write must not deadlock forever on a
-// channel nobody will ever drain again.
+// TestWriteExtractedCtxReportsClosedWriter: a write blocked on a full queue must not deadlock
+// forever on a channel nobody will ever drain again: Close wakes it with an error.
 func TestWriteExtractedCtxReportsClosedWriter(t *testing.T) {
 	w, err := storage.NewWriter(t.TempDir(), storage.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if err := w.Close(); err != nil {
-		t.Fatal(err)
-	}
-	fillQueue(t, w)
+	fillQueue(t, w) // never started, so nothing drains
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	err = w.WriteExtractedCtx(ctx, model.LogEntry{TS: time.Unix(0, 9999), Message: "overflow"}, nil, nil)
+	blocked := make(chan error, 1)
+	go func() {
+		blocked <- w.WriteExtractedCtx(ctx, model.LogEntry{TS: time.Unix(0, 9999), Message: "overflow"}, nil, nil)
+	}()
+	time.Sleep(20 * time.Millisecond) // let it block on the full queue
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	err = <-blocked
 	if err == nil {
 		t.Fatal("expected an error writing to a closed writer")
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		t.Fatal("blocked on the context instead of noticing the writer was closed")
+	}
+}
+
+// TestWritesAfterCloseAreRefused: once Close has begun, both write methods must say the
+// record was not taken. WriteExtracted never checked, and WriteExtractedCtx's select could
+// pick the free queue slot over the closed channel: either way the caller got nil for a
+// record nobody would ever read.
+func TestWritesAfterCloseAreRefused(t *testing.T) {
+	dir := t.TempDir()
+	w, err := storage.NewWriter(dir, storage.Options{BlockPages: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 100; i++ {
+		e := model.LogEntry{TS: time.Unix(1700000000, int64(i)), Message: "late"}
+		if err := w.WriteExtractedCtx(context.Background(), e, nil, nil); !errors.Is(err, storage.ErrWriterClosed) {
+			t.Fatalf("WriteExtractedCtx after Close: got %v, want ErrWriterClosed", err)
+		}
+		if err := w.WriteExtracted(e, nil, nil); !errors.Is(err, storage.ErrWriterClosed) {
+			t.Fatalf("WriteExtracted after Close: got %v, want ErrWriterClosed", err)
+		}
+	}
+}
+
+// TestCloseLosesNoAcceptedWrite: every write that returned nil must be on disk after Close,
+// however the writes and the Close interleave. The writers here behave like push handlers
+// while the daemon shuts down: they keep writing, before, during and after Close.
+func TestCloseLosesNoAcceptedWrite(t *testing.T) {
+	dir := t.TempDir()
+	w, err := storage.NewWriter(dir, storage.Options{BlockPages: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(nil); err != nil {
+		t.Fatal(err)
+	}
+	var accepted, seq atomic.Int64
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for !stop.Load() {
+				i := seq.Add(1)
+				e := model.LogEntry{TS: time.Unix(1700000000, i), Message: fmt.Sprintf("line %d", i)}
+				if w.WriteExtractedCtx(context.Background(), e, nil, nil) == nil {
+					accepted.Add(1)
+				}
+			}
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond) // writes keep arriving after Close has returned
+	stop.Store(true)
+	wg.Wait()
+
+	got, err := storage.ReadAll(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int64(len(got)) != accepted.Load() {
+		t.Fatalf("%d writes were accepted, %d records stored", accepted.Load(), len(got))
 	}
 }

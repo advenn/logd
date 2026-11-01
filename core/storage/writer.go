@@ -77,6 +77,13 @@ type Writer struct {
 	closeOnce sync.Once
 	wg        sync.WaitGroup
 
+	// Admission. Every enqueue holds sendMu for reading and refuses once stopping is
+	// closed; shutdown closes stopping, then takes sendMu for writing, which waits out
+	// every enqueue already past that check. Only after that does it close closeCh, so
+	// the drain sees every record a caller was told had been accepted (see shutdown).
+	sendMu   sync.RWMutex
+	stopping chan struct{}
+
 	flushTicker     *time.Ticker
 	retentionTicker *time.Ticker
 	retentionC      <-chan time.Time // retentionTicker.C, or nil when retention is disabled
@@ -173,6 +180,7 @@ func NewWriter(dir string, opts Options) (*Writer, error) {
 		opts:        opts,
 		writeCh:     make(chan record, 4096),
 		closeCh:     make(chan struct{}),
+		stopping:    make(chan struct{}),
 		manifest:    manifest,
 		serviceLT:   serviceLT,
 		schema:      opts.Schema,
@@ -350,10 +358,16 @@ func (w *Writer) Write(e model.LogEntry) error {
 // allowlisted label set the ingest layer produced for it (design §7.4: extraction and
 // label derivation run in handler goroutines; the writer interns the labels and pairs
 // keys with the record's on-disk offset). Non-blocking: a full queue drops and errors.
-// A record larger than MaxRecordSize is rejected with ErrEntryTooLarge.
+// A record larger than MaxRecordSize is rejected with ErrEntryTooLarge, and any record once
+// Close has begun with ErrWriterClosed.
 func (w *Writer) WriteExtracted(e model.LogEntry, keys []index.KeyedValue, labels label.Set) error {
 	if err := checkRecordSize(e); err != nil {
 		return err
+	}
+	w.sendMu.RLock()
+	defer w.sendMu.RUnlock()
+	if w.isStopping() {
+		return ErrWriterClosed
 	}
 	select {
 	case w.writeCh <- record{entry: e, keys: keys, labels: labels}:
@@ -375,18 +389,37 @@ func (w *Writer) WriteExtracted(e model.LogEntry, keys []index.KeyedValue, label
 //
 // Blocking turns backpressure into latency, which is what Loki and VictoriaLogs do and
 // what shippers already expect. The caller's context bounds the wait, and a closed writer
-// is reported rather than deadlocking on a channel nobody is draining.
+// is reported (ErrWriterClosed) rather than deadlocking on a channel nobody is draining.
+//
+// A nil return means the record WILL be stored by the drain in Close. The select used to
+// watch closeCh, the drain's own signal, so it could still pick the free queue slot after
+// the drain had finished: the record was acknowledged and then never read.
 func (w *Writer) WriteExtractedCtx(ctx context.Context, e model.LogEntry, keys []index.KeyedValue, labels label.Set) error {
 	if err := checkRecordSize(e); err != nil {
 		return err
 	}
+	w.sendMu.RLock()
+	defer w.sendMu.RUnlock()
+	if w.isStopping() {
+		return ErrWriterClosed
+	}
 	select {
 	case w.writeCh <- record{entry: e, keys: keys, labels: labels}:
 		return nil
-	case <-w.closeCh:
-		return fmt.Errorf("writer is closed")
+	case <-w.stopping:
+		return ErrWriterClosed
 	case <-ctx.Done():
 		return fmt.Errorf("waiting for write queue: %w", ctx.Err())
+	}
+}
+
+// isStopping reports whether Close (or stop) has begun.
+func (w *Writer) isStopping() bool {
+	select {
+	case <-w.stopping:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -434,6 +467,14 @@ func (w *Writer) stop() {
 // exactly as a crash would (test-only). Runs exactly once via closeOnce at both call
 // sites, so cleanup never races itself.
 func (w *Writer) shutdown(graceful bool) {
+	// Refuse new writes, and wake those blocked on a full queue so they return the error,
+	// then wait for every write already past the check: each has either queued its record
+	// or been refused. Only now is the queue final, so the drain that closeCh starts takes
+	// every record a caller was told had been accepted. Closing closeCh first, as before,
+	// let a write slip into the queue after the drain had exited.
+	close(w.stopping)
+	w.sendMu.Lock()
+	w.sendMu.Unlock()
 	close(w.closeCh)
 	w.wg.Wait()
 	if w.flushTicker != nil {

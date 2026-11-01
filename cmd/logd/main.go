@@ -92,8 +92,13 @@ func run(configPath string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	// The writers are NOT tied to the signal context. Given it, each closed itself the moment
+	// the signal arrived, while srv.Shutdown below was still letting in-flight pushes finish:
+	// those pushes then failed with 503 halfway through a batch (which the shipper retries
+	// whole, duplicating the part already stored), or were acknowledged and lost. The writers
+	// are closed below, once the HTTP server has stopped handing them records.
 	for i, w := range writers {
-		if err := w.Start(ctx); err != nil {
+		if err := w.Start(nil); err != nil {
 			closeWriters(writers)
 			return fmt.Errorf("starting shard %d: %w", i, err)
 		}
