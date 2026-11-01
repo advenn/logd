@@ -3,6 +3,7 @@ package index
 import (
 	"encoding/binary"
 	"hash/crc32"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -158,6 +159,44 @@ func TestTidxRejectsLengthCountMismatch(t *testing.T) {
 	}
 	if _, err := OpenReader(path); err == nil {
 		t.Fatal("an uncompressed length disagreeing with the record count must be rejected")
+	}
+}
+
+// TestTidxRejectsImpossibleCount: a record count and uncompressed length that agree with
+// each other, under a valid CRC, but that the compressed body cannot possibly inflate to.
+// The reader sized its buffer by the claim — 96 GiB for a count of 2^32-1 — and the process
+// died of OOM instead of degrading the segment to a scan.
+func TestTidxRejectsImpossibleCount(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "seg.field.tidx")
+	if err := WriteTIDX(path, KindInt, 0, []Entry{{Key: intKey(1), Offset: 0}}); err != nil {
+		t.Fatal(err)
+	}
+	buf, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary.BigEndian.PutUint32(buf[8:12], math.MaxUint32)
+	binary.BigEndian.PutUint64(buf[24:32], math.MaxUint32*tidxRecordSize)
+	reCRC(buf)
+	if err := os.WriteFile(path, buf, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenReader(path); err == nil {
+		t.Fatal("a count the compressed body cannot hold must be rejected")
+	}
+
+	// The bound must not reject a real file however well it compresses: a literal-existence
+	// field keys every entry under the zero key, and nothing compresses better than repeats.
+	entries := make([]Entry, 1<<20)
+	if err := WriteTIDX(path, KindStr, 0, entries); err != nil {
+		t.Fatal(err)
+	}
+	r, err := OpenReader(path)
+	if err != nil {
+		t.Fatalf("a maximally compressible .tidx must still open: %v", err)
+	}
+	if r.Count() != len(entries) {
+		t.Fatalf("count: got %d want %d", r.Count(), len(entries))
 	}
 }
 

@@ -56,6 +56,12 @@ func OpenReader(path string) (*Reader, error) {
 		return nil, fmt.Errorf("lidx %s: crc mismatch (corrupt index)", path)
 	}
 
+	// Each stream needs at least 2 bytes (its pair and posting counts). Bounding the count
+	// by what is left keeps a CRC-valid but hostile count from pre-allocating 4 billion
+	// streams and killing the process, instead of degrading this segment to a scan.
+	if streamCount > (len(data)-lidxHeaderSize)/2 {
+		return nil, fmt.Errorf("lidx %s: stream count %d exceeds remaining bytes", path, streamCount)
+	}
 	r := &Reader{streams: make([]streamData, 0, streamCount)}
 	pos := lidxHeaderSize
 	for i := 0; i < streamCount; i++ {
@@ -120,7 +126,9 @@ func readString(data []byte, pos int) (string, int, error) {
 		return "", 0, fmt.Errorf("bad string length")
 	}
 	pos += n
-	if pos+int(l) > len(data) {
+	// Compared in uint64 BEFORE converting: int(l) of a length >= 2^63 is negative, so
+	// pos+int(l) passed the bounds check and the slice below panicked.
+	if l > uint64(len(data)-pos) {
 		return "", 0, fmt.Errorf("string extends past data")
 	}
 	return string(data[pos : pos+int(l)]), pos + int(l), nil

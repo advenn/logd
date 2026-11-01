@@ -1,6 +1,9 @@
 package label
 
 import (
+	"encoding/binary"
+	"hash/crc32"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -118,6 +121,46 @@ func TestReaderRejectsCorruptFile(t *testing.T) {
 	os.WriteFile(path, data, 0o644)
 	if _, err := OpenReader(path); err == nil {
 		t.Fatal("OpenReader accepted a corrupt .lidx (should error so caller scans)")
+	}
+}
+
+// writeLIDX writes a .lidx with the given stream count and body under a VALID checksum, so a
+// test reaches the body parser rather than tripping the CRC.
+func writeLIDX(t *testing.T, path string, streamCount uint32, body []byte) {
+	t.Helper()
+	buf := make([]byte, lidxHeaderSize, lidxHeaderSize+len(body))
+	binary.BigEndian.PutUint32(buf[0:4], lidxMagic)
+	binary.BigEndian.PutUint16(buf[4:6], lidxVersion)
+	binary.BigEndian.PutUint32(buf[8:12], streamCount)
+	buf = append(buf, body...)
+	binary.BigEndian.PutUint32(buf[12:16], crc32.Checksum(buf, lidxCRC))
+	if err := os.WriteFile(path, buf, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The CRC proves a file is what was written, not that its counts are sane. Counts that the
+// remaining bytes cannot hold must be an error — the caller then scans the segment — never
+// an allocation sized by the count (4 billion streams: fatal OOM) or a length that overflows
+// int (a 2^63-byte string passed the bounds check and panicked slicing).
+func TestReaderRejectsHostileCounts(t *testing.T) {
+	dir := t.TempDir()
+	cases := map[string]struct {
+		streams uint32
+		body    []byte
+	}{
+		"stream count":         {streams: math.MaxUint32, body: []byte{0}},
+		"string length 2^63":   {streams: 1, body: append(binary.AppendUvarint(binary.AppendUvarint(nil, 1), 1<<63), 'k', 0, 0)},
+		"string length 2^64-1": {streams: 1, body: append(binary.AppendUvarint(binary.AppendUvarint(nil, 1), math.MaxUint64), 'k', 0, 0)},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(dir, "seg.labels.lidx")
+			writeLIDX(t, path, c.streams, c.body)
+			if _, err := OpenReader(path); err == nil {
+				t.Fatal("OpenReader accepted a hostile count (should error so caller scans)")
+			}
+		})
 	}
 }
 

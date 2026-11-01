@@ -25,6 +25,10 @@ const (
 	tidxVersionCompressed uint16 = 2
 	tidxHeaderSize               = 32
 	tidxRecordSize               = KeySize + 8 // 16-byte key + 8-byte offset
+
+	// maxDeflateRatio is the most deflate can expand: a 258-byte match coded in two 1-bit
+	// codes is 1032 output bytes per input byte. No stream inflates to more.
+	maxDeflateRatio = 1032
 )
 
 var tidxCRC = crc32.MakeTable(crc32.IEEE)
@@ -164,6 +168,13 @@ func OpenReader(path string) (*Reader, error) {
 		rawLen := binary.BigEndian.Uint64(data[24:32])
 		if rawLen != uint64(count)*uint64(tidxRecordSize) {
 			return nil, fmt.Errorf("tidx %s: uncompressed length %d disagrees with record count %d", path, rawLen, count)
+		}
+		// The CRC only proves the file is what was written, not that its count is sane: a
+		// count of 2^32-1 asked for a 96 GiB buffer before inflating a single byte, and the
+		// process died of OOM instead of degrading this segment to a scan. A length the stored
+		// stream cannot possibly inflate to is corrupt, and is rejected before allocating.
+		if rawLen > uint64(len(body))*maxDeflateRatio {
+			return nil, fmt.Errorf("tidx %s: uncompressed length %d exceeds what %d compressed bytes can hold", path, rawLen, len(body))
 		}
 		out := make([]byte, rawLen)
 		zr := flate.NewReader(bytes.NewReader(body))
