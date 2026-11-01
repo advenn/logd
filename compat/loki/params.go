@@ -44,11 +44,11 @@ var (
 // or before now when end is in the future.
 func (s *Server) timeRange(r *http.Request) (start, end int64, err error) {
 	now := s.now()
-	endStr := r.FormValue("end")
+	endName, endStr := "end", r.FormValue("end")
 	if endStr == "" {
-		endStr = r.FormValue("time")
+		endName, endStr = "time", r.FormValue("time")
 	}
-	endT, err := parseTimestamp("end", endStr, now)
+	endT, err := parseTimestamp(endName, endStr, now)
 	if err != nil {
 		return 0, 0, err
 	}
