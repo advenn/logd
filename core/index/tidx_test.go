@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -144,6 +145,67 @@ func TestBufferFlushWritesPerFieldFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(TidxPath(segBase, "unknown")); !os.IsNotExist(err) {
 		t.Fatal("unknown field should not have produced a .tidx")
+	}
+}
+
+// A field's .tidx name must fit in one path component whatever the field, or the seal that
+// writes it fails — and fails again on every retry. Percent-encoding made a 46-character
+// Cyrillic literal a 297-byte file name. Names that already fit must not change, since
+// existing segments' sidecars are on disk under them.
+func TestTidxPathFitsNameMax(t *testing.T) {
+	dir := t.TempDir()
+	segBase := filepath.Join(dir, "seg-01M6CMBF3X2T88ZSDTS92SZ1SK")
+
+	if got, want := TidxPath(segBase, "latency_ms"), segBase+".latency_ms.tidx"; got != want {
+		t.Fatalf("short field: got %s, want the readable name %s", got, want)
+	}
+	// The longest readable name is kept as is; one byte more is hashed.
+	room := maxTidxName - len(filepath.Base(segBase)) - len("..tidx")
+	if got := TidxPath(segBase, strings.Repeat("a", room)); got != segBase+"."+strings.Repeat("a", room)+".tidx" {
+		t.Fatalf("a name that fits was not kept: %s", filepath.Base(got))
+	}
+	if got := TidxPath(segBase, strings.Repeat("a", room+1)); strings.Contains(got, "aaa") {
+		t.Fatalf("a name one byte over the bound was kept: %s", filepath.Base(got))
+	}
+
+	long := []string{
+		"__lit_не удалось подключиться к базе данных: таймаут",
+		"__lit_" + strings.Repeat("x", 10000),
+		"__lit_" + strings.Repeat("x", 9999) + "y",
+		strings.Repeat("é", 300) + "_ms",
+	}
+	b := NewBuffer(func() (s []FieldType) {
+		for _, f := range long {
+			s = append(s, FieldType{Name: f, Kind: KindStr})
+		}
+		return s
+	}())
+	seen := map[string]string{}
+	for i, f := range long {
+		p := TidxPath(segBase, f)
+		if n := len(filepath.Base(p)) + len(".tmp"); n > nameMax {
+			t.Fatalf("field of %d bytes: file name (with .tmp) is %d bytes, over %d", len(f), n, nameMax)
+		}
+		if p != TidxPath(segBase, f) {
+			t.Fatal("TidxPath is not deterministic")
+		}
+		if other, dup := seen[p]; dup {
+			t.Fatalf("fields %q and %q share the path %s", other, f, p)
+		}
+		seen[p] = f
+		b.Add(f, strKey(""), uint64(i))
+	}
+	if _, err := b.Flush(segBase, 1); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	for i, f := range long {
+		r, err := OpenReader(TidxPath(segBase, f))
+		if err != nil {
+			t.Fatalf("field of %d bytes: %v", len(f), err)
+		}
+		if off := r.LookupEqual(strKey("")); len(off) != 1 || off[0] != uint64(i) {
+			t.Fatalf("field of %d bytes: got offsets %v, want [%d]", len(f), off, i)
+		}
 	}
 }
 

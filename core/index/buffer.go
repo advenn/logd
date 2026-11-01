@@ -1,7 +1,10 @@
 package index
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"path/filepath"
 	"strings"
 )
 
@@ -62,7 +65,7 @@ func (b *Buffer) Add(field string, key [KeySize]byte, offset uint64) {
 	fe.entries = append(fe.entries, Entry{Key: key, Offset: offset})
 }
 
-// Flush writes one <segBase>.<field>.tidx per field that accumulated any entries and
+// Flush writes one .tidx (at TidxPath) per field that accumulated any entries and
 // returns the set of fields it actually wrote — that becomes the segment's recorded
 // schema, so the planner only ever expects a .tidx that exists. segBase is the
 // segment's path without its extension (so index files sit next to the segment and are
@@ -74,7 +77,7 @@ func (b *Buffer) Flush(segBase string, segmentID uint64) ([]FieldType, error) {
 		if len(fe.entries) == 0 {
 			continue
 		}
-		path := fmt.Sprintf("%s.%s.tidx", segBase, sanitizeField(field))
+		path := TidxPath(segBase, field)
 		if err := WriteTIDX(path, fe.kind, segmentID, fe.entries); err != nil {
 			return written, fmt.Errorf("writing %s: %w", path, err)
 		}
@@ -83,9 +86,36 @@ func (b *Buffer) Flush(segBase string, segmentID uint64) ([]FieldType, error) {
 	return written, nil
 }
 
-// TidxPath returns the .tidx path for a segment base and field (also used by readers).
+// nameMax is the longest file name (one path component, in bytes) the filesystems logd
+// runs on accept: NAME_MAX on ext4, xfs, btrfs, tmpfs and overlayfs.
+const nameMax = 255
+
+// maxTidxName is the longest .tidx file name kept in its readable form: nameMax less the
+// ".tmp" suffix writeFileAtomic adds while the file is written. A readable name within it is
+// exactly a name that could be created before hashed names existed, so every sidecar already
+// on disk keeps the path readers compute for it.
+const maxTidxName = nameMax - len(".tmp")
+
+// hashedFieldMarker starts the field component of a hashed .tidx name. sanitizeField never
+// emits '~', so a hashed name can never equal the readable name of another field.
+const hashedFieldMarker = "~"
+
+// TidxPath returns the .tidx path for a segment base and field. The writer's Flush and every
+// reader compute it here, so the two always agree.
+//
+// The readable form is <segBase>.<sanitized field>.tidx. Percent-encoding triples every byte
+// outside [A-Za-z0-9_-], so a literal of ~70 bytes of Cyrillic already exceeds nameMax; the
+// file could not be created, the seal failed, and it failed again on every retry. A name that
+// would not fit uses <segBase>.~<hex sha256 of the field>.tidx instead, which is 101 bytes for
+// a seg-<ULID> base whatever the field. The field name itself is recorded in the manifest
+// schema, so nothing needs to recover it from the file name.
 func TidxPath(segBase, field string) string {
-	return fmt.Sprintf("%s.%s.tidx", segBase, sanitizeField(field))
+	p := segBase + "." + sanitizeField(field) + ".tidx"
+	if len(filepath.Base(p)) <= maxTidxName {
+		return p
+	}
+	sum := sha256.Sum256([]byte(field))
+	return segBase + "." + hashedFieldMarker + hex.EncodeToString(sum[:]) + ".tidx"
 }
 
 // sanitizeField maps a field name to a filesystem-safe, INJECTIVE filename component by

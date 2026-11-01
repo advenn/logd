@@ -320,6 +320,58 @@ func TestLiteralPathCollisionResolved(t *testing.T) {
 	}
 }
 
+// A literal whose percent-encoded .tidx name exceeded the file-name limit made every seal
+// fail with ENAMETOOLONG: the segment never sealed, and nothing was ever indexed. It must
+// seal, and its existence index must answer like the scan.
+func TestLongLiteralSealsAndPushesDown(t *testing.T) {
+	dir := t.TempDir()
+	lit := "не удалось подключиться к базе данных: таймаут" // 85 bytes; a 297-byte readable .tidx name
+	eng, err := extract.Compile(config.IndexConfig{Literals: []string{lit}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, _ := storage.NewWriter(dir, storage.Options{Schema: eng.IndexedFields(), SegmentSizeBytes: 4 * storage.PageSize, FlushInterval: time.Hour})
+	w.Start(nil)
+	ig := ingest.New(eng, w)
+	for i := 0; i < 2000; i++ {
+		msg := fmt.Sprintf("req %04d ok", i)
+		if i%10 == 0 {
+			msg = fmt.Sprintf("req %04d %s", i, lit)
+		}
+		if err := ig.Ingest(model.LogEntry{TS: time.Unix(t0+int64(i), 0).UTC(), Level: model.LogLevelInfo, Message: msg}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	segs := w.Manifest().All()
+	if len(segs) < 2 {
+		t.Fatalf("want several segments, got %d", len(segs))
+	}
+	for _, s := range segs {
+		if s.State != storage.SegmentSealed || !s.Indexed {
+			t.Fatalf("segment %s did not seal with its index (state %v, indexed %v)", s.ID, s.State, s.Indexed)
+		}
+	}
+	e := qr.NewEngine(w, eng)
+	q := qr.Query{Start: ts(0), End: ts(3000), Limit: 10000, Preds: []qr.Predicate{qr.LineContains{Sub: lit}}}
+	idx, err := e.Execute(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scan, _ := e.ExecuteScan(q)
+	equalResults(t, "long literal", idx, scan)
+	if len(idx) != 200 {
+		t.Fatalf("long literal: got %d records, want 200", len(idx))
+	}
+	for _, p := range e.Explain(q) {
+		if p.Mode != "index" {
+			t.Fatalf("segment %s: long literal was not answered from its index (%s/%s)", p.SegmentID, p.Mode, p.Reason)
+		}
+	}
+}
+
 // A field that is NOT in a sealed segment's schema (e.g. a template added AFTER the
 // segment was sealed) must cause that segment to be SCANNED and re-extracted at query
 // time — never skipped — or the pushdown result would drop records the scan keeps.
