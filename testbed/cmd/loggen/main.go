@@ -1,12 +1,16 @@
 // Command loggen produces log traffic for the testbed.
 //
-// Two modes:
+// Three modes:
 //
 //	live    — the original behaviour: generate at a rate to stdout/file/syslog forever.
 //	          Used with the Alloy compatibility profile.
 //	corpus  — generate a FIXED, replayable body of lines with synthetic monotonic
 //	          timestamps, write a ground-truth manifest, and optionally push the identical
 //	          encoded bytes to several backends at once. Used for parity and benchmarking.
+//	replay  — the same, for the lines of a REAL dataset (e.g. Loghub HDFS.log) instead of
+//	          generated ones: original text, synthetic timestamps, a ground-truth value per
+//	          line from -replay-value-regex. Answers "the corpus was designed alongside the
+//	          template" by measuring on data nobody designed.
 //
 // Corpus mode is what makes the head-to-head defensible: because the manifest records what
 // every line contains, the expected answer to a query can be computed without asking any
@@ -54,6 +58,11 @@ func run() error {
 		format   = flag.String("format", "app", "line format: app, json, nginx, logfmt, java, syslog, noisy")
 		seed     = flag.Int64("seed", 1001, "PRNG seed")
 		progress = flag.Int("progress", 100000, "corpus mode: log progress every N lines (0 to disable)")
+
+		replay      = flag.String("replay", "", "replay mode: push the lines of this file instead of generating them")
+		replayCount = flag.Int("replay-count", 2000000, "replay mode: replay at most this many lines from the start of the file")
+		replayRegex = flag.String("replay-value-regex", "", "replay mode: regexp whose first group is each line's ground-truth integer, e.g. 'size ([0-9]+)'")
+		replayName  = flag.String("replay-value-name", "", "replay mode: the value's name in the manifest and in queries, e.g. size_bytes")
 	)
 	var pushURLs stringList
 	var labelArgs stringList
@@ -61,11 +70,21 @@ func run() error {
 	flag.Var(&labelArgs, "label", "corpus mode: stream label k=v (repeatable)")
 	flag.Parse()
 
+	if *replay != "" {
+		if *corpus {
+			return fmt.Errorf("-corpus and -replay are mutually exclusive")
+		}
+		return runReplay(replayArgs{
+			path: *replay, count: *replayCount, valueRegex: *replayRegex, valueName: *replayName,
+			baseTS: *baseTS, step: *step, batch: *batch, progress: *progress,
+			manifest: *manifest, labels: labelArgs, push: pushURLs,
+		})
+	}
 	if !*corpus {
 		return runLive()
 	}
 
-	labels, err := parseLabels(labelArgs)
+	labels, err := parseLabels(labelArgs, map[string]string{"app": "checkout", "env": "prod", "region": "eu"})
 	if err != nil {
 		return err
 	}
@@ -139,17 +158,20 @@ func run() error {
 		}
 	}
 
-	return report(n, start, sink)
+	return report(n, start, sink, nil)
 }
 
 // report prints a machine-readable summary to stdout so the bench harness can consume it
 // without scraping human-facing text.
-func report(n int, start time.Time, sink *loggen.PushSink) error {
+func report(n int, start time.Time, sink *loggen.PushSink, extra map[string]any) error {
 	elapsed := time.Since(start)
 	out := map[string]any{
 		"lines":       n,
 		"elapsed_sec": elapsed.Seconds(),
 		"lines_per_s": float64(n) / elapsed.Seconds(),
+	}
+	for k, v := range extra {
+		out[k] = v
 	}
 	if sink != nil {
 		eps := map[string]any{}
@@ -199,7 +221,8 @@ func resolveBase(spec string, count int, step time.Duration) (time.Time, error) 
 	return t, nil
 }
 
-func parseLabels(args []string) (map[string]string, error) {
+// parseLabels reads -label k=v flags, falling back to def when none were given.
+func parseLabels(args []string, def map[string]string) (map[string]string, error) {
 	labels := map[string]string{}
 	for _, a := range args {
 		k, v, ok := strings.Cut(a, "=")
@@ -209,7 +232,7 @@ func parseLabels(args []string) (map[string]string, error) {
 		labels[k] = v
 	}
 	if len(labels) == 0 {
-		labels = map[string]string{"app": "checkout", "env": "prod", "region": "eu"}
+		labels = def
 	}
 	return labels, nil
 }

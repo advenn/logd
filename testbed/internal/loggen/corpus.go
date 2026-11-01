@@ -35,6 +35,13 @@ type Record struct {
 	// carries none. See extractLatencyMS for why this is scanned back out of the text
 	// rather than read from the event.
 	LatencyMS *int `json:"latency_ms,omitempty"`
+	// Value and ValueName are the ground truth of a REPLAYED dataset (see Replay): the
+	// integer the line carries and what it is called in the engines' queries, e.g.
+	// size_bytes for Loghub HDFS. A generic key rather than a per-dataset one, so tools that
+	// compute expected counts read every replay the same way. Corpus mode leaves both empty
+	// and keeps latency_ms, so existing manifests and the tools reading them are unchanged.
+	Value     *int64 `json:"value,omitempty"`
+	ValueName string `json:"value_name,omitempty"`
 }
 
 // CorpusOpts controls deterministic corpus generation.

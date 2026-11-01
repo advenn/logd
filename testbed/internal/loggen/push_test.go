@@ -1,11 +1,15 @@
 package loggen_test
 
 import (
+	"bytes"
+	"fmt"
 	"testing"
 	"time"
 
 	lokipush "github.com/advenn/logd/compat/loki/push"
 	"github.com/advenn/logd/testbed/internal/loggen"
+	"github.com/golang/snappy"
+	"google.golang.org/protobuf/encoding/protowire"
 )
 
 // TestEncodePushRoundTripsThroughRealDecoder is the reason this module has a `replace`
@@ -76,5 +80,73 @@ func TestEncodePushIsDeterministic(t *testing.T) {
 		if got := loggen.EncodePush(labels, entries); string(got) != string(first) {
 			t.Fatalf("encoding is not deterministic on attempt %d", i)
 		}
+	}
+}
+
+// TestEncodePushMultiStreamRoundTripsThroughRealDecoder: a replay batch spans several
+// component streams in ONE request. Every entry must come back out of the daemon's decoder
+// with its own stream's labels, its line and its exact timestamp.
+func TestEncodePushMultiStreamRoundTripsThroughRealDecoder(t *testing.T) {
+	sinkLabels := map[string]string{"app": "hdfs", "component": "other"}
+	dn := loggen.LabelString(map[string]string{"app": "hdfs", "component": "datanode"})
+	fs := loggen.LabelString(map[string]string{"app": "hdfs", "component": "fsnamesystem"})
+	in := []loggen.Entry{
+		{TSNano: 1, Line: "a", Stream: dn},
+		{TSNano: 2, Line: "b", Stream: fs},
+		{TSNano: 3, Line: "c", Stream: dn},
+		{TSNano: 4, Line: "d"}, // no Stream: the sink's labels
+	}
+	got, err := lokipush.Decode("application/x-protobuf", loggen.EncodePush(sinkLabels, in))
+	if err != nil {
+		t.Fatalf("the daemon's decoder rejected a multi-stream request: %v", err)
+	}
+	if len(got) != len(in) {
+		t.Fatalf("got %d entries, want %d", len(got), len(in))
+	}
+	wantComp := map[int64]string{1: "datanode", 2: "fsnamesystem", 3: "datanode", 4: "other"}
+	wantLine := map[int64]string{1: "a", 2: "b", 3: "c", 4: "d"}
+	var order []int64
+	for _, e := range got {
+		ts := e.TS.UnixNano()
+		order = append(order, ts)
+		if e.Message != wantLine[ts] || !containsLabel(e.Extra, "component", wantComp[ts]) || !containsLabel(e.Extra, "app", "hdfs") {
+			t.Errorf("ts %d: line %q extra %q, want %q in component %s", ts, e.Message, e.Extra, wantLine[ts], wantComp[ts])
+		}
+	}
+	// Streams in first-appearance order, entries in order within each: deterministic bytes.
+	if want := []int64{1, 3, 2, 4}; fmt.Sprint(order) != fmt.Sprint(want) {
+		t.Errorf("decoded order %v, want %v", order, want)
+	}
+}
+
+// TestEncodePushSingleStreamLayoutUnchanged pins that a corpus-mode batch (one stream, no
+// per-entry Stream) still encodes to exactly the PushRequest it did before multi-stream
+// batches existed, so corpus-mode measurements remain comparable across this change.
+func TestEncodePushSingleStreamLayoutUnchanged(t *testing.T) {
+	labels := map[string]string{"app": "checkout", "env": "prod", "region": "eu"}
+	entries := []loggen.Entry{{TSNano: 1700000000123456789, Line: "took=5ms"}, {TSNano: 1700000000123456790, Line: "x"}}
+
+	var stream []byte
+	stream = protowire.AppendTag(stream, 1, protowire.BytesType)
+	stream = protowire.AppendString(stream, `{app="checkout", env="prod", region="eu"}`)
+	for _, e := range entries {
+		var ts, msg []byte
+		ts = protowire.AppendTag(ts, 1, protowire.VarintType)
+		ts = protowire.AppendVarint(ts, uint64(e.TSNano/1e9))
+		ts = protowire.AppendTag(ts, 2, protowire.VarintType)
+		ts = protowire.AppendVarint(ts, uint64(e.TSNano%1e9))
+		msg = protowire.AppendTag(msg, 1, protowire.BytesType)
+		msg = protowire.AppendBytes(msg, ts)
+		msg = protowire.AppendTag(msg, 2, protowire.BytesType)
+		msg = protowire.AppendString(msg, e.Line)
+		stream = protowire.AppendTag(stream, 2, protowire.BytesType)
+		stream = protowire.AppendBytes(stream, msg)
+	}
+	var req []byte
+	req = protowire.AppendTag(req, 1, protowire.BytesType)
+	req = protowire.AppendBytes(req, stream)
+
+	if got := loggen.EncodePush(labels, entries); !bytes.Equal(got, snappy.Encode(nil, req)) {
+		t.Error("single-stream encoding changed")
 	}
 }

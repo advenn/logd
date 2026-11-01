@@ -36,11 +36,15 @@ import (
 type Entry struct {
 	TSNano int64
 	Line   string
+	// Stream is the entry's label set rendered by LabelString, or "" for the sink's own
+	// labels. It is rendered once by the caller rather than per entry here because a replay
+	// sends millions of entries over a handful of label sets.
+	Stream string
 }
 
-// labelString renders a label set in Loki's `{k="v", k2="v2"}` form with keys sorted, so
+// LabelString renders a label set in Loki's `{k="v", k2="v2"}` form with keys sorted, so
 // the same label map always produces the same stream identity.
-func labelString(labels map[string]string) string {
+func LabelString(labels map[string]string) string {
 	keys := make([]string, 0, len(labels))
 	for k := range labels {
 		keys = append(keys, k)
@@ -81,19 +85,46 @@ func appendEntry(dst []byte, e Entry) []byte {
 	return protowire.AppendBytes(dst, msg)
 }
 
-// EncodePush builds a snappy-compressed Loki PushRequest for one stream.
+// EncodePush builds a snappy-compressed Loki PushRequest. An entry with an empty Stream
+// belongs to `labels`; one with its own Stream goes to that stream. A batch spanning several
+// streams becomes ONE request with one StreamAdapter per stream, which is what a real shipper
+// sends, rather than one request per stream, which would multiply the request count by the
+// stream count and change what the ingest figure measures.
+//
+// Streams appear in the order of their first entry and entries keep their order within a
+// stream, so the same batch always encodes to the same bytes. For a single-stream batch the
+// output is byte-identical to what this function produced before streams existed.
 func EncodePush(labels map[string]string, entries []Entry) []byte {
-	var stream []byte
-	stream = protowire.AppendTag(stream, 1, protowire.BytesType)
-	stream = protowire.AppendString(stream, labelString(labels))
+	var (
+		streams [][]byte
+		index   = map[string]int{}
+		def     string
+	)
 	for _, e := range entries {
-		stream = appendEntry(stream, e)
+		key := e.Stream
+		if key == "" {
+			if def == "" {
+				def = LabelString(labels)
+			}
+			key = def
+		}
+		i, ok := index[key]
+		if !ok {
+			i = len(streams)
+			index[key] = i
+			var stream []byte
+			stream = protowire.AppendTag(stream, 1, protowire.BytesType)
+			stream = protowire.AppendString(stream, key)
+			streams = append(streams, stream)
+		}
+		streams[i] = appendEntry(streams[i], e)
 	}
 
 	var req []byte
-	req = protowire.AppendTag(req, 1, protowire.BytesType)
-	req = protowire.AppendBytes(req, stream)
-
+	for _, stream := range streams {
+		req = protowire.AppendTag(req, 1, protowire.BytesType)
+		req = protowire.AppendBytes(req, stream)
+	}
 	return snappy.Encode(nil, req)
 }
 
