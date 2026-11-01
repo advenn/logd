@@ -43,20 +43,17 @@ add "Loki (| regexp)"     "http://localhost:3100/loki/api/v1/query_range" "{app=
 # earlier measurements found to be the real competitor.
 add "VictoriaLogs (extract)" "http://localhost:9428/select/logsql/query" "_stream:{app=\"$APP\"} \"took=\" | extract \"took=<latency_ms>ms\" | latency_ms:>$T" jsonl
 
-hit() { # url query outfile
+here="$(cd "$(dirname "$0")" && pwd)"
+
+hit() { # url query outfile -> prints "<http status> <bytes received>"
   curl -sS -G "$1" \
     --data-urlencode "query=$2" \
     --data-urlencode "start=$START" \
     --data-urlencode "end=$END" \
-    --data-urlencode "limit=200000" -o "$3"
+    --data-urlencode "limit=200000" -o "$3" -w '%{http_code} %{size_download}\n'
 }
 
-rows() { # file format
-  case "$2" in
-    jsonl) grep -c . "$1" || true ;;  # one JSON object per matching record
-    *) python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(sum(len(r['values']) for r in d['data']['result']))" "$1" ;;
-  esac
-}
+slug() { echo "$1" | tr -c 'a-zA-Z0-9' '_'; }
 
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 # RESULTS_DIR keeps every raw sample, so percentiles can be recomputed and plots rebuilt from the
@@ -64,7 +61,7 @@ tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 if [[ -n "${RESULTS_DIR:-}" ]]; then mkdir -p "$RESULTS_DIR"; fi
 save_samples() { # label file
   [[ -z "${RESULTS_DIR:-}" ]] && return 0
-  local out="$RESULTS_DIR/t${T}_$(echo "$1" | tr -c 'a-zA-Z0-9' '_').csv"
+  local out="$RESULTS_DIR/t${T}_$(slug "$1").csv"
   { echo "ms"; cat "$2"; } > "$out"
 }
 
@@ -72,38 +69,79 @@ save_samples() { # label file
 # latency number next to an EMPTY answer is worse: it looks plausible and inverts the
 # conclusion. (Observed: a query that silently matched nothing reported Loki at 13ms and
 # logd at 26ms, i.e. Loki "winning" purely by returning nothing faster.) Abort on either.
-echo "Row counts (must all agree, and be non-zero):"
-gate_rows=""
+#
+# The engines must return the same RESULT SET, not merely as many rows: each response is
+# reduced to its sorted (timestamp, line) pairs (scripts/resultset.py, which reads Loki's
+# JSON and VictoriaLogs' JSONL) and those are compared byte for byte.
+echo "Result sets (must all be identical, and non-empty):"
+gate_set=""
+gate_name=""
 for e in "${ENGINES[@]}"; do
   IFS="$SEP" read -r name url q fmt <<<"$e"
-  hit "$url" "$q" "$tmp/check"
-  n=$(rows "$tmp/check" "$fmt")
-  printf "  %-22s %s rows\n" "$name" "$n"
+  key=$(slug "$name")
+  read -r code size <<<"$(hit "$url" "$q" "$tmp/check")"
+  if [[ "$code" != "200" ]]; then
+    echo >&2; echo "ABORT: '$name' answered HTTP $code: $(head -c 300 "$tmp/check")" >&2
+    exit 1
+  fi
+  if ! python3 "$here/resultset.py" "$fmt" "$tmp/check" > "$tmp/$key.set"; then
+    echo >&2; echo "ABORT: could not read '$name''s response as $fmt." >&2
+    exit 1
+  fi
+  echo "$size" > "$tmp/$key.size" # what every timed sample of this engine must match
+  n=$(wc -l < "$tmp/$key.set")
+  printf "  %-22s %8s rows  sha256 %s\n" "$name" "$n" "$(sha256sum < "$tmp/$key.set" | cut -c1-16)"
   if [[ "$n" == "0" ]]; then
     echo >&2; echo "ABORT: '$name' returned 0 rows — nothing to measure. Check the query, the app label and the time window." >&2
     exit 1
   fi
-  if [[ -n "$gate_rows" && "$n" != "$gate_rows" ]]; then
-    echo >&2; echo "ABORT: engines disagree ($gate_rows vs $n rows) — fix correctness before timing." >&2
+  if [[ -n "$gate_set" ]] && ! cmp -s "$gate_set" "$tmp/$key.set"; then
+    echo >&2
+    echo "ABORT: '$name' and '$gate_name' return different result sets — fix correctness before timing." >&2
+    echo "  only in '$gate_name': $(LC_ALL=C comm -23 "$gate_set" "$tmp/$key.set" | wc -l) rows, e.g. $(LC_ALL=C comm -23 "$gate_set" "$tmp/$key.set" | head -1 | cut -c1-160)" >&2
+    echo "  only in '$name': $(LC_ALL=C comm -13 "$gate_set" "$tmp/$key.set" | wc -l) rows, e.g. $(LC_ALL=C comm -13 "$gate_set" "$tmp/$key.set" | head -1 | cut -c1-160)" >&2
     exit 1
   fi
-  gate_rows="$n"
+  gate_set="$tmp/$key.set"
+  gate_name="$name"
 done
 echo
 
+# Every timed sample is checked too. Its body goes to /dev/null, so without this an error
+# response (a 4xx/5xx, a timeout's partial body) would be recorded as a fast sample. For a
+# fixed window the response is deterministic, so its size must match the gate response's;
+# the tolerance only absorbs Loki's `stats` block, whose timing figures change length from
+# run to run.
+check_sample() { # name key what
+  local code size want tol
+  read -r code size < "$tmp/w"
+  want=$(<"$tmp/$2.size")
+  tol=$(( want / 200 )); (( tol < 1024 )) && tol=1024
+  if [[ "$code" != "200" ]] || (( size < want - tol || size > want + tol )); then
+    echo >&2
+    echo "ABORT: $3 of '$1' answered HTTP $code with $size bytes; the gate response was $want bytes. Refusing to report timings that may include a failed response." >&2
+    exit 1
+  fi
+}
+
 for e in "${ENGINES[@]}"; do
   IFS="$SEP" read -r name url q fmt <<<"$e"
-  for ((i=0; i<WARMUP; i++)); do hit "$url" "$q" /dev/null; done
-  : > "$tmp/$(echo "$name" | tr -c 'a-zA-Z0-9' '_').samples"
+  key=$(slug "$name")
+  for ((i=0; i<WARMUP; i++)); do
+    hit "$url" "$q" /dev/null > "$tmp/w"
+    check_sample "$name" "$key" "warm-up $((i+1))"
+  done
+  : > "$tmp/$key.samples"
 done
 
 echo "Collecting $RUNS interleaved samples per engine..."
 for ((r=0; r<RUNS; r++)); do
   for e in "${ENGINES[@]}"; do
     IFS="$SEP" read -r name url q fmt <<<"$e"
-    f="$tmp/$(echo "$name" | tr -c 'a-zA-Z0-9' '_').samples"
-    t0=$(date +%s%N); hit "$url" "$q" /dev/null; t1=$(date +%s%N)
-    echo "scale=2; ($t1-$t0)/1000000" | bc >> "$f"
+    key=$(slug "$name")
+    t0=$(date +%s%N); hit "$url" "$q" /dev/null > "$tmp/w"; t1=$(date +%s%N)
+    check_sample "$name" "$key" "sample $((r+1))"
+    echo "scale=2; ($t1-$t0)/1000000" | bc >> "$tmp/$key.samples"
   done
 done
 echo
@@ -112,7 +150,7 @@ printf "%-24s %8s %8s %8s %8s %8s %6s\n" "engine" "median" "p95" "p99" "min" "ma
 printf "%-24s %8s %8s %8s %8s %8s %6s\n" "------------------------" "--------" "--------" "--------" "--------" "--------" "------"
 for e in "${ENGINES[@]}"; do
   IFS="$SEP" read -r name url q fmt <<<"$e"
-  f="$tmp/$(echo "$name" | tr -c 'a-zA-Z0-9' '_').samples"
+  f="$tmp/$(slug "$name").samples"
   save_samples "$name" "$f"
   python3 - "$name" "$f" <<'PY'
 import math, statistics, sys

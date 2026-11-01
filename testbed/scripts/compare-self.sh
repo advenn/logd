@@ -36,21 +36,21 @@ fi
 WARMUP="${WARMUP:-5}"
 RUNS="${RUNS:-20}"
 
-fetch() { # endpoint outfile
+fetch() { # endpoint outfile -> prints "<http status> <bytes received>"
   curl -sS -G "$LOGD_URL/$1" \
     --data-urlencode "query=$QUERY" \
     --data-urlencode "start=$START" \
     --data-urlencode "end=$END" \
     --data-urlencode "limit=$LIMIT" \
-    -o "$2"
+    -o "$2" -w '%{http_code} %{size_download}\n'
 }
 
 rows() { python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(sum(len(r['values']) for r in d['data']['result']))" "$1"; }
 
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 
-fetch "loki/api/v1/query_range" "$tmp/index.json"
-fetch "logd/api/v1/query_scan"  "$tmp/scan.json"
+read -r _ idx_size <<<"$(fetch "loki/api/v1/query_range" "$tmp/index.json")"
+read -r _ scn_size <<<"$(fetch "logd/api/v1/query_scan"  "$tmp/scan.json")"
 
 # Fail clearly on an error body rather than letting the comparator die on a missing key.
 for f in "$tmp/index.json" "$tmp/scan.json"; do
@@ -84,26 +84,52 @@ if [[ "$n" == "0" ]]; then
   exit 1
 fi
 
-bench() { # endpoint -> mean ms
-  local ep="$1" i t0 t1
-  for ((i=0; i<WARMUP; i++)); do fetch "$ep" /dev/null; done
-  t0=$(date +%s%N)
-  for ((i=0; i<RUNS; i++)); do fetch "$ep" /dev/null; done
-  t1=$(date +%s%N)
-  echo "scale=2; ($t1 - $t0) / $RUNS / 1000000" | bc
+# Interleaved, one sample per path at a time, for the reason bench-vs.sh gives: drift over
+# the run (page cache, a neighbour waking up, thermals) then lands on both paths instead of
+# masquerading as a difference between them. Reported as median and min-max, not a mean,
+# which one slow outlier can move.
+#
+# Every sample is checked: its body goes to /dev/null, so an error response would otherwise
+# be timed as a fast answer. Both paths are logd and the window is fixed, so each response
+# must be the gate response byte for byte in size.
+sample() { # endpoint gate-size -> elapsed ms
+  local t0 t1 code size
+  t0=$(date +%s%N); fetch "$1" /dev/null > "$tmp/w"; t1=$(date +%s%N)
+  read -r code size < "$tmp/w"
+  if [[ "$code" != "200" || "$size" != "$2" ]]; then
+    echo "ABORT: $1 answered HTTP $code with $size bytes; the gate response was $2 bytes. Refusing to report timings." >&2
+    exit 1
+  fi
+  echo "scale=2; ($t1 - $t0) / 1000000" | bc
 }
 
-idx=$(bench "loki/api/v1/query_range")
-scn=$(bench "logd/api/v1/query_scan")
+for ((i=0; i<WARMUP; i++)); do
+  sample "loki/api/v1/query_range" "$idx_size" > /dev/null
+  sample "logd/api/v1/query_scan"  "$scn_size" > /dev/null
+done
+: > "$tmp/idx.samples"; : > "$tmp/scn.samples"
+for ((i=0; i<RUNS; i++)); do
+  sample "loki/api/v1/query_range" "$idx_size" >> "$tmp/idx.samples"
+  sample "logd/api/v1/query_scan"  "$scn_size" >> "$tmp/scn.samples"
+done
 
 echo
 echo "query:  $QUERY"
 echo "rows:   $n  (identical on both paths)"
-echo "runs:   $RUNS measured, $WARMUP warm-ups discarded, warm page cache"
+echo "runs:   $RUNS interleaved per path, $WARMUP warm-ups each discarded, warm page cache"
 echo
-printf "  %-26s %8s ms\n" "logd (typed index)" "$idx"
-printf "  %-26s %8s ms\n" "logd (forced scan)" "$scn"
-echo "$idx $scn" | awk '{ if ($1 > 0) printf "  %-26s %8.2fx\n", "speedup", $2/$1 }'
+python3 - "$tmp/idx.samples" "$tmp/scn.samples" <<'PY'
+import statistics, sys
+def load(p):
+    return sorted(float(x) for x in open(p) if x.strip())
+idx, scn = load(sys.argv[1]), load(sys.argv[2])
+print(f"  {'':26} {'median':>9} {'min':>9} {'max':>9}")
+for name, v in (("logd (typed index)", idx), ("logd (forced scan)", scn)):
+    print(f"  {name:<26} {statistics.median(v):9.2f} {v[0]:9.2f} {v[-1]:9.2f}  ms")
+mi, ms = statistics.median(idx), statistics.median(scn)
+if mi > 0:
+    print(f"  {'speedup (median)':<26} {ms / mi:8.2f}x")
+PY
 echo
 echo "Access path per segment:"
 curl -sS -G "$LOGD_URL/logd/api/v1/explain" \

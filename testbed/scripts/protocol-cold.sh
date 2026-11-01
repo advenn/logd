@@ -23,11 +23,17 @@ for r in $(seq 1 "$ROUNDS"); do
     timeout 1 tail -f /dev/null || true
   done
   sample() { # engine url query
-    local t0 t1
+    local t0 t1 code
     t0=$(date +%s%N)
     curl -sS -G "$2" --data-urlencode "query=$3" --data-urlencode "start=$START" \
-      --data-urlencode "end=$END" --data-urlencode "limit=200000" -o /dev/null
+      --data-urlencode "end=$END" --data-urlencode "limit=200000" -o /dev/null -w '%{http_code}' > "$R/.status"
     t1=$(date +%s%N)
+    # The body is discarded, so an error answer would otherwise be recorded as a fast sample.
+    code=$(<"$R/.status")
+    if [[ "$code" != "200" ]]; then
+      echo "ABORT: round $r, $1 answered HTTP $code. Refusing to record it as a sample." >&2
+      exit 1
+    fi
     printf "%d,%s,%.1f\n" "$r" "$1" "$(echo "scale=2; ($t1-$t0)/1000000" | bc)" | tee -a "$out"
   }
   sample "logd (index)"       "http://localhost:7100/loki/api/v1/query_range" "$q_logd"

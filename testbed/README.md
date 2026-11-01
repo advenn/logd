@@ -60,7 +60,9 @@ logd unmodified**. That is a compatibility claim, and it never runs during a mea
 Real numbers from this harness, not estimates. Each section states its own corpus size:
 latency was measured at 500,000 lines, correctness/storage/ingest at 50,000. Reproduce with
 `./scripts/bench-vs.sh`, which interleaves samples across engines and refuses to report
-timings unless every engine returned the same non-zero row count.
+timings unless every engine returned the same non-empty result set (the sorted
+timestamp/line pairs, compared byte for byte) and every timed sample answered 200 with a
+response the size of the gate's.
 
 Corpus: unstructured application logs, e.g.
 `GET /api/v1/orders 200 took=247ms trace_id=…`. 81% of lines carry a `took=` duration.
@@ -381,6 +383,7 @@ cmd/loggen/                   corpus generator + multi-target Loki push driver
 internal/loggen/              ported generator; corpus.go and push.go are new
 scripts/bench-vs.sh           interleaved A/B latency across all engines
 scripts/compare-self.sh       index vs forced scan, with a correctness gate first
+scripts/resultset.py          canonical result set of a Loki-JSON or LogsQL-JSONL response
 scripts/window.sh             derives the query window from a manifest
 ```
 
