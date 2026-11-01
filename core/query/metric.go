@@ -51,6 +51,17 @@ type MetricQuery struct {
 	Grouping         []string // labels for by(...)/without(...)
 	Without          bool
 	Start, End, Step int64 // matrix time range + step, in nanos
+
+	// SeriesLabels, when set, gives each matching entry's series labels in place of the
+	// labels it carries (Resolver.AllLabels). A compat layer whose language derives labels
+	// from the line at query time — LogQL parser stages — supplies them, so streams split
+	// and group by those labels too. It must be pure; nil keeps the built-in behaviour.
+	SeriesLabels func(e model.LogEntry, r Resolver) map[string]string
+	// UnwrapValue, when set, replaces the built-in unwrap lookup (a template field's first
+	// value, else a numeric label) with the caller's: it returns the value to aggregate, or
+	// false to drop the entry. Unwrap must still name the value; this only says how to read
+	// it.
+	UnwrapValue func(e model.LogEntry, r Resolver) (float64, bool)
 }
 
 // MetricPoint is one [timestamp, value] sample.
@@ -118,7 +129,7 @@ func (e *Engine) ExecuteMetric(q MetricQuery) ([]MatrixSeries, error) {
 	// Gather entries that could fall in any window ([Start-Range, End]) PER SHARD, so each
 	// entry is labelled/unwrapped with its own shard's resolver (service names resolve per
 	// shard) before being merged into cross-shard streams.
-	acc := &metricCollector{e: e, unwrap: q.Unwrap, streams: map[string]*streamGroup{}}
+	acc := &metricCollector{e: e, unwrap: q.Unwrap, unwrapValue: q.UnwrapValue, seriesLabels: q.SeriesLabels, streams: map[string]*streamGroup{}}
 	for _, sh := range e.shards {
 		if err := e.collectShardInto(acc, sh, q.Preds, windowStart(q.Start, rng), q.End, false, Backward); err != nil {
 			return nil, err
@@ -164,10 +175,12 @@ func (e *Engine) ExecuteMetric(q MetricQuery) ([]MatrixSeries, error) {
 // a shard's every matching record had been collected as a full LogEntry, so on a
 // single-shard daemon it bounded nothing.
 type metricCollector struct {
-	e       *Engine
-	unwrap  string
-	streams map[string]*streamGroup
-	matched int
+	e            *Engine
+	unwrap       string
+	unwrapValue  func(model.LogEntry, Resolver) (float64, bool)   // MetricQuery.UnwrapValue
+	seriesLabels func(model.LogEntry, Resolver) map[string]string // MetricQuery.SeriesLabels
+	streams      map[string]*streamGroup
+	matched      int
 }
 
 func (c *metricCollector) add(en model.LogEntry, r *engineResolver) {
@@ -176,13 +189,24 @@ func (c *metricCollector) add(en model.LogEntry, r *engineResolver) {
 	}
 	var val float64
 	if c.unwrap != "" {
-		v, ok := c.e.unwrapValue(en, r, c.unwrap)
+		var v float64
+		var ok bool
+		if c.unwrapValue != nil {
+			v, ok = c.unwrapValue(en, r)
+		} else {
+			v, ok = c.e.unwrapValue(en, r, c.unwrap)
+		}
 		if !ok {
 			return // non-unwrappable entries are dropped (Loki)
 		}
 		val = v
 	}
-	labels := r.AllLabels(en)
+	var labels map[string]string
+	if c.seriesLabels != nil {
+		labels = c.seriesLabels(en, r)
+	} else {
+		labels = r.AllLabels(en)
+	}
 	key := labelKey(labels)
 	s := c.streams[key]
 	if s == nil {

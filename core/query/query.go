@@ -209,6 +209,12 @@ func (p TypedCompare) Match(e model.LogEntry, r Resolver) bool {
 // is malformed instead of answering it by an ordering nobody asked for.
 func validatePreds(preds []Predicate) error {
 	for _, p := range preds {
+		if dc, ok := p.(DynamicCompare); ok {
+			if err := dc.validate(); err != nil {
+				return err
+			}
+			continue
+		}
 		tc, ok := p.(TypedCompare)
 		if !ok || tc.Value.Kind != index.KindFloat {
 			continue
