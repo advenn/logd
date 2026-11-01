@@ -1,0 +1,30 @@
+# Overlay: a second logd built from an older tag, next to the current one.
+#
+#   ./scripts/build-v1.sh                       # builds logd:thesis-eval-1 from the tag
+#   docker compose -f docker-compose.yml -f docker-compose.v1.yml up -d
+#
+# The point is one interleaved run in which the old and the new daemon see the same pushes,
+# the same page cache and the same neighbours. Then "what the fixes and features changed" is
+# measured, not inferred from two sessions on different days.
+#
+# It reads the SAME config file as the current logd (LOGD_CONFIG, default stack/logd/logd.yaml).
+# The YAML loader ignores keys it does not know, so options added after the tag are inert for v1.
+# Templates, labels, segment size and sync settings are therefore identical for both.
+
+services:
+  logd-v1:
+    image: logd:thesis-eval-1
+    container_name: tb-logd-v1
+    cpus: "2.0"
+    mem_limit: 3g
+    restart: unless-stopped
+    stop_grace_period: 30s
+    ports:
+      - "7101:7100"
+    volumes:
+      - ${LOGD_CONFIG:-./stack/logd/logd.yaml}:/etc/logd/config.yaml:ro
+      - logd-v1-data:/data
+    command: ["-config", "/etc/logd/config.yaml"]
+
+volumes:
+  logd-v1-data:
