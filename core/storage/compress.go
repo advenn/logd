@@ -360,8 +360,32 @@ func newCompressedSource(f *os.File) (*pageSource, error) {
 		}
 	}
 
+	// The header's counts are not under the checksum, which covers only the dictionary and
+	// the directory, so they are checked before anything is sized or indexed by them:
+	// against each other and the file size here, and against the checksummed directory
+	// below. Trusted as read, a corrupt count was a panic (a page mapped to a block past the
+	// directory) or a multi-gigabyte allocation, and a wrong block size silently mapped
+	// pages onto other pages' bytes, which then validated as the wrong page.
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("segz: stat: %w", err)
+	}
+	size := uint64(info.Size())
+	bp := uint64(blockPages)
+	wantBlocks := pages / bp
+	if pages%bp != 0 {
+		wantBlocks++
+	}
+	if pages == 0 || uint64(numBlocks) != wantBlocks {
+		return nil, fmt.Errorf("segz: header says %d pages in %d blocks of %d", pages, numBlocks, blockPages)
+	}
+	dirOff := uint64(headerLen + len(dict))
+	if dirEnd := dirOff + uint64(numBlocks)*segzDirEntry; dirEnd > size {
+		return nil, fmt.Errorf("segz: directory of %d blocks runs past the end of the %d-byte file", numBlocks, size)
+	}
+
 	dir := make([]byte, int(numBlocks)*segzDirEntry)
-	if _, err := f.ReadAt(dir, int64(headerLen+len(dict))); err != nil {
+	if _, err := f.ReadAt(dir, int64(dirOff)); err != nil {
 		return nil, fmt.Errorf("segz: reading directory: %w", err)
 	}
 	// The CRC covers the dictionary as well as the directory in v2: a corrupt dictionary
@@ -372,6 +396,21 @@ func newCompressedSource(f *os.File) (*pageSource, error) {
 	crc.Write(dir)
 	if crc.Sum32() != wantCRC {
 		return nil, fmt.Errorf("segz: directory checksum mismatch")
+	}
+	// Every block holds blockPages pages but the last, which holds the rest: the raw
+	// lengths the (checksummed) directory records pin both header counts exactly.
+	for b := uint64(0); b < uint64(numBlocks); b++ {
+		e := dir[b*segzDirEntry:]
+		fileOff := binary.BigEndian.Uint64(e[0:8])
+		compLen := uint64(binary.BigEndian.Uint32(e[8:12]))
+		rawLen := uint64(binary.BigEndian.Uint32(e[12:16]))
+		n := min(bp, pages-b*bp)
+		if rawLen != n*PageSize {
+			return nil, fmt.Errorf("segz: block %d holds %d bytes, the header implies %d", b, rawLen, n*PageSize)
+		}
+		if fileOff > size || compLen > size-fileOff {
+			return nil, fmt.Errorf("segz: block %d runs past the end of the file", b)
+		}
 	}
 	return &pageSource{f: f, pages: pages, blockPages: blockPages, dir: dir, dict: dict}, nil
 }
@@ -392,6 +431,9 @@ func (s *pageSource) readPage(n uint64, buf []byte) error {
 		return err
 	}
 	block := n / uint64(s.blockPages)
+	if block >= uint64(len(s.dir)/segzDirEntry) {
+		return fmt.Errorf("segz: page %d maps to block %d, past the directory", n, block) // unreachable once the header validated
+	}
 	if !s.haveCache || s.cachedBlock != block {
 		if s.failedErr != nil && s.failedBlock == block {
 			return s.failedErr

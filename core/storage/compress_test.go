@@ -210,6 +210,58 @@ func TestCorruptDirectoryDegrades(t *testing.T) {
 	}
 }
 
+// TestCorruptHeaderCountsDegrade: the .logz header's page count, block size and block count
+// sit outside the checksum, which covers only the dictionary and the directory. Trusted as
+// read, a bad count made the readers index past the directory (a panic), size a 64 GB
+// directory, or map pages onto other pages' bytes. Each must instead be reported when the
+// segment is opened, which the readers turn into a skipped segment — never a wrong answer.
+func TestCorruptHeaderCountsDegrade(t *testing.T) {
+	_, segPath, recs := buildRawSegment(t, 3000)
+	if _, err := CompressSegment(segPath, 8); err != nil {
+		t.Fatal(err)
+	}
+	zpath := SegzPath(segPath)
+	orig, err := os.ReadFile(zpath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pages := binary.BigEndian.Uint64(orig[8:16])
+	blocks := binary.BigEndian.Uint32(orig[16:20])
+	offsets := []uint64{recs[0].Offset, recs[len(recs)-1].Offset}
+
+	for _, c := range []struct {
+		name   string
+		mutate func(h []byte)
+	}{
+		{"page count +64", func(h []byte) { binary.BigEndian.PutUint64(h[8:16], pages+64) }},
+		{"page count 0", func(h []byte) { binary.BigEndian.PutUint64(h[8:16], 0) }},
+		{"block size 8->4", func(h []byte) { binary.BigEndian.PutUint16(h[6:8], 4) }},
+		{"block count 2^32-1", func(h []byte) { binary.BigEndian.PutUint32(h[16:20], 0xFFFFFFFF) }},
+		// Counts consistent with each other, so only the directory's raw lengths expose it.
+		{"block size 8->9, page count to match", func(h []byte) {
+			binary.BigEndian.PutUint16(h[6:8], 9)
+			binary.BigEndian.PutUint64(h[8:16], uint64(blocks)*9)
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			data := append([]byte(nil), orig...)
+			c.mutate(data)
+			if err := os.WriteFile(zpath, data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := openPageSource(segPath); err == nil {
+				t.Fatal("a .logz with inconsistent header counts was opened")
+			}
+			if err := ScanSegmentTimeRange(segPath, 0, 1<<62, func(model.LogEntry) bool { return true }); err == nil {
+				t.Error("scan did not report the bad header")
+			}
+			if err := FetchRecords(segPath, offsets, func(model.LogEntry) bool { return true }); err == nil {
+				t.Error("fetch did not report the bad header")
+			}
+		})
+	}
+}
+
 // corruptBlockStart makes one compressed block undecodable by overwriting the start of its
 // deflate stream with 0xFF (BTYPE=11 is reserved, so inflating fails outright rather than
 // producing garbage that page CRCs would catch). It returns the logical pages that block
