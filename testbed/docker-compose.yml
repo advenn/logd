@@ -112,6 +112,38 @@ services:
       retries: 30
       start_period: 10s
 
+  # HTTP front for PostgreSQL, so the interleaved harness times it end to end like the
+  # others: request, query, row transfer, grouping into streams and JSON serialisation.
+  #   http://localhost:7300/loki/api/v1/query_range?variant=structured&query=latency_ms > 200
+  # See cmd/pgshim and the README for the query form.
+  #
+  # Its own limits, smaller than the backends': every other engine serialises its results
+  # inside its own 2-CPU budget, while PostgreSQL's serialisation happens here, outside it.
+  # One request is encoded on one goroutine, so one CPU does not throttle the shim, and it
+  # caps how much extra CPU the PostgreSQL side gets. State it when quoting PG latency.
+  pgshim:
+    build:
+      context: .
+      dockerfile: stack/pgshim/Dockerfile
+    image: pgshim:testbed
+    container_name: tb-pgshim
+    cpus: "1.0"
+    mem_limit: 512m
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGSHIM_DSN: postgres://logd:logd@postgres:5432/logs
+    ports:
+      - "7300:7300"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:7300/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
   # One-shot readiness gate.
   #
   # Both Loki and VictoriaLogs ship as shell-less images, so neither can run a container-

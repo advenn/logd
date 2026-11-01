@@ -1,0 +1,5 @@
+# Build context for the testbed's own images (pgshim). Corpora and results run to hundreds of
+# MB and are never needed inside an image.
+corpus/
+results/
+*.jsonl
