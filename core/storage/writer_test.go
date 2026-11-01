@@ -839,6 +839,65 @@ func TestTornPageTruncatedOnRecovery(t *testing.T) {
 	}
 }
 
+// TestRecoveryKeepsPagesAfterMidSegmentCorruption: recovery truncates a torn TAIL. A corrupt
+// page with valid pages after it is damage in the middle, not a torn write, and recovery used
+// to treat it as one: everything from it onwards was truncated, though every later page was
+// valid and long since fsynced. Only the trailing run of invalid pages may go.
+func TestRecoveryKeepsPagesAfterMidSegmentCorruption(t *testing.T) {
+	dir := t.TempDir()
+	w1, _ := NewWriter(dir, noTickOpts()) // SyncInterval 0: every page fsynced as it is written
+	w1.Start(nil)
+	const pages = 10
+	for i := 0; i < pages*entriesPerPage+1; i++ { // the extra record pushes the 10th page out
+		w1.Write(makeEntry(i, 1))
+	}
+	w1.stop() // crash
+
+	path := mustManifest(t, dir).Active().Path
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte{0xFF}, PageOffset(2)+100); err != nil { // bit rot in page 2
+		t.Fatal(err)
+	}
+	junk := make([]byte, PageSize)
+	for i := range junk {
+		junk[i] = 0xFF
+	}
+	if _, err := f.WriteAt(junk, PageOffset(pages+1)); err != nil { // and a torn trailing page
+		t.Fatal(err)
+	}
+	f.Close()
+
+	w2, err := NewWriter(dir, noTickOpts())
+	if err != nil {
+		t.Fatalf("recovery failed: %v", err)
+	}
+	if info, _ := w2.currSeg.File.Stat(); info.Size() != PageOffset(pages+1) {
+		t.Fatalf("recovered segment is %d bytes, want %d: pages 0-%d kept, only the torn tail cut", info.Size(), PageOffset(pages+1), pages)
+	}
+	w2.Start(nil)
+	if err := w2.Write(makeEntry(99999, 1)); err != nil { // appends after the last valid page
+		t.Fatal(err)
+	}
+	if err := w2.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ReadAll(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := (pages-1)*entriesPerPage + 1 // all but page 2, plus the record written after recovery
+	if len(got) != want {
+		t.Fatalf("read %d records after recovery, want %d", len(got), want)
+	}
+	if last := got[len(got)-2].Message; last != fmt.Sprintf("%05d", pages*entriesPerPage-1) {
+		t.Fatalf("last pre-crash record is %q, want the one from page %d", last, pages)
+	}
+}
+
 // A missing event time is defaulted to arrival time rather than being rejected or
 // stored as a wrapped zero-instant.
 func TestZeroTSDefaultsToIngestedAt(t *testing.T) {

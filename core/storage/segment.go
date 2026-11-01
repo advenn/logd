@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"log"
 	"os"
 )
 
@@ -57,10 +58,17 @@ func CreateSegment(path string) (*Segment, error) {
 
 // OpenSegment opens an existing segment read-write and performs crash recovery on
 // it. It reads every data page in full and validates it (magic + full-page
-// checksum). The FIRST page that fails validation is treated as a torn trailing
-// page from a crash mid-write: the file is truncated to the last known-good page
-// boundary and scanning stops. MinTS/MaxTS and the next page number are derived
-// from the surviving valid pages (design §8).
+// checksum). The run of invalid pages AFTER the last valid one is a torn tail from
+// a crash mid-write: the file is truncated to the end of that last valid page
+// (design §8). MinTS/MaxTS and the next page number are derived from the valid
+// pages.
+//
+// An invalid page with a valid one after it is not a torn write — pages are written
+// in order — but damage in the middle (a media error, or a page whose write-back a
+// machine crash lost while a later one's survived). It used to end the scan like a
+// torn tail, so recovery truncated away every later page, all valid and fsynced
+// long before. Such a page is now kept and logged: readers skip it, as they skip
+// any page that fails validation.
 //
 // Because torn-page truncation mutates the file, OpenSegment is the writer's
 // recovery primitive — it opens for append. (The read-only query path, added
@@ -91,14 +99,17 @@ func OpenSegment(path string) (*Segment, error) {
 	maxTS := emptyMaxTS
 	lastGoodPage := uint64(0) // page 0 is the placeholder; data starts at 1
 	page := make([]byte, PageSize)
+	var midBad, pendingBad []uint64 // invalid pages before the last valid one / since it
 
 	for i := uint64(1); i < numWholePages; i++ {
 		if _, err := f.ReadAt(page, PageOffset(i)); err != nil {
 			break // short read: treat the rest as torn
 		}
 		if err := ValidatePage(page); err != nil {
-			break // first corrupt/torn page ends the valid prefix
+			pendingBad = append(pendingBad, i) // torn tail, unless a valid page follows
+			continue
 		}
+		midBad, pendingBad = append(midBad, pendingBad...), pendingBad[:0]
 		h := decodePageHeader(page[:PageHeaderSize])
 		if h.EntryCount > 0 {
 			if h.MinTS < minTS {
@@ -111,8 +122,13 @@ func OpenSegment(path string) (*Segment, error) {
 		lastGoodPage = i
 	}
 
-	// Truncate away any torn trailing page(s) / partial tail so the file contains
-	// only whole, valid pages. nextPage is where the writer will append.
+	if len(midBad) > 0 {
+		log.Printf("storage: %s: %d corrupt page(s) before the last valid page %d, kept and skipped: %v",
+			path, len(midBad), lastGoodPage, midBad)
+	}
+
+	// Truncate away any torn trailing page(s) / partial tail so the file ends with a
+	// whole, valid page. nextPage is where the writer will append.
 	nextPage := lastGoodPage + 1
 	goodSize := PageOffset(nextPage)
 	if goodSize != size {

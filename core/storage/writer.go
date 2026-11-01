@@ -240,11 +240,14 @@ func (w *Writer) recoverActiveSegment(meta *SegmentMeta) error {
 		return fmt.Errorf("reopening index writer: %w", err)
 	}
 	for p := uint64(1); p < seg.PageNum; p++ {
-		h, err := seg.ReadPageHeader(p)
-		if err != nil {
+		// The whole page is validated, not just its header read: a corrupt page in the
+		// middle survives recovery (see OpenSegment), and its header is as untrustworthy
+		// as the rest of it.
+		buf, err := seg.ReadPage(p)
+		if err != nil || ValidatePage(buf) != nil {
 			continue
 		}
-		if h.EntryCount > 0 {
+		if h := decodePageHeader(buf[:PageHeaderSize]); h.EntryCount > 0 {
 			if err := iw.WriteEntry(h.MinTS, p); err != nil {
 				iw.Close()
 				seg.Close()
