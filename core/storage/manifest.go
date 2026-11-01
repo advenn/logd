@@ -83,6 +83,14 @@ type SealInfo struct {
 // Manifest is the per-shard catalog of segments, held in memory and persisted to
 // manifest.json. Safe for concurrent use: the query path reads it while the writer
 // mutates it.
+//
+// Every accessor returns COPIES of the entries, taken under the lock. It used to hand out
+// the shared *SegmentMeta itself, which the query path then read with no lock while the
+// writer's SetBounds and SealSegment rewrote it — a data race, and not a benign one: a
+// planner could see Indexed=true next to the CappedKeys of the unsealed entry, and push a
+// label predicate that the segment's capped values never reached. A copy is consistent by
+// construction. It is shallow, which is safe because the slice fields are only ever
+// REPLACED (by SealSegment), never modified in place.
 type Manifest struct {
 	mu       sync.RWMutex
 	segments map[string]*SegmentMeta
@@ -180,19 +188,27 @@ func (m *Manifest) Add(meta *SegmentMeta) {
 	if meta.ID == "" {
 		meta.ID = newULID()
 	}
-	m.segments[meta.ID] = meta
-	m.byMinTS = append(m.byMinTS, meta)
+	c := meta.clone() // the caller's struct stays its own; mutating it later cannot race readers
+	m.segments[c.ID] = c
+	m.byMinTS = append(m.byMinTS, c)
 	m.sortLocked()
+}
+
+// clone returns a shallow copy of s (see Manifest on why shallow is enough).
+func (s *SegmentMeta) clone() *SegmentMeta {
+	c := *s
+	return &c
 }
 
 // Update refreshes an existing segment's metadata and re-sorts.
 func (m *Manifest) Update(meta *SegmentMeta) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.segments[meta.ID] = meta
+	c := meta.clone()
+	m.segments[c.ID] = c
 	for i, s := range m.byMinTS {
-		if s.ID == meta.ID {
-			m.byMinTS[i] = meta
+		if s.ID == c.ID {
+			m.byMinTS[i] = c
 			break
 		}
 	}
@@ -274,7 +290,7 @@ func (m *Manifest) SealedBefore(cutoff int64) []*SegmentMeta {
 	var out []*SegmentMeta
 	for _, s := range m.byMinTS {
 		if s.State == SegmentSealed && s.MaxTS < cutoff {
-			out = append(out, s)
+			out = append(out, s.clone())
 		}
 	}
 	return out
@@ -287,7 +303,7 @@ func (m *Manifest) Filter(minTS, maxTS int64) []*SegmentMeta {
 	var out []*SegmentMeta
 	for _, s := range m.byMinTS {
 		if s.MaxTS >= minTS && s.MinTS <= maxTS {
-			out = append(out, s)
+			out = append(out, s.clone())
 		}
 	}
 	return out
@@ -298,7 +314,9 @@ func (m *Manifest) All() []*SegmentMeta {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	out := make([]*SegmentMeta, len(m.byMinTS))
-	copy(out, m.byMinTS)
+	for i, s := range m.byMinTS {
+		out[i] = s.clone()
+	}
 	return out
 }
 
@@ -308,7 +326,7 @@ func (m *Manifest) Active() *SegmentMeta {
 	defer m.mu.RUnlock()
 	for _, s := range m.segments {
 		if s.State == SegmentActive {
-			return s
+			return s.clone()
 		}
 	}
 	return nil
@@ -318,7 +336,10 @@ func (m *Manifest) Active() *SegmentMeta {
 func (m *Manifest) Get(id string) *SegmentMeta {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.segments[id]
+	if s, ok := m.segments[id]; ok {
+		return s.clone()
+	}
+	return nil
 }
 
 // Save persists the manifest to dir/manifest.json atomically: write a temp file,
