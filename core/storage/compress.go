@@ -281,17 +281,24 @@ type pageSource struct {
 // The compressed file is checked FIRST. Checking .log first and falling back on ENOENT
 // would confuse "this segment is compressed" with "retention deleted this segment", and the
 // latter is deliberately treated as an empty result rather than an error.
+//
+// The two opens are not atomic against CompressSegment, which renames the .logz into place
+// and then unlinks the .log: both can land between them, so a reader finds neither file for
+// a segment that exists the whole time. That ENOENT used to reach the query path as the
+// retention race and silently empty the segment's result. The .logz is therefore tried once
+// more before the .log's ENOENT is believed: the .log is only ever unlinked once the .logz is
+// in place, so if the .logz is not there either, the segment really is gone.
 func openPageSource(logPath string) (*pageSource, error) {
 	if f, err := os.Open(SegzPath(logPath)); err == nil {
-		s, err := newCompressedSource(f)
-		if err != nil {
-			f.Close()
-			return nil, err
-		}
-		return s, nil
+		return openCompressed(f)
 	}
 	f, err := os.Open(logPath)
 	if err != nil {
+		if os.IsNotExist(err) {
+			if zf, zerr := os.Open(SegzPath(logPath)); zerr == nil {
+				return openCompressed(zf)
+			}
+		}
 		return nil, err // includes the retention race; callers map ENOENT to empty
 	}
 	info, err := f.Stat()
@@ -300,6 +307,16 @@ func openPageSource(logPath string) (*pageSource, error) {
 		return nil, err
 	}
 	return &pageSource{f: f, pages: uint64(info.Size() / PageSize)}, nil
+}
+
+// openCompressed reads an opened .logz's header and directory, closing f if they are bad.
+func openCompressed(f *os.File) (*pageSource, error) {
+	s, err := newCompressedSource(f)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return s, nil
 }
 
 func newCompressedSource(f *os.File) (*pageSource, error) {

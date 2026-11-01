@@ -9,6 +9,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -309,6 +312,53 @@ func reopen(t *testing.T, dir string, blockPages int) {
 func exists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// TestReadRacingCompressionNeverReportsGone: a reader that opens a segment while it is being
+// compressed must find it. openPageSource tries the .logz and then the .log, and the rename of
+// the one plus the unlink of the other can both land between those two opens; the reader then
+// got ENOENT for a segment that existed the whole time, which the query path takes for the
+// retention race and answers with an empty result.
+func TestReadRacingCompressionNeverReportsGone(t *testing.T) {
+	_, src, _ := buildRawSegment(t, 300)
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	readers := runtime.GOMAXPROCS(0) * 2
+	var gone atomic.Int64
+	// A probabilistic test, but not a marginal one: before the fix, these 20 compressions gave
+	// 10 to 40 such reads per run.
+	for it := 0; it < 20; it++ {
+		p := filepath.Join(dir, fmt.Sprintf("seg-%d.log", it))
+		if err := os.WriteFile(p, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		var done atomic.Bool
+		var wg sync.WaitGroup
+		for r := 0; r < readers; r++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for !done.Load() {
+					err := ScanSegmentPages(p, 0, 1<<62, false, nil, func(model.LogEntry) bool { return false })
+					if os.IsNotExist(err) {
+						gone.Add(1)
+					}
+				}
+			}()
+		}
+		if _, err := CompressSegment(p, 0); err != nil {
+			t.Fatal(err)
+		}
+		done.Store(true)
+		wg.Wait()
+		os.Remove(SegzPath(p))
+	}
+	if n := gone.Load(); n > 0 {
+		t.Fatalf("%d reads reported a segment missing while it was being compressed", n)
+	}
 }
 
 // TestStartCompressesSegmentLeftRaw: compression runs in the background after seal, so a
