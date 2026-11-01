@@ -1,10 +1,11 @@
 name: logd-testbed
 
 # Head-to-head testbed: logd, Loki and VictoriaLogs side by side in one Grafana, fed
-# identical traffic.
+# identical traffic, plus PostgreSQL as the relational baseline (loaded from the same
+# manifest, queried over HTTP through pgshim).
 #
-#   docker compose up -d            bring up all four
-#   make corpus load                generate a corpus and push it to all three
+#   docker compose up -d            bring up the stack
+#   make corpus load                generate a corpus and push it to the three log stores
 #   open http://localhost:3000      Explore, switch datasource, compare
 #
 # Resource limits are set on every backend deliberately. On a shared dev box an unpinned
@@ -76,6 +77,40 @@ services:
     # No healthcheck: this image is built FROM scratch, so there is no shell, no wget and
     # no curl inside it for a CMD/CMD-SHELL probe to run. Readiness is gated by the
     # `waiter` service below, which polls it from the outside.
+
+  # PostgreSQL baseline (experiment E-3): "why not a table with an extracted column and a
+  # B-tree?". Pinned by digest, not by tag: postgres:17 is a moving tag that follows every
+  # minor release, and a rerun on a different minor would not be the same baseline. This
+  # digest is PostgreSQL 17.11 (Debian 17.11-1.pgdg13+2).
+  #
+  # Every non-default setting is in stack/postgres/postgresql.conf with its reason; the
+  # schema and the choice of index are in stack/postgres/schema.sql. Load with
+  # scripts/pg-load.sh; query over HTTP through the `pgshim` service.
+  postgres:
+    image: postgres@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
+    container_name: tb-postgres
+    <<: *bench-limits
+    # Docker's default /dev/shm is 64 MB. PostgreSQL puts parallel-query shared memory there,
+    # and a parallel scan that cannot allocate it fails the query outright ("could not resize
+    # shared memory segment") rather than degrading. shared_buffers itself is not in /dev/shm.
+    shm_size: 256mb
+    environment:
+      POSTGRES_USER: logd
+      POSTGRES_PASSWORD: logd   # a throwaway benchmark database, reachable only from this host
+      POSTGRES_DB: logs
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./stack/postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./stack/postgres/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "logd", "-d", "logs"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
 
   # One-shot readiness gate.
   #
@@ -152,4 +187,5 @@ volumes:
   logd-data:
   loki-data:
   vlogs-data:
+  pg-data:
   alloy-data:
