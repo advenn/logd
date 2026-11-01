@@ -2,6 +2,7 @@ package query
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 
@@ -106,8 +107,11 @@ func (e *Engine) ExecuteMetric(q MetricQuery) ([]MatrixSeries, error) {
 	if q.End < q.Start {
 		return nil, nil
 	}
-	// Reject a resolution that would allocate an unbounded number of steps (DoS guard).
-	if n := (q.End-q.Start)/step + 1; n > maxMetricSteps {
+	// Reject a resolution that would allocate an unbounded number of steps (DoS guard). The
+	// count is taken in uint64: End-Start overflows int64 for bounds far enough apart (e.g.
+	// MinInt64..MaxInt64), and the wrapped value slipped past this guard.
+	n := (uint64(q.End)-uint64(q.Start))/uint64(step) + 1
+	if n > maxMetricSteps {
 		return nil, fmt.Errorf("query resolution too fine: %d steps exceeds the max of %d — widen the step or narrow the range", n, maxMetricSteps)
 	}
 
@@ -118,7 +122,7 @@ func (e *Engine) ExecuteMetric(q MetricQuery) ([]MatrixSeries, error) {
 	total := 0
 	for _, sh := range e.shards {
 		r := e.resolverFor(sh)
-		entries, err := e.collectShard(sh, q.Preds, q.Start-rng, q.End, false)
+		entries, err := e.collectShard(sh, q.Preds, windowStart(q.Start, rng), q.End, false)
 		if err != nil {
 			return nil, err
 		}
@@ -146,7 +150,7 @@ func (e *Engine) ExecuteMetric(q MetricQuery) ([]MatrixSeries, error) {
 		}
 	}
 
-	steps := stepsBetween(q.Start, q.End, step)
+	steps := stepsBetween(q.Start, step, int(n))
 	rangeSecs := float64(rng) / 1e9
 
 	var perStream []streamValues
@@ -154,7 +158,7 @@ func (e *Engine) ExecuteMetric(q MetricQuery) ([]MatrixSeries, error) {
 		sort.Slice(s.entries, func(i, j int) bool { return s.entries[i].ts < s.entries[j].ts })
 		sv := streamValues{labels: s.labels, vals: make([]float64, len(steps)), present: make([]bool, len(steps))}
 		for i, t := range steps {
-			window := entriesInWindow(s.entries, t-rng, t)
+			window := entriesInWindow(s.entries, windowStart(t, rng), t)
 			sv.vals[i], sv.present[i] = rangeAggregate(window, q.RangeOp, rangeSecs)
 		}
 		perStream = append(perStream, sv)
@@ -322,12 +326,26 @@ func reduceLabels(labels map[string]string, grouping []string, without bool) map
 	return out
 }
 
-func stepsBetween(start, end, step int64) []int64 {
-	var out []int64
-	for t := start; t <= end; t += step {
-		out = append(out, t)
+// stepsBetween returns the n evaluation times start, start+step, …. It counts by index
+// rather than advancing a cursor until it passes the end: a cursor near MaxInt64 wraps
+// negative, stays <= end, and the loop never stops. Every value is <= End by construction
+// (n was derived from End), so the uint64 arithmetic yields the exact int64 result even
+// when the intermediate product would overflow int64.
+func stepsBetween(start, step int64, n int) []int64 {
+	out := make([]int64, n)
+	for i := range out {
+		out[i] = int64(uint64(start) + uint64(i)*uint64(step))
 	}
 	return out
+}
+
+// windowStart is t-rng, saturated at MinInt64 so a window ending near the bottom of the
+// range cannot wrap to a huge positive start (which would silently empty it).
+func windowStart(t, rng int64) int64 {
+	if lo := t - rng; lo <= t {
+		return lo
+	}
+	return math.MinInt64
 }
 
 func points(steps []int64, vals []float64, present []bool) []MetricPoint {

@@ -2,6 +2,7 @@ package query_test
 
 import (
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -180,5 +181,56 @@ func TestMetricSumOverTimeUnwrap(t *testing.T) {
 	eu, _ := seriesFor(m, "eu")
 	if v, _ := pointAt(eu, 10); v != 350 { // 100 + 250
 		t.Fatalf("sum_over_time(unwrap latency_ms): got %v want 350", v)
+	}
+}
+
+// Bounds at the edges of int64 must neither overflow the step count past the resolution
+// guard nor wrap the step cursor. Both happened: End-Start overflowed to a small number for
+// a MinInt64..MaxInt64 range, and a cursor that stepped past MaxInt64 wrapped negative and
+// stayed <= End, so one request appended steps until the process ran out of memory. Each
+// case runs under a deadline so that failure mode fails the test instead of hanging it.
+func TestMetricExtremeBoundsTerminate(t *testing.T) {
+	e := buildMetricData(t, []struct {
+		region  string
+		sec     int
+		latency int
+	}{{"eu", 5, 1}})
+	const maxI, minI = int64(math.MaxInt64), int64(math.MinInt64)
+	sec := int64(time.Second)
+	cases := []struct {
+		name    string
+		q       qr.MetricQuery
+		wantErr bool
+	}{
+		{"end at MaxInt64", qr.MetricQuery{Range: 60 * sec, Start: maxI - 3600*sec, End: maxI, Step: 15 * sec}, false},
+		{"start at MinInt64", qr.MetricQuery{Range: 60 * sec, Start: minI, End: minI + 60*sec, Step: 15 * sec}, false},
+		{"whole int64 span", qr.MetricQuery{Range: 60 * sec, Start: minI, End: maxI, Step: 15 * sec}, true},
+		{"whole int64 span, coarse step", qr.MetricQuery{Range: 60 * sec, Start: minI, End: maxI, Step: maxI / 4}, false},
+	}
+	for _, c := range cases {
+		type result struct {
+			m   []qr.MatrixSeries
+			err error
+		}
+		done := make(chan result, 1)
+		go func() {
+			m, err := e.ExecuteMetric(c.q)
+			done <- result{m, err}
+		}()
+		select {
+		case r := <-done:
+			if (r.err != nil) != c.wantErr {
+				t.Fatalf("%s: err = %v, want error %v", c.name, r.err, c.wantErr)
+			}
+			for _, s := range r.m {
+				for _, p := range s.Points {
+					if p.TS < c.q.Start || p.TS > c.q.End {
+						t.Fatalf("%s: point at %d outside [%d, %d]", c.name, p.TS, c.q.Start, c.q.End)
+					}
+				}
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: ExecuteMetric did not return within 5s", c.name)
+		}
 	}
 }
