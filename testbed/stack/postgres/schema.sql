@@ -78,6 +78,29 @@ CREATE TABLE logs_raw (
 );
 CREATE INDEX logs_raw_ts ON logs_raw (ts_ns);
 
+-- Loghub HDFS replay (experiment E-2): the same two variants for a second dataset, in their
+-- own tables because the extraction expression is different. The shim selects them with
+-- dataset=hdfs (or implicitly, by the field name size_bytes).
+--
+-- bigint, not integer: a block size is a byte count, and HDFS block sizes are configurable
+-- (64 MiB in this dataset, 128 MiB by default since Hadoop 2, and larger in practice). The
+-- partial index matters more here than for the app corpus: 68% of HDFS lines carry no size.
+CREATE TABLE hdfs_logs (
+    ts_ns      bigint  NOT NULL,
+    stream_id  integer NOT NULL,
+    size_bytes bigint  GENERATED ALWAYS AS ((substring(line FROM 'size ([0-9]+)'))::bigint) STORED,
+    line       text    NOT NULL
+);
+CREATE INDEX hdfs_logs_size ON hdfs_logs (size_bytes, ts_ns) WHERE size_bytes IS NOT NULL;
+CREATE INDEX hdfs_logs_ts ON hdfs_logs (ts_ns);
+
+CREATE TABLE hdfs_logs_raw (
+    ts_ns     bigint  NOT NULL,
+    stream_id integer NOT NULL,
+    line      text    NOT NULL
+);
+CREATE INDEX hdfs_logs_raw_ts ON hdfs_logs_raw (ts_ns);
+
 -- Retention, not implemented here. A production deployment would declare these tables
 --     PARTITION BY RANGE (ts_ns)
 -- with one partition per day, and expire data with DETACH/DROP PARTITION -- instant, and no

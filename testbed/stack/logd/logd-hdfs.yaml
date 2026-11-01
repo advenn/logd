@@ -1,0 +1,45 @@
+# logd configuration for the Loghub HDFS replay (experiment E-2).
+#
+# Select it with LOGD_CONFIG (scripts/hdfs-run.sh does this):
+#   LOGD_CONFIG=./stack/logd/logd-hdfs.yaml docker compose up -d logd
+#
+# Everything except the index and the label allowlist is identical to logd.yaml, so the two
+# runs differ only in what is declared. The point of the replay is a dataset nobody designed
+# for logd, so the template is declared for it the way an operator would: by reading the data,
+# not by shaping the data to a template.
+
+port: 7100
+data_dir: /data
+segment_size_mb: 64
+flush_interval_ms: 500
+sync_interval_ms: 50       # see logd.yaml for what this trades
+compress_block_pages: 8
+retention_days: 0          # keep everything; a benchmark must not delete its own corpus
+index_mem_budget_mb: 256
+shards: 1
+max_label_values_per_key: 1000
+multitenancy: false
+
+index:
+  templates:
+    # HDFS renders a block size in two places, and in five line forms over the first 2M lines:
+    #   dfs.DataNode$PacketResponder: Received block blk_X of size 67108864 from /10.x
+    #   dfs.FSNamesystem: BLOCK* NameSystem.addStoredBlock: blockMap updated: 10.x:50010 is added to blk_X size 67108864
+    #   dfs.DataNode$DataXceiver: Received block blk_X src: /10.x dest: /10.x of size 67108864
+    #   WARN dfs.FSNamesystem: ... Redundant addStoredBlock request received for blk_X on 10.x size 67108864
+    #   dfs.FSNamesystem: ... addStoredBlock request received for blk_X on 10.x size 67108864 But it does not belong to any file.
+    # "size " is the one anchor all five share. The capture is the pattern's last fragment, so
+    # it ends where the digits end, whatever follows -- which is also why one template covers
+    # forms that a single Loki `| pattern` cannot (see README).
+    #
+    # The queryable field is <template>_<capture> = size_bytes. logd matches a line if ANY
+    # occurrence satisfies the predicate; the ground truth takes the first. They agree here
+    # because no line in the replay carries two sizes (loggen reports multi_value: 0).
+    - name: size
+      pattern: "size {bytes:int}"
+
+# component is allowlisted so {app="hdfs", component="datanode"} pushes down to the label
+# index; app must be here for the same reason as in logd.yaml.
+labels:
+  - app
+  - component

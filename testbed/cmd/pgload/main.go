@@ -179,8 +179,12 @@ func readManifest(path, field string) ([]corpusRow, []string, int64, error) {
 	return rows, labelSets, withValue, err
 }
 
-// manifestValue returns the ground-truth value a record carries for field.
+// manifestValue returns the ground-truth value a record carries for field: the generic
+// value/value_name pair of a replay, or corpus mode's latency_ms.
 func manifestValue(r loggen.Record, field string) (int64, bool) {
+	if r.Value != nil && r.ValueName == field {
+		return *r.Value, true
+	}
 	if field == "latency_ms" && r.LatencyMS != nil {
 		return int64(*r.LatencyMS), true
 	}

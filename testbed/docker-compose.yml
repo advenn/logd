@@ -34,7 +34,9 @@ services:
     ports:
       - "7100:7100"
     volumes:
-      - ./stack/logd/logd.yaml:/etc/logd/config.yaml:ro
+      # LOGD_CONFIG selects the declared templates per dataset; the default is the synthetic
+      # corpus's. The HDFS replay uses ./stack/logd/logd-hdfs.yaml (scripts/hdfs-run.sh).
+      - ${LOGD_CONFIG:-./stack/logd/logd.yaml}:/etc/logd/config.yaml:ro
       - logd-data:/data
     command: ["-config", "/etc/logd/config.yaml"]
     healthcheck:

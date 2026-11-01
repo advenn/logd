@@ -6,6 +6,8 @@
 #   make explain     show which access path logd chose
 #   make compare     time logd's index path against its own forced scan
 #   make pg-load     load the same corpus into PostgreSQL (both variants), print cost and size
+#   make gate        every engine's row count against the manifest's ground truth
+#   make hdfs        the Loghub HDFS replay end to end (fresh volumes, push, load, gate)
 #   make down        tear everything down
 
 COMPOSE  ?= docker compose
@@ -24,7 +26,7 @@ VL_URL   ?= http://localhost:9428
 # including high-cardinality ones, and its stream count stops matching the others.
 VL_PUSH  ?= $(VL_URL)/insert/loki/api/v1/push?_stream_fields=app,env,region
 
-.PHONY: up down clean ps logs corpus load pg-load explain compare bench verify-loki test alloy
+.PHONY: up down clean ps logs corpus load pg-load gate hdfs explain compare bench verify-loki test alloy
 
 up:
 	$(COMPOSE) up -d --build
@@ -68,6 +70,17 @@ load:
 # after `make load` so PostgreSQL holds exactly what the log stores received.
 pg-load:
 	@./scripts/pg-load.sh $(CORPUS) app
+
+# Correctness against GROUND TRUTH, not just agreement: the expected count per threshold is
+# computed from the manifest alone, and every engine -- logd (index and forced scan), Loki
+# (pattern and regexp), VictoriaLogs and both PostgreSQL variants -- must return exactly it.
+gate:
+	@python3 scripts/gate.py --dataset app --manifest $(CORPUS)
+
+# Loghub HDFS_v1 replay (experiment E-2). DESTRUCTIVE: starts from `docker compose down -v`.
+# The ~530 MB manifest goes to ~/.cache/logd-bench, not corpus/. See scripts/hdfs-run.sh.
+hdfs:
+	@./scripts/hdfs-run.sh
 
 # Show logd's chosen access path. "mode":"index" on sealed segments is the differentiator
 # working; the active (unsealed) segment always scans by design.

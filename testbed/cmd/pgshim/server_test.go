@@ -181,3 +181,21 @@ func TestStreamCacheReloadsOnlyOnMiss(t *testing.T) {
 		t.Error("a failed load resolved an id")
 	}
 }
+
+// TestParseRequestSelectsTheDatasetByField: dataset=hdfs is accepted for documentation, but the
+// field already names the dataset, and a contradiction is an error rather than a silent pick.
+func TestParseRequestSelectsTheDatasetByField(t *testing.T) {
+	r, err := parseRequest(values("query", "size_bytes < 90000", "variant", "unstructured"), time.Now())
+	if err != nil || r.dataset.Name != "hdfs" || r.dataset.Table(r.variant) != "hdfs_logs_raw" || r.pred.Op != pgdata.OpLT {
+		t.Fatalf("got %+v, %v", r, err)
+	}
+	if _, err := parseRequest(values("query", "size_bytes < 90000", "variant", "structured", "dataset", "hdfs"), time.Now()); err != nil {
+		t.Errorf("explicit matching dataset: %v", err)
+	}
+	if _, err := parseRequest(values("query", "size_bytes < 90000", "variant", "structured", "dataset", "app"), time.Now()); err == nil {
+		t.Error("size_bytes with dataset=app was accepted")
+	}
+	if _, err := parseRequest(values("query", "latency_ms > 1", "variant", "structured", "dataset", "hdfs"), time.Now()); err == nil {
+		t.Error("latency_ms with dataset=hdfs was accepted")
+	}
+}

@@ -63,6 +63,16 @@ var datasets = []Dataset{
 		Expr:         `(substring(line FROM 'took=([0-9]+)ms'))::integer`,
 		Contains:     "took=",
 	},
+	{
+		// Loghub HDFS_v1 replay. The regular expression is loggen's -replay-value-regex,
+		// i.e. the manifest's ground truth; "size " is the anchor all five line forms share.
+		Name:         "hdfs",
+		Field:        "size_bytes",
+		Structured:   "hdfs_logs",
+		Unstructured: "hdfs_logs_raw",
+		Expr:         `(substring(line FROM 'size ([0-9]+)'))::bigint`,
+		Contains:     "size ",
+	},
 }
 
 // Lookup returns the dataset with this name.
