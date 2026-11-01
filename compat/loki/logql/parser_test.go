@@ -68,3 +68,50 @@ func TestDropKeepOtherLabelsUnsupported(t *testing.T) {
 		t.Fatal("drop without a label list must not parse")
 	}
 }
+
+// Valid LogQL that the parser rejected: `and` and `,` joining label filters (both AND),
+// `==` for `=`, and compound range durations.
+func TestLabelFilterConjunctionsAndCompoundRanges(t *testing.T) {
+	for _, c := range []struct{ q, same string }{
+		{`{a="b"} | x > 1 and x < 5`, `{a="b"} | x > 1 | x < 5`},
+		{`{a="b"} | region="eu", app="api"`, `{a="b"} | region="eu" | app="api"`},
+		{`{a="b"} | region="eu", app="api" and x >= 2 |= "y"`, `{a="b"} | region="eu" | app="api" | x >= 2 |= "y"`},
+		{`{a="b"} | x == 200`, `{a="b"} | x = 200`},
+		{`count_over_time({a="b"} | x > 1 and x < 5 [5m])`, `count_over_time({a="b"} | x > 1 | x < 5 [5m])`},
+		{`rate({a="b"}[1d12h])`, `rate({a="b"}[36h])`},
+		{`rate({a="b"}[1h30m])`, `rate({a="b"}[90m])`},
+		{`rate({a="b"}[1w2d])`, `rate({a="b"}[216h])`},
+	} {
+		got, err := translateExpr(c.q)
+		if err != nil {
+			t.Fatalf("%s: %v", c.q, err)
+		}
+		want, err := translateExpr(c.same)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("%s translated to\n %s\nwant (as %s)\n %s", c.q, got, c.same, want)
+		}
+	}
+}
+
+// What logd does not implement is refused with a message that says so: `or` between
+// label filters (by design, §9.3: pipelines are AND; OR lives inside a regex), and
+// duration or byte-size comparison values. `==` stays a label-filter operator only.
+func TestUnsupportedLabelFilterFormsSayUnsupported(t *testing.T) {
+	for _, q := range []string{
+		`{a="b"} | x > 1 or x < 5`,
+		`{a="b"} | d > 1s`,
+		`{a="b"} | d >= 250ms`,
+		`{a="b"} | size > 1KB`,
+	} {
+		_, err := translateExpr(q)
+		if err == nil || !strings.Contains(err.Error(), "not supported") {
+			t.Fatalf("%s: err = %v, want a not-supported error", q, err)
+		}
+	}
+	if _, err := logql.ParseExpr(`{a=="b"}`); err == nil {
+		t.Fatal("`==` is not a selector operator")
+	}
+}

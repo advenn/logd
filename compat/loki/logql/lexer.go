@@ -32,6 +32,7 @@ const (
 	TokRPAREN  // )
 	TokLBRACK  // [
 	TokRBRACK  // ]
+	TokCMPEQ   // == (label filters only)
 	TokILLEGAL // an unrecognized byte
 )
 
@@ -82,6 +83,8 @@ func (k TokenKind) String() string {
 		return "["
 	case TokRBRACK:
 		return "]"
+	case TokCMPEQ:
+		return "=="
 	case TokILLEGAL:
 		return "illegal"
 	default:
@@ -134,6 +137,9 @@ func (l *Lexer) Next() Token {
 	}
 	if ch == '=' && l.peek() == '~' {
 		return l.advance2(TokREQ)
+	}
+	if ch == '=' && l.peek() == '=' {
+		return l.advance2(TokCMPEQ)
 	}
 	if ch == '>' && l.peek() == '=' {
 		return l.advance2(TokGTE)
@@ -392,7 +398,7 @@ func TokenOpToLogQLOp(k TokenKind) Op {
 // OpPipeNotEq/OpPipeNotRe), so label-filter evaluation handles them correctly.
 func TokenToLabelOp(k TokenKind) Op {
 	switch k {
-	case TokEQ:
+	case TokEQ, TokCMPEQ:
 		return OpEq
 	case TokNEQ:
 		return OpNotEq
@@ -413,10 +419,11 @@ func TokenToLabelOp(k TokenKind) Op {
 	}
 }
 
-// IsLabelOp reports whether the token kind is a label filter operator.
+// IsLabelOp reports whether the token kind is a label filter operator. `==` is one (Loki
+// treats it as `=`), but not a selector operator.
 func IsLabelOp(k TokenKind) bool {
 	switch k {
-	case TokEQ, TokNEQ, TokREQ, TokNRE, TokGT, TokGTE, TokLT, TokLTE:
+	case TokEQ, TokCMPEQ, TokNEQ, TokREQ, TokNRE, TokGT, TokGTE, TokLT, TokLTE:
 		return true
 	}
 	return false

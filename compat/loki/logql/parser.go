@@ -65,8 +65,42 @@ func (p *Parser) parseLogBody() (*Query, error) {
 			return nil, err
 		}
 		pipeline = append(pipeline, stage)
+		if _, ok := stage.(*LabelFilter); ok {
+			more, err := p.parseLabelFilterConjunction()
+			if err != nil {
+				return nil, err
+			}
+			pipeline = append(pipeline, more...)
+		}
 	}
 	return &Query{Selector: sel, Pipeline: pipeline}, nil
+}
+
+// parseLabelFilterConjunction parses the label filters joined to the one just parsed by
+// `and` or `,` — both mean AND in LogQL, the same as separate `| ...` stages, so each
+// becomes a stage of its own. `or` is refused explicitly: logd's pipelines are AND-only by
+// design (§9.3; OR exists only inside a regex), and without this it was a bare "unexpected
+// token".
+func (p *Parser) parseLabelFilterConjunction() ([]PipelineStage, error) {
+	var more []PipelineStage
+	for {
+		switch {
+		case p.tok.Kind == TokCOMMA || (p.tok.Kind == TokIDENT && p.tok.Value == "and"):
+			p.advance()
+			if p.tok.Kind != TokIDENT {
+				return nil, p.parseError("expected a label filter after and/',', got %s", p.tok.Kind)
+			}
+			f, err := p.parseLabelFilter()
+			if err != nil {
+				return nil, err
+			}
+			more = append(more, f)
+		case p.tok.Kind == TokIDENT && p.tok.Value == "or":
+			return nil, p.parseError("`or` between label filters is not supported: filters combine with AND; for alternatives on one label use a regex, e.g. | level=~\"warn|error\"")
+		default:
+			return more, nil
+		}
+	}
 }
 
 // ---- metric queries ----
@@ -402,7 +436,14 @@ func (p *Parser) parseLabelFilter() (*LabelFilter, error) {
 		return nil, p.parseError("expected string or number value, got %s", p.tok.Kind)
 	}
 	value := p.tok.Value
+	number := p.tok
 	p.advance()
+	// A unit directly after a number (`1s`, `250ms`, `1KB`) is a duration or byte-size
+	// value, which Loki compares after converting the label. logd does not, and without
+	// this the unit read as a stray identifier.
+	if number.Kind == TokNUMBER && p.tok.Kind == TokIDENT && p.tok.Pos == number.Pos+len(number.Value) {
+		return nil, p.parseError("duration and byte-size values (%s%s) are not supported in label filters; compare a plain number", number.Value, p.tok.Value)
+	}
 
 	return &LabelFilter{Label: label, Op: op, Value: value}, nil
 }

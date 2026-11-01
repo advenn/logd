@@ -156,31 +156,13 @@ func mapVectorOp(op string) (query.VectorOp, error) {
 	}
 }
 
-// parseLokiDuration parses a Loki range-selector duration. Go's time.ParseDuration covers
-// ns/us/ms/s/m/h; Loki also allows d (days) and w (weeks), handled here.
+// parseLokiDuration parses a Loki range-selector duration (see ParseDuration), which must
+// be positive.
 func parseLokiDuration(s string) (time.Duration, error) {
-	if s == "" {
-		return 0, fmt.Errorf("logql: empty duration")
+	d, err := ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("logql: %w", err)
 	}
-	var d time.Duration
-	if n := len(s); n >= 2 && (s[n-1] == 'd' || s[n-1] == 'w') {
-		v, err := strconv.ParseFloat(s[:n-1], 64)
-		if err != nil {
-			return 0, fmt.Errorf("logql: bad duration %q", s)
-		}
-		unit := float64(24 * time.Hour)
-		if s[n-1] == 'w' {
-			unit = float64(7 * 24 * time.Hour)
-		}
-		d = time.Duration(v * unit)
-	} else {
-		var err error
-		if d, err = time.ParseDuration(s); err != nil {
-			return 0, fmt.Errorf("logql: bad duration %q: %w", s, err)
-		}
-	}
-	// Reject non-positive (incl. an int64 overflow from a huge d/w value, which wraps to a
-	// negative Duration) so it can't be silently coerced to the default window.
 	if d <= 0 {
 		return 0, fmt.Errorf("logql: duration must be positive, got %q", s)
 	}
