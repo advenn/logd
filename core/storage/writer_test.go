@@ -1042,6 +1042,47 @@ func TestRetentionDeletesSealedSegments(t *testing.T) {
 	}
 }
 
+// TestRetentionDeletesFilesUnderPatternLikeDir: retention found a segment's files with the glob
+// <base>.*, which made the data directory part of the pattern. Under a directory named like
+// "logd[prod]" it matched nothing, the delete reported success, and the manifest entry was
+// dropped while every file stayed on disk, never to be deleted.
+func TestRetentionDeletesFilesUnderPatternLikeDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logd[prod]", "shard-0000")
+	opts := Options{SegmentSizeBytes: 1 << 40, FlushInterval: time.Hour, Retention: time.Hour}
+	w1, err := NewWriter(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w1.Start(nil)
+	for i := 0; i < 300; i++ {
+		w1.Write(makeEntry(i, 1)) // 2023 timestamps: past the retention window
+	}
+	if err := w1.Close(); err != nil { // seals, compresses, writes the sidecars
+		t.Fatal(err)
+	}
+
+	w2, err := NewWriter(dir, opts) // unstarted, so no goroutine races the sweep
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+	w2.enforceRetention(time.Now())
+	if n := len(w2.manifest.All()); n != 0 {
+		t.Fatalf("%d segments still in the manifest after retention", n)
+	}
+	left, err := os.ReadDir(filepath.Join(dir, "segments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 0 {
+		var names []string
+		for _, e := range left {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("retention left the expired segment's files behind: %v", names)
+	}
+}
+
 func mustManifest(t *testing.T, dir string) *Manifest {
 	t.Helper()
 	m, err := LoadManifest(dir)

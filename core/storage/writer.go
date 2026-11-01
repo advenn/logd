@@ -872,13 +872,30 @@ func (w *Writer) syncNow(now time.Time) error {
 }
 
 // deleteSegmentFiles removes a segment's .log and every sidecar (<base>.idx, per-field
-// .tidx, .labels.lidx) — all matched by the single glob <base>.*. Returns the first
-// non-ENOENT error (an already-absent file is fine).
+// .tidx, .labels.lidx, .logz, and any leftover .tmp) — every file in its directory whose
+// name starts with "seg-<ID>.". Returns the first non-ENOENT error (an already-absent file
+// is fine).
+//
+// The files are found by listing the directory and comparing names, not by the glob
+// <base>.* it used to be: that made the whole path a pattern, so a '[', '*' or '?' in the
+// data directory matched nothing, the delete "succeeded", and retention dropped the
+// manifest entry while every file stayed on disk forever.
 func (w *Writer) deleteSegmentFiles(segPath string) error {
-	base := strings.TrimSuffix(segPath, ".log")
-	matches, _ := filepath.Glob(base + ".*")
+	dir := filepath.Dir(segPath)
+	prefix := strings.TrimSuffix(filepath.Base(segPath), ".log") + "."
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
 	var firstErr error
-	for _, m := range matches {
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), prefix) {
+			continue
+		}
+		m := filepath.Join(dir, e.Name())
 		if err := os.Remove(m); err != nil && !os.IsNotExist(err) {
 			log.Printf("storage: retention removing %s: %v", m, err)
 			if firstErr == nil {
