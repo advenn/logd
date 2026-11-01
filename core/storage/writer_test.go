@@ -361,6 +361,153 @@ func TestFailedSealSaveLeavesSegmentActive(t *testing.T) {
 	}
 }
 
+// lookupN returns the messages of the records the sealed segment's "n" index finds for v.
+func lookupN(t *testing.T, segPath string, v int64) []string {
+	t.Helper()
+	r, err := index.OpenReader(index.TidxPath(strings.TrimSuffix(segPath, ".log"), "n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	err = FetchRecords(segPath, r.LookupEqual(index.EncodeKey(index.Value{Kind: index.KindInt, Int: v})), func(e model.LogEntry) bool {
+		out = append(out, e.Message)
+		return true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// readOnlyFile opens path read-only: swapped in for a writer's descriptor, every write
+// through it fails, standing in for EIO or ENOSPC.
+func readOnlyFile(t *testing.T, path string) *os.File {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+	return f
+}
+
+// TestTickFlushFailureKeepsPage: a partial page the flush tick cannot write must stay in RAM.
+// The tick used to reset it anyway, losing its records while their index entries stayed
+// buffered — pointing at the page number the next page was then written to, so an exact
+// index lookup returned a different record.
+func TestTickFlushFailureKeepsPage(t *testing.T) {
+	dir := t.TempDir()
+	schema := []index.FieldType{{Name: "n", Kind: index.KindInt}}
+	w := newSyncWriter(t, dir, Options{Schema: schema, SegmentSizeBytes: 1 << 40, FlushInterval: time.Hour, BlockPages: -1})
+	segPath := w.currSeg.Path
+	put := func(i int) {
+		w.processEntry(record{entry: makeEntry(i, 1), keys: []index.KeyedValue{intKV("n", int64(i))}})
+	}
+	for i := 0; i < 5; i++ {
+		put(i)
+	}
+	good := w.currSeg.File
+	w.currSeg.File = readOnlyFile(t, segPath)
+	w.flushTick(time.Now()) // the page write fails
+	w.currSeg.File = good
+	for i := 5; i < 10; i++ {
+		put(i)
+	}
+	w.flushTick(time.Now())
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ReadAll(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPrefixMatches(t, got, 10)
+	for v := int64(0); v < 10; v++ {
+		if msgs := lookupN(t, segPath, v); len(msgs) != 1 || msgs[0] != fmt.Sprintf("%05d", v) {
+			t.Fatalf("index lookup n == %d returned %v", v, msgs)
+		}
+	}
+}
+
+// TestFullPageWrittenOnceWhenIndexAppendFails: once a page is on disk it must count as
+// written, whatever fails after. A failed .idx append (an fsync error behaves the same) used
+// to leave the page in RAM with its page number already advanced, so it was written a second
+// time as the next page — duplicates in every scan — and the record that triggered the flush
+// was dropped.
+func TestFullPageWrittenOnceWhenIndexAppendFails(t *testing.T) {
+	dir := t.TempDir()
+	w := newSyncWriter(t, dir, Options{SegmentSizeBytes: 1 << 40, FlushInterval: time.Hour, BlockPages: -1})
+	write, count := syncWrites(w, false)
+	write(entriesPerPage) // exactly one full page
+
+	good := w.idxWriter.file
+	w.idxWriter.file = readOnlyFile(t, indexPathFor(w.currSeg.Path))
+	write(1) // flushes the full page: the page write succeeds, the .idx append fails
+	w.idxWriter.file = good
+	write(1)
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ReadAll(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPrefixMatches(t, got, count())
+}
+
+// TestFullPageWriteFailureRetries: when the full page cannot be written, the record that did
+// not fit — already acknowledged — must wait for it rather than be dropped, and so must every
+// record behind it. They used to be dropped one per failed attempt until the write worked.
+func TestFullPageWriteFailureRetries(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	dir := t.TempDir()
+	w, err := NewWriter(dir, Options{SegmentSizeBytes: 1 << 40, FlushInterval: time.Hour, BlockPages: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(nil); err != nil {
+		t.Fatal(err)
+	}
+	// A new service name must be made durable in lookup.bin before the first page that uses
+	// it; a read-only shard directory makes that, and so the page flush, fail.
+	svc := w.InternService("checkout")
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o755) })
+	const n = 2 * entriesPerPage
+	for i := 0; i < n; i++ {
+		if err := w.Write(makeEntry(i, svc)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Wait until the record that does not fit has been taken off the queue, then let a few
+	// attempts fail.
+	for deadline := time.Now().Add(5 * time.Second); len(w.writeCh) >= n-entriesPerPage; {
+		if time.Now().After(deadline) {
+			t.Fatal("the writer never reached the full page")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(3 * flushRetryDelay)
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ReadAll(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPrefixMatches(t, got, n)
+}
+
 // TestCloseReportsFailedSeal: Close used to return nil whatever its final flush and seal did,
 // so a daemon whose last seal failed exited as if every record were safe.
 func TestCloseReportsFailedSeal(t *testing.T) {

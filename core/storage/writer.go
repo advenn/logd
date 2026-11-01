@@ -503,30 +503,40 @@ func (w *Writer) writerLoop() {
 		case rec := <-w.writeCh:
 			w.processEntry(rec)
 		case <-w.flushTicker.C:
-			if w.hdr.EntryCount > 0 {
-				err := w.flushPage()
-				if err != nil {
-					log.Printf("storage: flushing page on tick: %v", err)
-				}
-				w.resetPage()
-				// A page the tick wrote is a page boundary like any other. At a low ingest
-				// rate EVERY page goes out this way before it fills, so checking only on the
-				// page-full path let such a segment grow without bound and never seal.
-				if err == nil {
-					w.maybeRotate()
-				}
-			}
-			// Also the group-commit deadline check, so a page written just before the
-			// stream went quiet cannot sit unsynced indefinitely. The effective loss
-			// window is therefore bounded by SyncInterval + FlushInterval.
-			if err := w.syncIfDue(time.Now()); err != nil {
-				log.Printf("storage: group-commit sync: %v", err)
-			}
+			w.flushTick(time.Now())
 		case <-w.retentionC:
 			// Runs on the writer goroutine so its manifest Save serializes with seal/
 			// flush (no concurrent Save race on the manifest tmp file).
 			w.enforceRetention(time.Now())
 		}
+	}
+}
+
+// flushTick is the flush ticker's work: write the partial page, if any, and check the
+// group-commit deadline.
+func (w *Writer) flushTick(now time.Time) {
+	if w.hdr.EntryCount > 0 {
+		if err := w.flushPage(); err != nil {
+			log.Printf("storage: flushing page on tick: %v", err)
+		}
+		// A page that could not be written is still in RAM, untouched, and the next tick
+		// (or the page filling) retries it. This path used to reset it regardless, which
+		// lost its records and, worse, left their .tidx and label postings pointing at the
+		// page number the NEXT page was then written to: an exact-match index lookup
+		// returned whichever other record landed at the same offset.
+		//
+		// A page the tick did write is a page boundary like any other. At a low ingest
+		// rate EVERY page goes out this way before it fills, so checking only on the
+		// page-full path let such a segment grow without bound and never seal.
+		if w.hdr.EntryCount == 0 {
+			w.maybeRotate()
+		}
+	}
+	// Also the group-commit deadline check, so a page written just before the
+	// stream went quiet cannot sit unsynced indefinitely. The effective loss
+	// window is therefore bounded by SyncInterval + FlushInterval.
+	if err := w.syncIfDue(now); err != nil {
+		log.Printf("storage: group-commit sync: %v", err)
 	}
 }
 
@@ -555,11 +565,10 @@ func (w *Writer) processEntry(rec record) {
 		return
 	}
 	if size > PageSize-int(w.hdr.FreeSpaceOffset) {
-		if err := w.flushPage(); err != nil {
-			log.Printf("storage: flushing full page: %v", err)
+		if !w.flushFullPage() {
+			log.Printf("storage: dropping a record: the writer is closing and the page before it cannot be written")
 			return
 		}
-		w.resetPage()
 		// A failed rotation must not cost this record: it was acknowledged when it was
 		// queued. maybeRotate leaves the active segment open in that case, so the record
 		// simply goes into it, and the segment keeps growing until a later rotation works.
@@ -706,6 +715,42 @@ func (w *Writer) maybeRotate() {
 // again.
 const rotateRetryInterval = time.Second
 
+// flushFullPage writes the full in-RAM page so the next record can start a new one. If the
+// page cannot be written it is kept, and the write retried every flushRetryDelay for as long
+// as it keeps failing. The alternative was to drop the record that did not fit — which had
+// already been acknowledged — and every record after it, one per failed attempt.
+//
+// Waiting here stalls the writer goroutine, so the queue fills behind it and ingest gets
+// backpressure instead of silent loss: WriteExtractedCtx blocks, WriteExtracted reports a
+// full queue. Returns false only once the writer is closing and one more attempt has failed.
+func (w *Writer) flushFullPage() bool {
+	for {
+		err := w.flushPage()
+		if w.hdr.EntryCount == 0 {
+			// The page is on disk. An error from past that point (the .idx append, or the
+			// fsync, which stays due) is the next sync's to retry, not this record's.
+			if err != nil {
+				log.Printf("storage: after writing a full page: %v", err)
+			}
+			return true
+		}
+		select {
+		case <-w.closeCh:
+			log.Printf("storage: writing full page: %v", err)
+			return false
+		default:
+		}
+		log.Printf("storage: writing full page (retrying in %v): %v", flushRetryDelay, err)
+		select {
+		case <-w.closeCh: // one last attempt, then give up
+		case <-time.After(flushRetryDelay):
+		}
+	}
+}
+
+// flushRetryDelay is how long the writer waits before retrying a full page it could not write.
+const flushRetryDelay = 100 * time.Millisecond
+
 // indexMemExceeded reports whether the active segment's in-RAM typed-range index has
 // grown past the configured memory budget (the dominant index-RAM consumer; the label
 // dictionary is bounded by stream cardinality). Estimated as entries × EntryBytes.
@@ -812,6 +857,10 @@ func (w *Writer) resetPage() {
 // bounds to the manifest. fsync-per-flushed-page (rather than per-write) means a
 // crash loses at most the in-RAM partial page plus whatever is still buffered in the
 // write channel — not any page already flushed here.
+//
+// Once the page has been written it advances to the next page number and resets the
+// in-RAM page, whatever happens after; callers tell "written" from "still in RAM" by the
+// page being empty on return, not by the error.
 func (w *Writer) flushPage() error {
 	if w.hdr.EntryCount == 0 {
 		return nil
@@ -837,19 +886,29 @@ func (w *Writer) flushPage() error {
 	FinalizePage(w.page, w.hdr) // stamps header + full-page checksum; must be last mutation
 	pageNum := w.currSeg.PageNum
 	if err := w.currSeg.WritePage(pageNum, w.page); err != nil {
+		// Nothing has moved: the page stays in RAM under the page number its records'
+		// index entries already point at, for the caller to retry.
 		return fmt.Errorf("writing page %d: %w", pageNum, err)
 	}
+	// The page is on disk, so from here on it counts as written whatever fails next. It
+	// used to stay in RAM when the .idx append or the fsync failed, after PageNum had
+	// already moved on, so the next flush wrote the same records again as a second page:
+	// duplicates in every scan, while the index pointed at only the first copy.
+	minTS := w.hdr.MinTS
 	w.currSeg.PageNum++
+	w.needsSync = true // cleared only by a successful fsync, so a failed one stays due
+	w.resetPage()
 
-	if err := w.idxWriter.WriteEntry(w.hdr.MinTS, pageNum); err != nil {
-		return fmt.Errorf("writing index entry: %w", err)
-	}
 	// The sparse .idx is deliberately NOT fsynced here. It is a derived accelerator that
 	// nothing reads today (the query path prunes on page-header bounds) and that recovery
 	// rebuilds from the segment's pages anyway, so paying an fsync per page for it bought
 	// nothing — it just doubled the syscall that dominates this path. It is synced at seal.
-	w.needsSync = true
-	return w.syncIfDue(time.Now())
+	idxErr := w.idxWriter.WriteEntry(minTS, pageNum)
+	syncErr := w.syncIfDue(time.Now())
+	if idxErr != nil {
+		return fmt.Errorf("writing index entry: %w", idxErr)
+	}
+	return syncErr
 }
 
 // ---- segment lifecycle ----
