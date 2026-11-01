@@ -111,6 +111,52 @@ func TestRotationAcrossSegments(t *testing.T) {
 	assertPrefixMatches(t, got, n)
 }
 
+// TestLowRateIngestStillRotates: at a low ingest rate every page is written by the flush tick
+// before it fills. The size and index-budget checks used to run only when a record did not
+// fit in the page, so such a stream never reached them: the active segment grew past
+// SegmentSizeBytes without bound and was never sealed, indexed, compressed or expired.
+func TestLowRateIngestStillRotates(t *testing.T) {
+	dir := t.TempDir()
+	const limit = 3 * PageSize // page 0 + two data pages
+	w, err := NewWriter(dir, Options{SegmentSizeBytes: limit, FlushInterval: 5 * time.Millisecond, BlockPages: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(nil); err != nil {
+		t.Fatal(err)
+	}
+	const n = 12
+	for i := 0; i < n; i++ {
+		if err := w.Write(makeEntry(i, 1)); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond) // several ticks: each record goes out on a page of its own
+	}
+
+	// Inspected BEFORE Close, which seals whatever is active and would hide the bug. The
+	// on-disk manifest is read so the check does not race the writer goroutine.
+	sealed := 0
+	for _, s := range mustManifest(t, dir).All() {
+		if s.State == SegmentSealed {
+			sealed++
+		}
+		if st, err := os.Stat(s.Path); err == nil && st.Size() > limit {
+			t.Errorf("segment %s is %d bytes, past SegmentSizeBytes=%d", s.ID, st.Size(), limit)
+		}
+	}
+	if sealed == 0 {
+		t.Errorf("no segment sealed after %d tick-flushed pages with a %d-byte segment limit", n, limit)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadAll(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPrefixMatches(t, got, n)
+}
+
 func TestSealWritesSchemaField(t *testing.T) {
 	dir := t.TempDir()
 	w, _ := NewWriter(dir, noTickOpts())

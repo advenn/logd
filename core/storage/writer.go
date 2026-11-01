@@ -492,10 +492,19 @@ func (w *Writer) writerLoop() {
 			w.processEntry(rec)
 		case <-w.flushTicker.C:
 			if w.hdr.EntryCount > 0 {
-				if err := w.flushPage(); err != nil {
+				err := w.flushPage()
+				if err != nil {
 					log.Printf("storage: flushing page on tick: %v", err)
 				}
 				w.resetPage()
+				// A page the tick wrote is a page boundary like any other. At a low ingest
+				// rate EVERY page goes out this way before it fills, so checking only on the
+				// page-full path let such a segment grow without bound and never seal.
+				if err == nil {
+					if err := w.maybeRotate(); err != nil {
+						log.Printf("storage: rotating segment: %v", err)
+					}
+				}
 			}
 			// Also the group-commit deadline check, so a page written just before the
 			// stream went quiet cannot sit unsynced indefinitely. The effective loss
@@ -541,14 +550,9 @@ func (w *Writer) processEntry(rec record) {
 			return
 		}
 		w.resetPage()
-		// Seal + rotate at a page boundary when the segment reaches its size OR its
-		// in-RAM index exceeds the memory budget — the latter caps index RAM without
-		// spill-and-merge, staying true to the per-segment (no global merge) design.
-		if w.currSeg.Size >= w.opts.SegmentSizeBytes || w.indexMemExceeded() {
-			if err := w.rotateSegment(); err != nil {
-				log.Printf("storage: rotating segment: %v", err)
-				return
-			}
+		if err := w.maybeRotate(); err != nil {
+			log.Printf("storage: rotating segment: %v", err)
+			return
 		}
 	}
 
@@ -659,6 +663,22 @@ func (w *Writer) LiveStreams() []label.Set {
 		out = append(out, s)
 	}
 	return out
+}
+
+// maybeRotate seals and rotates the active segment when it has reached its size OR its
+// in-RAM index exceeds the memory budget — the latter caps index RAM without
+// spill-and-merge, staying true to the per-segment (no global merge) design.
+//
+// Call it only right after a page was written, with the in-RAM page empty: the page being
+// assembled targets the active segment, so rotating under it would put its records in the
+// next segment at offsets computed for this one. Both places a page is written (a record
+// that does not fit, and the flush tick) call it, so the check cannot depend on which of
+// the two a stream's pages happen to take.
+func (w *Writer) maybeRotate() error {
+	if w.currSeg.Size < w.opts.SegmentSizeBytes && !w.indexMemExceeded() {
+		return nil
+	}
+	return w.rotateSegment()
 }
 
 // indexMemExceeded reports whether the active segment's in-RAM typed-range index has
