@@ -455,6 +455,11 @@ func (p *Parser) advance() {
 }
 
 func (p *Parser) parseError(format string, args ...interface{}) *ParseError {
+	if p.tok.Kind == TokILLEGAL && p.tok.Err != "" {
+		// The lexer found a malformed string here; that, not what the parser expected
+		// instead, is what the user needs to see.
+		return &ParseError{Msg: p.tok.Err, Pos: p.tok.Pos}
+	}
 	return &ParseError{
 		Msg: fmt.Sprintf(format, args...),
 		Pos: p.tok.Pos,

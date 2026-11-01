@@ -2,8 +2,8 @@ package logql
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
-	"unicode/utf8"
 )
 
 // TokenKind identifies the type of a lexer token.
@@ -97,6 +97,7 @@ type Token struct {
 	Kind  TokenKind
 	Value string // raw text (unquoted for strings)
 	Pos   int    // byte offset in the input
+	Err   string // for a TokILLEGAL that is a malformed string: what is wrong with it
 }
 
 // Lexer tokenizes a LogQL query string.
@@ -277,45 +278,58 @@ func (l *Lexer) scanNumber() Token {
 
 func isDigit(ch byte) bool { return ch >= '0' && ch <= '9' }
 
+// scanString scans a quoted string. A double-quoted string is decoded with Go's escape
+// rules (strconv.Unquote), as Loki decodes it — \x41, \u00e9 and octal escapes included —
+// and an invalid escape is an error. A single-quoted string, which Go would read as a
+// rune, is decoded by the same rules with \' and a bare " allowed in it. An unterminated
+// string is an error: it used to be accepted as a value running to the end of the query.
 func (l *Lexer) scanString(quote byte) Token {
-	// Advance past the opening quote.
-	l.pos++
-
-	var buf strings.Builder
+	start := l.pos
+	l.pos++ // past the opening quote
 	for l.pos < len(l.input) {
-		ch := l.input[l.pos]
-		if ch == '\\' && l.pos+1 < len(l.input) {
-			next := l.input[l.pos+1]
-			switch next {
-			case '"', '\'', '\\':
-				l.pos += 2
-				buf.WriteByte(next)
-				continue
-			case 'n':
-				l.pos += 2
-				buf.WriteByte('\n')
-				continue
-			case 't':
-				l.pos += 2
-				buf.WriteByte('\t')
-				continue
-			case 'r':
-				l.pos += 2
-				buf.WriteByte('\r')
-				continue
-			}
-		}
-		if ch == quote {
+		switch l.input[l.pos] {
+		case '\\':
+			l.pos += 2 // the escaped byte cannot close the string
+			continue
+		case quote:
 			l.pos++
-			return Token{Kind: TokSTRING, Value: buf.String(), Pos: l.start}
+			lit := l.input[start:l.pos]
+			val, err := unquote(lit, quote)
+			if err != nil {
+				return Token{Kind: TokILLEGAL, Value: lit, Pos: l.start, Err: fmt.Sprintf("invalid string %s: %v", lit, err)}
+			}
+			return Token{Kind: TokSTRING, Value: val, Pos: l.start}
 		}
-		r, size := utf8.DecodeRuneInString(l.input[l.pos:])
-		buf.WriteRune(r)
-		l.pos += size
+		l.pos++
 	}
+	l.pos = len(l.input)
+	return Token{Kind: TokILLEGAL, Value: l.input[start:], Pos: l.start, Err: "unterminated string"}
+}
 
-	// Unterminated string — return what we have.
-	return Token{Kind: TokSTRING, Value: buf.String(), Pos: l.start}
+func unquote(lit string, quote byte) (string, error) {
+	if quote == '"' {
+		return strconv.Unquote(lit)
+	}
+	body := lit[1 : len(lit)-1]
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(body); i++ {
+		switch c := body[i]; {
+		case c == '\\' && i+1 < len(body) && body[i+1] == '\'':
+			b.WriteByte('\'')
+			i++
+		case c == '\\' && i+1 < len(body):
+			b.WriteByte(c)
+			b.WriteByte(body[i+1])
+			i++
+		case c == '"':
+			b.WriteString(`\"`)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	b.WriteByte('"')
+	return strconv.Unquote(b.String())
 }
 
 // scanRawString scans a backtick-quoted raw string (Go/LogQL semantics: no
@@ -333,8 +347,7 @@ func (l *Lexer) scanRawString() Token {
 		}
 		l.pos++
 	}
-	// Unterminated — return what we have.
-	return Token{Kind: TokSTRING, Value: l.input[start:l.pos], Pos: l.start}
+	return Token{Kind: TokILLEGAL, Value: l.input[l.start:], Pos: l.start, Err: "unterminated raw string"}
 }
 
 func (l *Lexer) scanIdent() Token {

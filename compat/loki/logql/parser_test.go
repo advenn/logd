@@ -115,3 +115,45 @@ func TestUnsupportedLabelFilterFormsSayUnsupported(t *testing.T) {
 		t.Fatal("`==` is not a selector operator")
 	}
 }
+
+// An unterminated string is an error, not a value that runs to the end of the query — the
+// lexer used to accept `|= "abc` as `|= "abc"`.
+func TestUnterminatedStringRejected(t *testing.T) {
+	for _, q := range []string{
+		`{app="api"} |= "unterminated`,
+		"{app=\"api\"} |= `unterminated",
+		`{app='api}`,
+		`{app="api\"}`,
+	} {
+		_, err := logql.ParseExpr(q)
+		if err == nil || !strings.Contains(err.Error(), "unterminated") {
+			t.Fatalf("%q: err = %v, want an unterminated-string error", q, err)
+		}
+	}
+}
+
+// Double-quoted strings are decoded with Go's escape rules, as Loki decodes them
+// (strconv.Unquote): \x, \u, \U and octal escapes were left undecoded. An invalid escape
+// is an error.
+func TestStringEscapesDecodedAsGo(t *testing.T) {
+	for q, want := range map[string]string{
+		`{app="a\x41"}`:      "aA",
+		`{app="caf\u00e9"}`:  "café",
+		`{app="\U0001F600"}`: "\U0001F600",
+		`{app="\101\102"}`:   "AB",
+		`{app="q\"\\\t"}`:    "q\"\\\t",
+		"{app=`a\\x41`}":     `a\x41`, // raw: no escapes
+		`{app='it\'s "x"'}`:  `it's "x"`,
+	} {
+		ast, err := logql.ParseExpr(q)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		if got := ast.(*logql.Query).Selector.Matchers[0].Value; got != want {
+			t.Fatalf("%s: value %q, want %q", q, got, want)
+		}
+	}
+	if _, err := logql.ParseExpr(`{app="a\q"}`); err == nil {
+		t.Fatal(`an invalid escape (\q) must be an error`)
+	}
+}
