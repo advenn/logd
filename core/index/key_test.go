@@ -162,6 +162,27 @@ func TestCompareCrossKindNeverEqual(t *testing.T) {
 	}
 }
 
+// Compare is the scan path's oracle and the key order is the index's, so for floats they
+// must agree on every value, not only the finite ones extraction produces. A NaN used to
+// compare 0 (equal) to everything while its key sorts above +Inf, so `= NaN` matched every
+// record on the scan path and none on the index path.
+func TestCompareFloatAgreesWithKeyOrder(t *testing.T) {
+	vals := []float64{
+		math.NaN(), math.Copysign(math.NaN(), -1), math.Inf(1), math.Inf(-1),
+		0, math.Copysign(0, -1), -math.MaxFloat64, -1.5, -math.SmallestNonzeroFloat64,
+		math.SmallestNonzeroFloat64, 1.5, 290.5, math.MaxFloat64,
+	}
+	for _, a := range vals {
+		for _, b := range vals {
+			va, vb := Value{Kind: KindFloat, Float: a}, Value{Kind: KindFloat, Float: b}
+			ka, kb := floatKey(a), floatKey(b)
+			if got, want := sign(Compare(va, vb)), sign(bytes.Compare(ka[:], kb[:])); got != want {
+				t.Fatalf("Compare(%v, %v) = %d, key order %d", a, b, got, want)
+			}
+		}
+	}
+}
+
 func cmpInt64(a, b int64) int {
 	switch {
 	case a < b:

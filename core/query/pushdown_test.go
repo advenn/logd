@@ -2,6 +2,7 @@ package query_test
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -234,6 +235,57 @@ func TestPushdownCrossKindDoesNotDiverge(t *testing.T) {
 		if p.Mode != "scan" {
 			t.Fatalf("cross-kind predicate should not push down, Explain said %q", p.Mode)
 		}
+	}
+}
+
+// A NaN or ±Inf float bound is a plan-time error on every entry point (design §9.3: the
+// native API is strict). Before, it was answered — inconsistently: `lat_s = NaN` returned 0
+// records from Execute and all 300 from ExecuteScan, because the index placed the NaN key
+// above every finite one while the scan's comparison called it equal to everything.
+func TestNonFiniteFloatBoundRejected(t *testing.T) {
+	dir := t.TempDir()
+	eng, _ := extract.Compile(config.IndexConfig{Templates: []config.Template{{Name: "lat", Pattern: "took={s:float}s"}}})
+	w, _ := storage.NewWriter(dir, storage.Options{Schema: eng.IndexedFields(), SegmentSizeBytes: 3 * storage.PageSize, FlushInterval: time.Hour})
+	w.Start(nil)
+	ig := ingest.New(eng, w)
+	for i := 0; i < 300; i++ {
+		if err := ig.Ingest(model.LogEntry{TS: time.Unix(t0+int64(i), 0).UTC(), Level: model.LogLevelInfo, Message: fmt.Sprintf("req %d took=%d.5s", i, i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w.Close()
+	e := qr.NewEngine(w, eng)
+	floatV := func(f float64) index.Value { return index.Value{Kind: index.KindFloat, Float: f} }
+
+	for _, bound := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		for _, op := range []qr.Op{qr.OpEq, qr.OpNe, qr.OpLt, qr.OpLe, qr.OpGt, qr.OpGe} {
+			preds := []qr.Predicate{
+				qr.TypedCompare{Field: "lat_s", Op: qr.OpGt, Value: floatV(100)},
+				qr.TypedCompare{Field: "lat_s", Op: op, Value: floatV(bound)},
+			}
+			q := qr.Query{Start: ts(0), End: ts(1000), Preds: preds}
+			if _, err := e.Execute(q); err == nil {
+				t.Errorf("Execute accepted lat_s op=%d %v", op, bound)
+			}
+			if _, err := e.ExecuteScan(q); err == nil {
+				t.Errorf("ExecuteScan accepted lat_s op=%d %v", op, bound)
+			}
+			if _, err := e.ExecuteMetric(qr.MetricQuery{Preds: preds, RangeOp: qr.RangeCount, Range: int64(time.Minute), Start: ts(0), End: ts(300), Step: int64(time.Minute)}); err == nil {
+				t.Errorf("ExecuteMetric accepted lat_s op=%d %v", op, bound)
+			}
+		}
+	}
+
+	// A finite float bound is still answered, identically by both paths.
+	q := qr.Query{Start: ts(0), End: ts(1000), Limit: 1000, Preds: []qr.Predicate{qr.TypedCompare{Field: "lat_s", Op: qr.OpGe, Value: floatV(250.5)}}}
+	idx, err := e.Execute(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scan, _ := e.ExecuteScan(q)
+	equalResults(t, "lat_s >= 250.5", idx, scan)
+	if len(idx) != 50 {
+		t.Fatalf("lat_s >= 250.5: got %d records, want 50", len(idx))
 	}
 }
 

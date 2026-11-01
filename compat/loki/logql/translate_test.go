@@ -78,6 +78,29 @@ func TestTranslateUUIDField(t *testing.T) {
 	}
 }
 
+// strconv.ParseFloat accepts NaN and infinities, which no extracted value can be. A bound
+// spelled that way must be rejected (400), not passed to the engine: `| lat_s >= "NaN"`
+// used to return every record from the scan path and none from the index.
+func TestTranslateRejectsNonFiniteFloat(t *testing.T) {
+	ex, _ := extract.Compile(config.IndexConfig{Templates: []config.Template{{Name: "lat", Pattern: "took={s:float}s"}}})
+	for _, v := range []string{"NaN", "nan", "Inf", "+Inf", "-Inf", "infinity", "1e400"} {
+		for _, op := range []string{"=", "!=", "<", "<=", ">", ">="} {
+			q := fmt.Sprintf(`{a="b"} | lat_s %s "%s"`, op, v)
+			ast, err := logql.Parse(q)
+			if err != nil {
+				t.Fatalf("parse %q: %v", q, err)
+			}
+			if _, err := logql.Translate(ast, ex); err == nil {
+				t.Errorf("Translate accepted %s", q)
+			}
+		}
+	}
+	// A finite bound still translates.
+	if tc, ok := translate(t, `{a="b"} | lat_s >= "2.5"`, ex)[1].(query.TypedCompare); !ok || tc.Value.Float != 2.5 {
+		t.Fatalf("finite float bound not translated: %#v", tc)
+	}
+}
+
 func TestTranslateParserStageUnsupported(t *testing.T) {
 	ast, _ := logql.Parse(`{a="b"} | json`)
 	if _, err := logql.Translate(ast, nil); err == nil {

@@ -35,10 +35,15 @@ func Compare(a, b Value) int {
 			return 0
 		}
 	case KindFloat:
+		// By the key's total order, not by < and >. Both are false against a NaN, so a NaN
+		// compared 0 — "equal" — to every value while its key sorts above every finite one:
+		// `= NaN` matched every record on the scan path and none on the index path. For
+		// non-NaN values the two orders are the same (−0 and +0 are equal in both).
+		fa, fb := floatOrder(a.Float), floatOrder(b.Float)
 		switch {
-		case a.Float < b.Float:
+		case fa < fb:
 			return -1
-		case a.Float > b.Float:
+		case fa > fb:
 			return 1
 		default:
 			return 0

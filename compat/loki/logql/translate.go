@@ -2,6 +2,7 @@ package logql
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"strconv"
 	"time"
@@ -270,9 +271,15 @@ func parseTypedValue(raw string, kind index.ValueKind) (index.Value, error) {
 		}
 		return index.Value{Kind: index.KindInt, Int: n}, nil
 	case index.KindFloat:
+		// ParseFloat accepts "NaN", "Inf" and "Infinity". No extracted value is ever
+		// non-finite, and NaN is unordered, so such a bound is a malformed query (400), not
+		// a comparison to answer; the core engine rejects it too.
 		f, err := strconv.ParseFloat(raw, 64)
 		if err != nil {
 			return index.Value{}, fmt.Errorf("not a float")
+		}
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return index.Value{}, fmt.Errorf("not a finite float")
 		}
 		return index.Value{Kind: index.KindFloat, Float: f}, nil
 	case index.KindStr:

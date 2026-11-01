@@ -8,6 +8,8 @@
 package query
 
 import (
+	"fmt"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -194,6 +196,28 @@ func (p TypedCompare) Match(e model.LogEntry, r Resolver) bool {
 		}
 	}
 	return false
+}
+
+// validatePreds is the plan-time check of the native API, which is strict (design §9.3):
+// a predicate it cannot answer is an error, not an empty or arbitrary result.
+//
+// A non-finite float bound is such a predicate. Extraction never produces NaN or ±Inf (they
+// are extraction failures, §7.2), and NaN has no place in the numeric order at all, so
+// `lat_s >= NaN` has no meaningful answer — before this check the scan path matched every
+// record for it and the index path none. Compare and the key encoding now order such a value
+// identically, so the paths would agree regardless; rejecting it tells the caller the query
+// is malformed instead of answering it by an ordering nobody asked for.
+func validatePreds(preds []Predicate) error {
+	for _, p := range preds {
+		tc, ok := p.(TypedCompare)
+		if !ok || tc.Value.Kind != index.KindFloat {
+			continue
+		}
+		if f := tc.Value.Float; math.IsNaN(f) || math.IsInf(f, 0) {
+			return fmt.Errorf("query: field %q: %v is not a finite number", tc.Field, f)
+		}
+	}
+	return nil
 }
 
 func satisfies(cmp int, op Op) bool {

@@ -97,26 +97,31 @@ func encodeInt(i int64) [KeySize]byte {
 	return k
 }
 
-// encodeFloat maps a float64 to an order-preserving big-endian value via the standard
-// IEEE-754 total-order transform: if the sign bit is set (negative), flip all bits;
-// otherwise flip just the sign bit. Negative zero is normalized to positive zero first
-// so −0 and +0 encode identically (design §7.2). NaN/±Inf never reach here — the
-// extractor rejects them as extraction failures.
+// encodeFloat maps a float64 to an order-preserving big-endian value; see floatOrder.
 func encodeFloat(f float64) [KeySize]byte {
 	var k [KeySize]byte
+	binary.BigEndian.PutUint64(k[8:16], floatOrder(f))
+	return k
+}
+
+// floatOrder is the standard IEEE-754 total-order transform: if the sign bit is set
+// (negative), flip all bits; otherwise flip just the sign bit. Unsigned order of the
+// result is the key order. Negative zero is normalized to positive zero first so −0 and
+// +0 encode identically (design §7.2).
+//
+// Extraction never produces NaN/±Inf (they are extraction failures) and the query layer
+// rejects them as bounds, but the transform still places them: ±Inf at the ends of the
+// finite range, a NaN beyond the Inf of its sign. Compare orders floats by this same
+// transform, so the scan oracle agrees with the index even on a value that slips through.
+func floatOrder(f float64) uint64 {
 	var b uint64
-	if f == 0 { // true for both +0.0 and −0.0; force the +0.0 bit pattern
-		b = 0
-	} else {
+	if f != 0 { // f == 0 for both +0.0 and −0.0; both keep the +0.0 bit pattern (0)
 		b = math.Float64bits(f)
 	}
 	if b>>63 == 1 {
-		b = ^b
-	} else {
-		b |= 1 << 63
+		return ^b
 	}
-	binary.BigEndian.PutUint64(k[8:16], b)
-	return k
+	return b | 1<<63
 }
 
 // encodeStr takes the first 16 bytes of the UTF-8 string verbatim (plain truncation)
