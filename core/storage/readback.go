@@ -192,7 +192,15 @@ func ScanSegmentPages(path string, start, end int64, reverse bool, skipPage func
 		for i := 0; i < int(h.EntryCount) && off < endOff; i++ {
 			e, err := DecodeEntry(page[off:endOff])
 			if err != nil {
-				break
+				// Skip just this record, as FetchRecords (which decodes each offset on its
+				// own) does; stopping here lost the rest of the page from the scan alone,
+				// so the index and scan paths returned different rows.
+				n, ok := recordLen(page[off:endOff])
+				if !ok {
+					break
+				}
+				off += n
+				continue
 			}
 			off += EncodedSize(e)
 			if ts := e.TS.UnixNano(); ts < start || ts > end {
@@ -229,7 +237,12 @@ func readSegmentRecords(path string) ([]Record, error) {
 		for i := 0; i < int(h.EntryCount) && off < end; i++ {
 			e, err := DecodeEntry(page[off:end])
 			if err != nil {
-				break
+				n, ok := recordLen(page[off:end]) // skip just this record (see ScanSegmentPages)
+				if !ok {
+					break
+				}
+				off += n
+				continue
 			}
 			out = append(out, Record{
 				Offset: uint64(PageOffset(p)) + uint64(off),
@@ -256,7 +269,12 @@ func decodePageEntries(page []byte) ([]model.LogEntry, error) {
 		}
 		e, err := DecodeEntry(page[off:end])
 		if err != nil {
-			return out, err
+			n, ok := recordLen(page[off:end]) // skip just this record (see ScanSegmentPages)
+			if !ok {
+				return out, err
+			}
+			off += n
+			continue
 		}
 		out = append(out, e)
 		off += EncodedSize(e)

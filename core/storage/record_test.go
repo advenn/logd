@@ -132,6 +132,16 @@ func TestDecodeInvalidLevel(t *testing.T) {
 	}
 }
 
+// TestEncodeRejectsInvalidLevel: encoding must refuse what decoding refuses. A level byte
+// above ERROR used to be written as given and then rejected on every read.
+func TestEncodeRejectsInvalidLevel(t *testing.T) {
+	e := sampleEntry()
+	e.Level = model.LogLevel(9)
+	if _, err := EncodeEntry(e); !errors.Is(err, ErrInvalidLevel) {
+		t.Fatalf("got %v, want ErrInvalidLevel for level 9", err)
+	}
+}
+
 func TestEncodeMessageAtMax(t *testing.T) {
 	e := sampleEntry()
 	e.Message = strings.Repeat("x", maxFieldSize)

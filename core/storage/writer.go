@@ -361,10 +361,11 @@ func (w *Writer) Write(e model.LogEntry) error {
 // allowlisted label set the ingest layer produced for it (design §7.4: extraction and
 // label derivation run in handler goroutines; the writer interns the labels and pairs
 // keys with the record's on-disk offset). Non-blocking: a full queue drops and errors.
-// A record larger than MaxRecordSize is rejected with ErrEntryTooLarge, and any record once
-// Close has begun with ErrWriterClosed.
+// A record larger than MaxRecordSize is rejected with ErrEntryTooLarge, one with an
+// undefined Level with ErrInvalidLevel, and any record once Close has begun with
+// ErrWriterClosed.
 func (w *Writer) WriteExtracted(e model.LogEntry, keys []index.KeyedValue, labels label.Set) error {
-	if err := checkRecordSize(e); err != nil {
+	if err := checkRecord(e); err != nil {
 		return err
 	}
 	w.sendMu.RLock()
@@ -398,7 +399,7 @@ func (w *Writer) WriteExtracted(e model.LogEntry, keys []index.KeyedValue, label
 // watch closeCh, the drain's own signal, so it could still pick the free queue slot after
 // the drain had finished: the record was acknowledged and then never read.
 func (w *Writer) WriteExtractedCtx(ctx context.Context, e model.LogEntry, keys []index.KeyedValue, labels label.Set) error {
-	if err := checkRecordSize(e); err != nil {
+	if err := checkRecord(e); err != nil {
 		return err
 	}
 	w.sendMu.RLock()
@@ -426,13 +427,20 @@ func (w *Writer) isStopping() bool {
 	}
 }
 
-// checkRecordSize rejects a record that cannot fit in a page while the caller can still be
-// told. The writer goroutine used to discover this only after the entry was enqueued — by
-// which time a push had already been answered 204 — and could do nothing but log and drop
-// it, so long lines (stack traces, large JSON) disappeared without any client-visible error.
-func checkRecordSize(e model.LogEntry) error {
+// checkRecord rejects a record that cannot fit in a page, or that could not be read back,
+// while the caller can still be told. The writer goroutine used to discover the first only
+// after the entry was enqueued — by which time a push had already been answered 204 — and
+// could do nothing but log and drop it, so long lines (stack traces, large JSON) disappeared
+// without any client-visible error.
+//
+// A Level above ERROR was not checked at all: it was stored, and DecodeEntry then rejected
+// it, so the record never came back — and a scan stopped at it and lost the rest of its page.
+func checkRecord(e model.LogEntry) error {
 	if size := EncodedSize(e); size > MaxRecordSize {
 		return fmt.Errorf("%w: record is %d bytes, max %d (line + labels + 27-byte prefix)", ErrEntryTooLarge, size, MaxRecordSize)
+	}
+	if e.Level > model.LogLevelError {
+		return fmt.Errorf("%w: %d", ErrInvalidLevel, e.Level)
 	}
 	return nil
 }

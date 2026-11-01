@@ -78,6 +78,11 @@ func EncodeEntry(e model.LogEntry) ([]byte, error) {
 	if !representableNano(e.IngestedAt) {
 		return nil, fmt.Errorf("%w: ingested-at timestamp %v", ErrTimestampRange, e.IngestedAt)
 	}
+	// DecodeEntry rejects a level byte above ERROR, so encoding one would store a record
+	// that can never be read back.
+	if e.Level > model.LogLevelError {
+		return nil, fmt.Errorf("%w: %d", ErrInvalidLevel, e.Level)
+	}
 
 	buf := make([]byte, EncodedSize(e))
 
@@ -144,6 +149,28 @@ func DecodeEntry(data []byte) (model.LogEntry, error) {
 		Message:    msg,
 		Extra:      extra,
 	}, nil
+}
+
+// recordLen returns the length a record's own prefixes declare, and whether that many bytes
+// are present in data. Readers use it to step over a record DecodeEntry rejects inside a
+// page that passed its full-page CRC: the bytes are exactly what was written, so a record
+// that will not decode (a level byte an older writer let through) still has sound lengths,
+// and only it needs to be lost — not every record after it in the page. When the lengths
+// do not fit, there is no telling where the next record starts and the caller must stop.
+func recordLen(data []byte) (int, bool) {
+	if len(data) < recordPrefixSize {
+		return 0, false
+	}
+	msgLen := int(binary.BigEndian.Uint16(data[23:25]))
+	if len(data) < recordPrefixSize+msgLen {
+		return 0, false
+	}
+	extraLen := int(binary.BigEndian.Uint16(data[25+msgLen : 27+msgLen]))
+	n := recordPrefixSize + msgLen + extraLen
+	if len(data) < n {
+		return 0, false
+	}
+	return n, true
 }
 
 // timeFromNano rebuilds a time.Time from a stored unix-nano value. We normalize to

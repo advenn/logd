@@ -642,6 +642,93 @@ func TestWriteRejectsRecordLargerThanPage(t *testing.T) {
 	}
 }
 
+// TestWriteRejectsInvalidLevel: a record whose Level the decoder rejects must be refused
+// when it is written. It used to be stored, and then never came back from any read.
+func TestWriteRejectsInvalidLevel(t *testing.T) {
+	w, err := NewWriter(t.TempDir(), noTickOpts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Start(nil)
+	defer w.Close()
+	e := makeEntry(0, 1)
+	e.Level = model.LogLevel(9)
+	if err := w.Write(e); !errors.Is(err, ErrInvalidLevel) {
+		t.Fatalf("Write: got %v, want ErrInvalidLevel", err)
+	}
+	if err := w.WriteExtractedCtx(context.Background(), e, nil, nil); !errors.Is(err, ErrInvalidLevel) {
+		t.Fatalf("WriteExtractedCtx: got %v, want ErrInvalidLevel", err)
+	}
+}
+
+// TestUndecodableRecordSkippedAlone: a record that will not decode inside a page that passed
+// its CRC — one an older writer stored with an invalid level — must cost that record only,
+// and cost it on every read path. The scan stopped at it and lost the rest of its page,
+// ReadAll dropped the whole page, and FetchRecords, which decodes each offset on its own,
+// still returned the later records: the index and scan paths disagreed.
+func TestUndecodableRecordSkippedAlone(t *testing.T) {
+	dir := t.TempDir()
+	w, err := NewWriter(dir, Options{SegmentSizeBytes: 1 << 40, FlushInterval: time.Hour, BlockPages: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Start(nil)
+	const n, bad = 20, 5
+	for i := 0; i < n; i++ {
+		w.Write(makeEntry(i, 1))
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := mustManifest(t, dir).All()[0].Path
+	recs, err := readSegmentRecords(path)
+	if err != nil || len(recs) != n {
+		t.Fatalf("setup: read %d records (err %v), want %d", len(recs), err, n)
+	}
+
+	// Store record 5 with level 9, page CRC and all, as a writer without the check would.
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pageNum := recs[bad].Offset / PageSize
+	page := make([]byte, PageSize)
+	if _, err := f.ReadAt(page, PageOffset(pageNum)); err != nil {
+		t.Fatal(err)
+	}
+	page[recs[bad].Offset%PageSize+16] = 9
+	FinalizePage(page, decodePageHeader(page[:PageHeaderSize]))
+	if _, err := f.WriteAt(page, PageOffset(pageNum)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	want := n - 1
+	scanned := 0
+	if err := ScanSegmentTimeRange(path, 0, 1<<62, func(model.LogEntry) bool { scanned++; return true }); err != nil {
+		t.Fatal(err)
+	}
+	all, _ := ReadAll(dir)
+	withOffsets, _ := readSegmentRecords(path)
+	var offsets []uint64
+	for _, r := range recs {
+		offsets = append(offsets, r.Offset)
+	}
+	fetched := 0
+	if err := FetchRecords(path, offsets, func(model.LogEntry) bool { fetched++; return true }); err != nil {
+		t.Fatal(err)
+	}
+	if scanned != want || len(all) != want || len(withOffsets) != want || fetched != want {
+		t.Fatalf("with one undecodable record of %d: scan=%d ReadAll=%d records=%d fetch=%d, want %d each",
+			n, scanned, len(all), len(withOffsets), fetched, want)
+	}
+	for _, e := range all {
+		if e.Message == fmt.Sprintf("%05d", bad) {
+			t.Fatal("the undecodable record was returned")
+		}
+	}
+}
+
 // TestDataDirRelocatable: moving a shard directory must not lose its data. The manifest used
 // to store full paths built from the configured data_dir, so after a move every sealed segment
 // was "not found" — which the query path reads as a retention race, i.e. an empty result with

@@ -27,6 +27,10 @@ var (
 	// edge rather than corrupted.
 	ErrTimestampRange = errors.New("timestamp out of representable range")
 
+	// ErrInvalidLevel is returned for a LogEntry whose Level is not one of the four
+	// defined levels: such a record could be stored but never read back.
+	ErrInvalidLevel = errors.New("invalid log level")
+
 	// ErrWriterClosed is returned by the Write methods once Close has begun. The record
 	// was not stored.
 	ErrWriterClosed = errors.New("writer is closed")
