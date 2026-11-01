@@ -6,6 +6,11 @@ services:
     image: logd:latest
     container_name: logd
     restart: unless-stopped
+    # On SIGTERM logd lets in-flight pushes finish (up to 10 s), then writes out what is still
+    # queued, seals every shard and waits for the last segments' compression. Docker's default
+    # 10 s grace can SIGKILL it partway: acknowledged records not yet written are lost, and the
+    # active segments are left to crash recovery.
+    stop_grace_period: 30s
     ports:
       - "7100:7100"          # publish to the host (optional — remove to keep it network-only)
     volumes:
