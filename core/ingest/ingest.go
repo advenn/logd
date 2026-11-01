@@ -47,12 +47,13 @@ func NewShardedWithLabels(engine *extract.Engine, writers []*storage.Writer, lab
 // Ingest extracts typed index keys and the allowlisted label set from the entry, then
 // enqueues everything for durable, indexed storage on the routed shard.
 func (ig *Ingester) Ingest(e model.LogEntry) error {
-	var keys []index.KeyedValue
-	if ig.engine != nil {
-		keys = ig.engine.Extract(e.Message)
-	}
+	keys, tally := ig.extractTally(e.Message)
 	labels := ig.deriveLabels(e.Extra)
-	return ig.writers[ig.route(labels)].WriteExtracted(e, keys, labels)
+	if err := ig.writers[ig.route(labels)].WriteExtracted(e, keys, labels); err != nil {
+		return err
+	}
+	ig.count(tally)
+	return nil
 }
 
 // IngestCtx is Ingest, but it waits for queue space rather than dropping when the writer
@@ -60,12 +61,31 @@ func (ig *Ingester) Ingest(e model.LogEntry) error {
 // dropping midway through a batch makes the client resend entries that were already
 // stored, silently duplicating them. See storage.WriteExtractedCtx.
 func (ig *Ingester) IngestCtx(ctx context.Context, e model.LogEntry) error {
-	var keys []index.KeyedValue
-	if ig.engine != nil {
-		keys = ig.engine.Extract(e.Message)
-	}
+	keys, tally := ig.extractTally(e.Message)
 	labels := ig.deriveLabels(e.Extra)
-	return ig.writers[ig.route(labels)].WriteExtractedCtx(ctx, e, keys, labels)
+	if err := ig.writers[ig.route(labels)].WriteExtractedCtx(ctx, e, keys, labels); err != nil {
+		return err
+	}
+	ig.count(tally)
+	return nil
+}
+
+// extractTally returns the entry's index keys and its contribution to the extraction
+// counters, which count applies only once the writer has accepted the entry. One it
+// rejects — too large for a page (a 400 for a push), or refused by a closed or saturated
+// writer — is not stored, and counting it would make index_stats describe data logd does
+// not hold.
+func (ig *Ingester) extractTally(msg string) ([]index.KeyedValue, extract.Tally) {
+	if ig.engine == nil {
+		return nil, extract.Tally{}
+	}
+	return ig.engine.ExtractTally(msg)
+}
+
+func (ig *Ingester) count(t extract.Tally) {
+	if ig.engine != nil {
+		ig.engine.AddTally(t)
+	}
 }
 
 // route picks the shard for a record. A labelled stream is hashed to a stable shard, so a

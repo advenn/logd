@@ -1,6 +1,8 @@
 package ingest_test
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -108,6 +110,42 @@ func TestRebuildAndCompare(t *testing.T) {
 			t.Fatalf("field %s: .tidx contents differ from rebuilt truth\n got  %s\n want %s",
 				field.Name, dump(got), dump(want))
 		}
+	}
+}
+
+// The extraction counters describe the data logd holds, so an entry the writer refuses is
+// not counted. Extraction ran — and counted — before the size check, so a line too large for
+// a page, which the push answered with a 400, still showed up as a matched candidate.
+func TestRejectedEntryIsNotCounted(t *testing.T) {
+	engine, err := extract.Compile(config.IndexConfig{Templates: []config.Template{{Name: "lat", Pattern: "took={ms:int}ms"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := storage.NewWriter(t.TempDir(), storage.Options{Schema: engine.IndexedFields(), FlushInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Start(nil)
+	defer w.Close()
+	ig := ingest.New(engine, w)
+
+	big := model.LogEntry{TS: time.Unix(1700000000, 0).UTC(), Message: "took=250ms " + strings.Repeat("x", storage.MaxRecordSize)}
+	if err := ig.Ingest(big); !errors.Is(err, storage.ErrEntryTooLarge) {
+		t.Fatalf("Ingest of an oversized entry: got %v, want ErrEntryTooLarge", err)
+	}
+	if err := ig.IngestCtx(context.Background(), big); !errors.Is(err, storage.ErrEntryTooLarge) {
+		t.Fatalf("IngestCtx of an oversized entry: got %v, want ErrEntryTooLarge", err)
+	}
+	if st := engine.Stats()[0]; st.Candidates != 0 || st.Matches != 0 || st.Failures != 0 {
+		t.Fatalf("rejected entries were counted: %+v", st)
+	}
+
+	ok := model.LogEntry{TS: time.Unix(1700000001, 0).UTC(), Message: "took=250ms"}
+	if err := ig.IngestCtx(context.Background(), ok); err != nil {
+		t.Fatal(err)
+	}
+	if st := engine.Stats()[0]; st.Candidates != 1 || st.Matches != 1 || st.Failures != 0 {
+		t.Fatalf("an accepted entry must be counted once: %+v", st)
 	}
 }
 

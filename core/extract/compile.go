@@ -29,11 +29,28 @@ type fragment struct {
 // template is a compiled pattern. firstLiteral is fragments[0].literal, which validation
 // guarantees is a literal — its occurrences in a message are the candidate start
 // positions for matching.
+//
+// anchor is the index of the first literal fragment long enough to be an anchor
+// (anchorMinLen, §7.2) — usually the first literal itself. Matching starts at the first
+// literal, but an attempt counts as a candidate only once the anchor aligns; see
+// classifyMiss.
 type template struct {
 	name         string
 	pattern      string // the raw configured pattern, kept only so Stats can report it
 	fragments    []fragment
 	firstLiteral string
+	anchor       int
+}
+
+// anchorFragment returns the index of the first literal fragment of at least anchorMinLen
+// bytes. validateTemplate guarantees there is one.
+func anchorFragment(frags []fragment) int {
+	for i, f := range frags {
+		if !f.isCapture && len(f.literal) >= anchorMinLen {
+			return i
+		}
+	}
+	return 0
 }
 
 // numericExtender reports whether byte b, appearing as the first byte of the literal

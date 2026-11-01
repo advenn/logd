@@ -29,10 +29,11 @@ type Engine struct {
 
 	// Per-template extraction counters. All three are needed together: a failure count
 	// on its own has no denominator ("50 failures" of how many?). candidates counts
-	// anchor occurrences we tried, matches counts full successes, failures counts
-	// anchor-aligned-but-unparseable. candidates > matches+failures means the anchor
-	// fires but the rest of the pattern doesn't align — a different mis-specification
-	// than failures > 0 (which means it aligns but the declared type is wrong).
+	// attempts in which the template's anchor aligned, matches counts full successes,
+	// failures counts anchor-aligned-but-unparseable (see classifyMiss). candidates >
+	// matches+failures means the anchor fires but the rest of the pattern doesn't align —
+	// a different mis-specification than failures > 0 (which means it aligns but the
+	// declared type is wrong). Only records the writer accepted are counted (see Tally).
 	candidates map[string]*atomic.Int64
 	matches    map[string]*atomic.Int64
 	failures   map[string]*atomic.Int64
@@ -73,6 +74,7 @@ func Compile(cfg config.IndexConfig) (*Engine, error) {
 			return nil, err
 		}
 		t.firstLiteral = frags[0].literal
+		t.anchor = anchorFragment(frags)
 
 		shape := normalizedShape(&t)
 		if other, ok := shapes[shape]; ok {
@@ -227,14 +229,6 @@ func (e *Engine) Literals() []string {
 	return out
 }
 
-type matchStatus uint8
-
-const (
-	noMatch   matchStatus = iota // a literal fragment didn't align: not this template here
-	parseFail                    // literals aligned but a capture didn't parse: a failure
-	matchOK
-)
-
 type captureVal struct {
 	field string
 	value index.Value
@@ -257,12 +251,14 @@ type FieldValue struct {
 // and counting there would make the stats meaningless: they would report how many times
 // the matcher ran, which is dominated by query volume, rather than how much of the
 // INGESTED data each template actually matched — the only question the index config poses.
-// Extract, the ingest entry point, is where counting happens.
+// Extract and ExtractTally, the ingest entry points, are where counting happens.
 func (e *Engine) ExtractValues(message string) []FieldValue {
-	return e.extractValues(message, false)
+	return e.extractValues(message, nil)
 }
 
-func (e *Engine) extractValues(message string, count bool) []FieldValue {
+// extractValues is the shared core. With a non-nil tally it also classifies each attempt
+// for the counters; that changes nothing about what is extracted.
+func (e *Engine) extractValues(message string, tally *Tally) []FieldValue {
 	hits := e.ac.search(message)
 	if len(hits) == 0 {
 		return nil
@@ -276,24 +272,32 @@ func (e *Engine) extractValues(message string, count bool) []FieldValue {
 	var out []FieldValue
 	for ti := range e.templates {
 		t := &e.templates[ti]
+		c := templateTally{tmpl: ti}
 		for _, start := range posByLit[t.firstLiteral] {
-			if count {
-				e.candidates[t.name].Add(1)
-			}
-			vals, status := e.matchAt(message, start, t)
-			switch status {
-			case matchOK:
-				if count {
-					e.matches[t.name].Add(1)
-				}
+			vals, ok := e.matchAt(message, start, t)
+			if ok {
 				for _, cv := range vals {
 					out = append(out, FieldValue{Field: cv.field, Value: cv.value})
 				}
-			case parseFail:
-				if count {
-					e.failures[t.name].Add(1)
-				}
 			}
+			if tally == nil {
+				continue
+			}
+			if ok {
+				c.candidates++
+				c.matches++
+				continue
+			}
+			anchored, failed := t.classifyMiss(message, start)
+			if anchored {
+				c.candidates++
+			}
+			if failed {
+				c.failures++
+			}
+		}
+		if tally != nil && c.candidates > 0 {
+			tally.add(c)
 		}
 	}
 	for _, lit := range e.bareLiterals {
@@ -307,10 +311,65 @@ func (e *Engine) extractValues(message string, count bool) []FieldValue {
 // Extract returns the encoded (field, key) pairs to index for a record, de-duplicated
 // on (field, key) so the same value indexed twice in one line produces one entry.
 //
-// This is the INGEST entry point, so it is where the per-template counters are updated:
-// one increment per record ingested, independent of how often that record is later read.
+// It updates the per-template counters at once: one increment per record, independent of
+// how often that record is later read. A caller that may still reject the record uses
+// ExtractTally instead.
 func (e *Engine) Extract(message string) []index.KeyedValue {
-	return encodeKeys(e.extractValues(message, true))
+	keys, tally := e.ExtractTally(message)
+	e.AddTally(tally)
+	return keys
+}
+
+// ExtractTally returns what Extract returns, plus the record's contribution to the
+// per-template counters, which it does NOT apply. The ingest path applies it with AddTally
+// once the writer has accepted the record. Extract counted before the writer had seen it,
+// so a record rejected as too large for a page (a 400 to the pushing client) still showed
+// up in /logd/api/v1/index_stats as matched data.
+func (e *Engine) ExtractTally(message string) ([]index.KeyedValue, Tally) {
+	var tally Tally
+	keys := encodeKeys(e.extractValues(message, &tally))
+	return keys, tally
+}
+
+// AddTally applies a record's contribution from ExtractTally to the counters. Call it once
+// per accepted record.
+func (e *Engine) AddTally(t Tally) {
+	for i := 0; i < t.n; i++ {
+		e.addTemplateTally(t.inline[i])
+	}
+	for _, c := range t.more {
+		e.addTemplateTally(c)
+	}
+}
+
+func (e *Engine) addTemplateTally(c templateTally) {
+	name := e.templates[c.tmpl].name
+	e.candidates[name].Add(c.candidates)
+	e.matches[name].Add(c.matches)
+	e.failures[name].Add(c.failures)
+}
+
+// Tally is one record's contribution to the per-template counters, as ExtractTally returns
+// it. Room for a few templates is inline, so a record costs no allocation on the ingest
+// path unless it hits more templates than that.
+type Tally struct {
+	n      int
+	inline [4]templateTally
+	more   []templateTally
+}
+
+type templateTally struct {
+	tmpl                          int // index into Engine.templates
+	candidates, matches, failures int64
+}
+
+func (t *Tally) add(c templateTally) {
+	if t.n < len(t.inline) {
+		t.inline[t.n] = c
+		t.n++
+		return
+	}
+	t.more = append(t.more, c)
 }
 
 // ReExtract returns exactly what Extract returns but leaves the per-template counters
@@ -318,7 +377,7 @@ func (e *Engine) Extract(message string) []index.KeyedValue {
 // recovery rebuilding a segment's index — which Extract would count a second time, inflating
 // the candidates/matches/failures that /logd/api/v1/index_stats reports.
 func (e *Engine) ReExtract(message string) []index.KeyedValue {
-	return encodeKeys(e.extractValues(message, false))
+	return encodeKeys(e.extractValues(message, nil))
 }
 
 // encodeKeys turns extracted values into index keys, de-duplicated on (field, key).
@@ -345,14 +404,15 @@ type dedupKey struct {
 	key   [index.KeySize]byte
 }
 
-// matchAt attempts to match template t against message starting at start.
-func (e *Engine) matchAt(message string, start int, t *template) ([]captureVal, matchStatus) {
+// matchAt attempts to match template t against message starting at start. How a miss is
+// counted is not decided here but by classifyMiss.
+func (e *Engine) matchAt(message string, start int, t *template) ([]captureVal, bool) {
 	cursor := start
 	var vals []captureVal
 	for i, f := range t.fragments {
 		if !f.isCapture {
 			if !hasPrefixAt(message, cursor, f.literal) {
-				return nil, noMatch
+				return nil, false
 			}
 			cursor += len(f.literal)
 			continue
@@ -363,12 +423,90 @@ func (e *Engine) matchAt(message string, start int, t *template) ([]captureVal, 
 		}
 		val, consumed, ok := parseCapture(message[cursor:], f.kind, nextLit)
 		if !ok {
-			return nil, parseFail
+			return nil, false
 		}
 		cursor += consumed
 		vals = append(vals, captureVal{field: f.field, value: val})
 	}
-	return vals, matchOK
+	return vals, true
+}
+
+// classifyMiss decides how the counters see an attempt at start that matchAt did not match.
+// It walks the template again, but where a capture stops the strict match it looks for the
+// following literal further along the same token (realign) instead of giving up:
+//
+//   - anchored: the walk reached the template's anchor — its first literal of at least 3
+//     bytes — and aligned it. Only such an attempt is a candidate. Matching has to start at
+//     the first literal, but a short first literal ("a" in "a{x:int} took") occurs
+//     everywhere, and counting each occurrence made every "a" of "banana" a candidate and a
+//     failure. When the first literal is itself the anchor, every attempt is a candidate,
+//     as before.
+//   - failed: anchored, and a capture's text is not a value of its type. Either it does not
+//     parse, or it parses only partway and the following literal aligns later in the same
+//     token: "12.5" under {ms:int} in "took 12.5ms", which matchAt sees as "ms" failing to
+//     align after "12". A complete value followed by something else ("took 12 seconds") is
+//     the pattern not aligning — a candidate, but not a failure.
+//
+// It runs only when counting and only for misses, so it changes what the counters report
+// and nothing that is extracted.
+func (t *template) classifyMiss(message string, start int) (anchored, failed bool) {
+	cursor := start
+	for i, f := range t.fragments {
+		if !f.isCapture {
+			if !hasPrefixAt(message, cursor, f.literal) {
+				return anchored, false
+			}
+			cursor += len(f.literal)
+			if i == t.anchor {
+				anchored = true
+				if failed { // a capture before the anchor did not parse, yet the template aligned around it
+					return true, true
+				}
+			}
+			continue
+		}
+		nextLit := ""
+		if i+1 < len(t.fragments) {
+			nextLit = t.fragments[i+1].literal
+		}
+		_, consumed, ok := parseCapture(message[cursor:], f.kind, nextLit)
+		if ok && (nextLit == "" || hasPrefixAt(message, cursor+consumed, nextLit)) {
+			cursor += consumed
+			continue
+		}
+		if anchored && !ok {
+			return true, true // the anchor aligned and the value does not parse
+		}
+		if nextLit == "" {
+			return anchored, false
+		}
+		// The value parsed only partway, or (before the anchor) not at all: it is a failure
+		// only if the template realigns on the following literal within the same token.
+		j, found := realign(message, cursor, cursor+consumed, nextLit)
+		if !found {
+			return anchored, false
+		}
+		if anchored {
+			return true, true
+		}
+		failed, cursor = true, j
+	}
+	return anchored, failed
+}
+
+// realign reports where lit next aligns within the token a capture starts at capStart:
+// at or after from, before the next str delimiter, and within maxStrCapture bytes. Alignment
+// is checked before the delimiter so a literal that starts with one (" ms") still realigns.
+func realign(message string, capStart, from int, lit string) (int, bool) {
+	for j := from; j <= len(message) && j-capStart <= maxStrCapture; j++ {
+		if hasPrefixAt(message, j, lit) {
+			return j, true
+		}
+		if j == len(message) || isStrDelimiter(message[j]) {
+			return 0, false
+		}
+	}
+	return 0, false
 }
 
 func parseCapture(s string, kind index.ValueKind, nextLit string) (index.Value, int, bool) {

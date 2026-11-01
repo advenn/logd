@@ -136,6 +136,105 @@ func TestReExtractMatchesExtractWithoutCounting(t *testing.T) {
 	}
 }
 
+// statOf returns one template's counters as {candidates, matches, failures}.
+func statOf(t *testing.T, e *Engine, name string) [3]int64 {
+	t.Helper()
+	for _, st := range e.Stats() {
+		if st.Name == name {
+			return [3]int64{st.Candidates, st.Matches, st.Failures}
+		}
+	}
+	t.Fatalf("no template %q", name)
+	return [3]int64{}
+}
+
+// A candidate is an attempt in which the template's anchor — its first literal of at least
+// 3 bytes — aligned, not every occurrence of its first literal. With a 1-byte first literal
+// every "a" of "banana" was a candidate whose "capture" failed to parse, so a line with one
+// clean match reported Candidates:4 Matches:1 Failures:3. A value that is malformed for its
+// type is still a failure when the template aligns around it, before the anchor as after it.
+func TestStatsCandidatesCountFromTheAnchor(t *testing.T) {
+	for _, c := range []struct {
+		msg  string
+		want [3]int64 // candidates, matches, failures
+	}{
+		{"banana a5 took 3ms", [3]int64{1, 1, 0}},
+		{"banana", [3]int64{0, 0, 0}},
+		{"aX took", [3]int64{1, 0, 1}},   // anchored around "X", which is not an int
+		{"a5.5 took", [3]int64{1, 0, 1}}, // parses only partway
+		{"a5 tool", [3]int64{0, 0, 0}},   // the anchor never aligns
+	} {
+		e := mustCompile(t, config.IndexConfig{Templates: []config.Template{{Name: "t", Pattern: "a{x:int} took"}}})
+		e.Extract(c.msg)
+		if got := statOf(t, e, "t"); got != c.want {
+			t.Errorf("%q: candidates/matches/failures = %v, want %v", c.msg, got, c.want)
+		}
+	}
+	// A first literal that is already an anchor keeps counting every occurrence, even when
+	// a longer literal follows.
+	e := mustCompile(t, config.IndexConfig{Templates: []config.Template{{Name: "ord", Pattern: "order-{id:uuid} created"}}})
+	e.Extract("order-xyz shipped")
+	if got := statOf(t, e, "ord"); got != [3]int64{1, 0, 1} {
+		t.Errorf("order-xyz shipped: candidates/matches/failures = %v, want [1 0 1]", got)
+	}
+}
+
+// A value that parses only partway is malformed for its type, and so a failure: under
+// {ms:int}, "took 12.5ms" parsed "12" and then found ".5ms" where "ms" should be, which was
+// counted as the pattern not aligning — hiding exactly the "declared int, data is float"
+// mistake the failure counter exists to show. A complete value followed by something else
+// is still only a candidate.
+func TestStatsPartialValueIsFailure(t *testing.T) {
+	for _, c := range []struct {
+		msg  string
+		want [3]int64
+	}{
+		{"GET /x took 12.5ms", [3]int64{1, 0, 1}},
+		{"GET /y took 1.25e3ms", [3]int64{1, 0, 1}},
+		{"GET /z took abcms", [3]int64{1, 0, 1}},
+		{"GET /w took 12 seconds", [3]int64{1, 0, 0}},
+		{"GET /v took 12ms", [3]int64{1, 1, 0}},
+	} {
+		e := mustCompile(t, config.IndexConfig{Templates: []config.Template{{Name: "lat", Pattern: "took {ms:int}ms"}}})
+		e.Extract(c.msg)
+		if got := statOf(t, e, "lat"); got != c.want {
+			t.Errorf("%q: candidates/matches/failures = %v, want %v", c.msg, got, c.want)
+		}
+	}
+	// A literal that starts with a delimiter still realigns after a partial value.
+	e := mustCompile(t, config.IndexConfig{Templates: []config.Template{{Name: "lat", Pattern: "took {ms:int} ms"}}})
+	e.Extract("took 12.5 ms")
+	if got := statOf(t, e, "lat"); got != [3]int64{1, 0, 1} {
+		t.Errorf("took 12.5 ms: candidates/matches/failures = %v, want [1 0 1]", got)
+	}
+}
+
+// Classifying misses for the counters must not change what is extracted: the counting path
+// (Extract) and the non-counting one (ReExtract) return the same keys for every message.
+func TestCountingDoesNotChangeExtraction(t *testing.T) {
+	cfg := config.IndexConfig{Templates: []config.Template{
+		{Name: "t", Pattern: "a{x:int} took"},
+		{Name: "lat", Pattern: "took {ms:int}ms"},
+		{Name: "pair", Pattern: "x{a:int}-{b:float} done"},
+		{Name: "trip", Pattern: "trip:{id:str} end"},
+	}}
+	e := mustCompile(t, cfg)
+	for _, m := range []string{
+		"banana a5 took 3ms", "aX took", "a5.5 took 12.5ms", "took 12 seconds took 7ms",
+		"x1-2.5 done", "x1-2.5.1 done", "xx1-2 done", "trip:abc end", "trip:a,b end", "",
+	} {
+		got, want := e.Extract(m), e.ReExtract(m)
+		if len(got) != len(want) {
+			t.Fatalf("%q: Extract returned %d keys, ReExtract %d", m, len(got), len(want))
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("%q: key %d differs: %+v vs %+v", m, i, got[i], want[i])
+			}
+		}
+	}
+}
+
 func TestExtractSignedNumbers(t *testing.T) {
 	e := mustCompile(t, config.IndexConfig{Templates: []config.Template{
 		{Name: "d", Pattern: "delta {n:int} done"},
