@@ -32,16 +32,60 @@ APP="${APP:-checkout}"
 # corpus > 200 matches 5.4% of lines and > 5000 matches 0.09%, which is the range where the
 # answer changes (an index wins on the selective end, a scan-based store is flat).
 T="${THRESHOLD:-200}"
+# Optional rows, all off by default so the default run is the one earlier results came from:
+#   WITH_PG=1          PostgreSQL through the shim on :7300, both variants (structured =
+#                      generated column + B-tree; unstructured = extraction in the WHERE clause)
+#   LOGD_V1_URL=...    a second logd built from an older tag (e.g. thesis-eval-1 on :7101), so
+#                      one interleaved run measures what the fixes and features changed
+#   WITH_LOGQL_STAGES=1  logd answering the Loki query text itself (| pattern / | regexp), which
+#                      needs a logd with parser stages; shows whether the same text reaches the index
+# DATASET selects the corpus the queries are written for: app (the synthetic took=<n>ms corpus,
+# predicate latency_ms > T) or hdfs (Loghub HDFS replay, predicate size_bytes < T). The HDFS
+# forms are the ones scripts/gate.py verified against ground truth; a single Loki | pattern or
+# a single VictoriaLogs extract is NOT exact on HDFS (two line shapes carry the size), so the
+# two-stage forms are used.
+DATASET="${DATASET:-app}"
+LOGD_URL="${LOGD_URL:-http://localhost:7100}"
 # Each engine carries the response format its row count has to be read from: Loki's JSON for
-# logd and Loki, one JSON object per line for VictoriaLogs' LogsQL endpoint.
-add "logd (typed index)"  "http://localhost:7100/loki/api/v1/query_range" "{app=\"$APP\"} | latency_ms > $T" loki
-add "logd (forced scan)"  "http://localhost:7100/logd/api/v1/query_scan"  "{app=\"$APP\"} | latency_ms > $T" loki
-add "Loki (| pattern)"    "http://localhost:3100/loki/api/v1/query_range" "{app=\"$APP\"} |= \"took=\" | pattern \"<_>took=<latency_ms>ms<_>\" | latency_ms > $T" loki
-add "Loki (| regexp)"     "http://localhost:3100/loki/api/v1/query_range" "{app=\"$APP\"} |= \"took=\" | regexp \"took=(?P<latency_ms>[0-9]+)ms\" | latency_ms > $T" loki
-# VictoriaLogs speaks the Loki PUSH protocol but not the Loki QUERY API, so it is measured on
-# its own endpoint in LogsQL. Without this row the comparison quietly omits the engine that the
-# earlier measurements found to be the real competitor.
-add "VictoriaLogs (extract)" "http://localhost:9428/select/logsql/query" "_stream:{app=\"$APP\"} \"took=\" | extract \"took=<latency_ms>ms\" | latency_ms:>$T" jsonl
+# logd, Loki and the PostgreSQL shim; one JSON object per line for VictoriaLogs' LogsQL endpoint.
+case "$DATASET" in
+app)
+  add "logd (typed index)"  "$LOGD_URL/loki/api/v1/query_range" "{app=\"$APP\"} | latency_ms > $T" loki
+  add "logd (forced scan)"  "$LOGD_URL/logd/api/v1/query_scan"  "{app=\"$APP\"} | latency_ms > $T" loki
+  if [[ -n "${LOGD_V1_URL:-}" ]]; then
+    add "logd v1 (typed index)" "$LOGD_V1_URL/loki/api/v1/query_range" "{app=\"$APP\"} | latency_ms > $T" loki
+  fi
+  if [[ -n "${WITH_LOGQL_STAGES:-}" ]]; then
+    add "logd (Loki | pattern text)" "$LOGD_URL/loki/api/v1/query_range" "{app=\"$APP\"} |= \"took=\" | pattern \"<_>took=<latency_ms>ms<_>\" | latency_ms > $T" loki
+    add "logd (Loki | regexp text)"  "$LOGD_URL/loki/api/v1/query_range" "{app=\"$APP\"} |= \"took=\" | regexp \"took=(?P<latency_ms>[0-9]+)ms\" | latency_ms > $T" loki
+  fi
+  add "Loki (| pattern)"    "http://localhost:3100/loki/api/v1/query_range" "{app=\"$APP\"} |= \"took=\" | pattern \"<_>took=<latency_ms>ms<_>\" | latency_ms > $T" loki
+  add "Loki (| regexp)"     "http://localhost:3100/loki/api/v1/query_range" "{app=\"$APP\"} |= \"took=\" | regexp \"took=(?P<latency_ms>[0-9]+)ms\" | latency_ms > $T" loki
+  # VictoriaLogs speaks the Loki PUSH protocol but not the Loki QUERY API, so it is measured on
+  # its own endpoint in LogsQL. Without this row the comparison quietly omits the engine that the
+  # earlier measurements found to be the real competitor.
+  add "VictoriaLogs (extract)" "http://localhost:9428/select/logsql/query" "_stream:{app=\"$APP\"} \"took=\" | extract \"took=<latency_ms>ms\" | latency_ms:>$T" jsonl
+  if [[ -n "${WITH_PG:-}" ]]; then
+    add "PostgreSQL (generated col + B-tree)" "http://localhost:7300/loki/api/v1/query_range?variant=structured"   "latency_ms > $T" loki
+    add "PostgreSQL (extract in WHERE)"       "http://localhost:7300/loki/api/v1/query_range?variant=unstructured" "latency_ms > $T" loki
+  fi
+  ;;
+hdfs)
+  add "logd (typed index)"  "$LOGD_URL/loki/api/v1/query_range" "{app=\"hdfs\"} | size_bytes < $T" loki
+  add "logd (forced scan)"  "$LOGD_URL/logd/api/v1/query_scan"  "{app=\"hdfs\"} | size_bytes < $T" loki
+  if [[ -n "${LOGD_V1_URL:-}" ]]; then
+    add "logd v1 (typed index)" "$LOGD_V1_URL/loki/api/v1/query_range" "{app=\"hdfs\"} | size_bytes < $T" loki
+  fi
+  add "Loki (| regexp)"     "http://localhost:3100/loki/api/v1/query_range" "{app=\"hdfs\"} |= \"size \" | regexp \"size (?P<size_bytes>[0-9]+)\" | size_bytes < $T" loki
+  add "Loki (2× | pattern)" "http://localhost:3100/loki/api/v1/query_range" "{app=\"hdfs\"} |= \"size \" | pattern \"<_> size <size_bytes> <_>\" | pattern \"<_> size <size_bytes>\" | size_bytes < $T" loki
+  add "VictoriaLogs (extract_regexp)" "http://localhost:9428/select/logsql/query" "_stream:{app=\"hdfs\"} \"size\" | extract_regexp \"size (?P<size_bytes>[0-9]+)\" | size_bytes:<$T" jsonl
+  if [[ -n "${WITH_PG:-}" ]]; then
+    add "PostgreSQL (generated col + B-tree)" "http://localhost:7300/loki/api/v1/query_range?variant=structured&dataset=hdfs"   "size_bytes < $T" loki
+    add "PostgreSQL (extract in WHERE)"       "http://localhost:7300/loki/api/v1/query_range?variant=unstructured&dataset=hdfs" "size_bytes < $T" loki
+  fi
+  ;;
+*) echo "unknown DATASET=$DATASET (app|hdfs)" >&2; exit 2 ;;
+esac
 
 here="$(cd "$(dirname "$0")" && pwd)"
 
