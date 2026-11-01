@@ -196,21 +196,24 @@ func (s *Server) queryRangeWith(w http.ResponseWriter, r *http.Request, exec fun
 	}
 }
 
-// handleQuery serves instant queries. Grafana's datasource health check
-// (vector(1)+vector(1)) gets a scalar vector stub; a selector query returns streams; a
-// metric query is evaluated at the instant and returned as a vector.
+// healthCheckExpr is the instant query Grafana's Loki datasource sends from "Save & test"
+// (pkg/tsdb/loki/healthcheck.go), and it checks the answer is 2.
+const healthCheckExpr = "vector(1)+vector(1)"
+
+// handleQuery serves instant queries. Grafana's datasource health check gets a constant
+// vector; a selector query returns streams; a metric query is evaluated at the instant and
+// returned as a vector.
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	expr := strings.TrimSpace(r.FormValue("query"))
+	// logd has no vector(), so the health check is answered as the constant it computes —
+	// but only that exact expression, whitespace aside. Answering every unparseable query
+	// containing "vector(" made `<metric> or vector(0)` return 1, a number nobody computed.
+	if strings.Join(strings.Fields(expr), "") == healthCheckExpr {
+		writeJSON(w, newScalarVector(s.now(), "2"))
+		return
+	}
 	ast, err := logql.ParseExpr(expr)
 	if err != nil {
-		// Grafana's datasource health check sends `vector(1)+vector(1)`, which isn't a
-		// valid log/metric query. Only stub when the parse fails AND it looks like the
-		// health check — a real query that merely contains "vector(" still parses and is
-		// evaluated normally.
-		if strings.Contains(expr, "vector(") {
-			writeJSON(w, newScalarVector(s.now(), "1"))
-			return
-		}
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}

@@ -88,7 +88,7 @@ func newQueryRangeResponse(results []streamResult) queryRangeResponse {
 }
 
 // vectorResponse answers instant metric queries (one sample per series) and Grafana's
-// datasource health check (vector(1)+vector(1) → a scalar stub).
+// datasource health check (vector(1)+vector(1) → a constant 2).
 type vectorResponse struct {
 	Status string     `json:"status"`
 	Data   vectorData `json:"data"`

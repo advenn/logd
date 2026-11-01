@@ -316,6 +316,38 @@ func TestHealthCheckNotOverbroad(t *testing.T) {
 	}
 }
 
+// Only Grafana's exact health-check expression is stubbed, and with the value it computes
+// (1+1). Any unparseable query containing "vector(" used to answer "1", so
+// `<metric> or vector(0)` returned a number nobody computed.
+func TestHealthCheckStubExactAndCorrect(t *testing.T) {
+	srv, _ := setup(t)
+	h := srv.Handler()
+	for _, q := range []string{"vector(1)+vector(1)", " vector(1) + vector(1) "} {
+		rr := do(t, h, "GET", "/loki/api/v1/query?query="+urlEncode(q), "", "")
+		var resp struct {
+			Data struct {
+				ResultType string `json:"resultType"`
+				Result     []struct {
+					Value [2]any `json:"value"`
+				} `json:"result"`
+			} `json:"data"`
+		}
+		json.Unmarshal(rr.Body.Bytes(), &resp)
+		if rr.Code != http.StatusOK || resp.Data.ResultType != "vector" || len(resp.Data.Result) != 1 || resp.Data.Result[0].Value[1] != "2" {
+			t.Fatalf("%q: %d %s, want a one-sample vector of 2", q, rr.Code, rr.Body.String())
+		}
+	}
+	for _, q := range []string{
+		`count_over_time({region="eu"}[1m]) or vector(0)`,
+		`vector(1)`,
+		`vector(1)+vector(2)`,
+	} {
+		if rr := do(t, h, "GET", "/loki/api/v1/query?query="+urlEncode(q), "", ""); rr.Code != http.StatusBadRequest {
+			t.Fatalf("%q: got %d %s, want 400", q, rr.Code, rr.Body.String())
+		}
+	}
+}
+
 // End-to-end live tail: real WebSocket handshake, push a matching entry, receive it as a
 // text frame.
 func TestLokiTailWebSocket(t *testing.T) {
