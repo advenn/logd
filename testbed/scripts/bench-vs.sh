@@ -115,11 +115,11 @@ for e in "${ENGINES[@]}"; do
   f="$tmp/$(echo "$name" | tr -c 'a-zA-Z0-9' '_').samples"
   save_samples "$name" "$f"
   python3 - "$name" "$f" <<'PY'
-import statistics, sys
+import math, statistics, sys
 name, path = sys.argv[1], sys.argv[2]
 v = sorted(float(x) for x in open(path) if x.strip())
-def pct(p):  # nearest-rank; with few samples p99 is effectively the max, which is why n is printed
-    return v[min(len(v) - 1, int(round(p / 100 * len(v) + 0.5)) - 1)]
+def pct(p):  # nearest-rank, rank ceil(p/100*n), as protocol-analyse.py; with few samples p99 is the max, hence n
+    return v[max(0, math.ceil(p * len(v) / 100) - 1)]
 print(f"{name:<24} {statistics.median(v):8.1f} {pct(95):8.1f} {pct(99):8.1f} {v[0]:8.1f} {v[-1]:8.1f} {len(v):6d}")
 PY
 done

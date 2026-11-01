@@ -1,6 +1,32 @@
 #!/usr/bin/env python3
 """Turn the raw per-cell samples into the tables chapter 6 needs, plus one combined raw CSV."""
-import csv, os, statistics, sys
+import csv, math, os, statistics, sys
+
+
+def pct(v, p):
+    """Nearest-rank percentile of the sorted samples v: the value at rank ceil(p/100 * n).
+
+    round(p/100*n + 0.5) was one rank too high whenever p/100*n is a whole number, because
+    Python rounds halves to even: with 20 samples p95 is rank 19, but round(19.5) is 20, so
+    "p95" reported the maximum.
+    """
+    return v[max(0, math.ceil(p * len(v) / 100) - 1)]
+
+
+def self_test():
+    v = list(range(1, 21))  # 20 samples: p95 is the 19th, p99 the 20th
+    assert pct(v, 95) == 19 and pct(v, 99) == 20 and pct(v, 50) == 10, (pct(v, 95), pct(v, 99))
+    v = list(range(1, 31))  # 30 samples: ceil(28.5) = 29, ceil(29.7) = 30
+    assert pct(v, 95) == 29 and pct(v, 99) == 30
+    v = list(range(1, 101))  # 100 samples: p95 is exactly the 95th
+    assert pct(v, 95) == 95 and pct(v, 99) == 99
+    assert pct([7.0], 95) == 7.0
+    print("pct self-test ok")
+
+
+if sys.argv[1:] == ["--self-test"]:
+    self_test()
+    sys.exit(0)
 
 R = sys.argv[1]
 THRESHOLDS = [200, 1000, 3000, 5000]
@@ -12,9 +38,6 @@ ENGINES = [
     ("Loki____regexp__", "Loki (| regexp)"),
     ("VictoriaLogs__extract__", "VictoriaLogs"),
 ]
-
-def pct(v, p):
-    return v[min(len(v) - 1, int(round(p / 100 * len(v) + 0.5)) - 1)]
 
 def load(layout, t, key):
     path = os.path.join(R, f"samples-{layout}", f"t{t}_{key}.csv")
