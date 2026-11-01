@@ -139,6 +139,16 @@ type ParserStage struct {
 
 func (*ParserStage) pipelineStage() {}
 
+// LabelsStage is `| drop <labels>` or `| keep <labels>`: it removes labels from (or
+// keeps only the named labels on) each result. Each item is a bare name (Op == OpNone) or
+// a matcher such as `level="debug"`, which drops the label only where it matches.
+type LabelsStage struct {
+	Keep   bool // false: drop
+	Labels []LabelMatcher
+}
+
+func (*LabelsStage) pipelineStage() {}
+
 // LabelFilter applies a filter to stream labels or extracted labels.
 type LabelFilter struct {
 	Label string
@@ -182,6 +192,21 @@ func stageString(s PipelineStage) string {
 		return "| " + s.Parser
 	case *LabelFilter:
 		return "| " + s.Label + " " + s.Op.String() + " " + fmt.Sprintf("%q", s.Value)
+	case *LabelsStage:
+		str := "| drop "
+		if s.Keep {
+			str = "| keep "
+		}
+		for i, m := range s.Labels {
+			if i > 0 {
+				str += ", "
+			}
+			str += m.Label
+			if m.Op != OpNone {
+				str += m.Op.String() + fmt.Sprintf("%q", m.Value)
+			}
+		}
+		return str
 	default:
 		return "| ?"
 	}

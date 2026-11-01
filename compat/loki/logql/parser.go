@@ -310,6 +310,8 @@ func (p *Parser) parsePipelineStage() (PipelineStage, error) {
 		return p.parseUnwrap()
 	case p.tok.Kind == TokIDENT && isParserKeyword(p.tok.Value):
 		return p.parseParserStage()
+	case p.tok.Kind == TokIDENT && (p.tok.Value == "drop" || p.tok.Value == "keep"):
+		return p.parseLabelsStage()
 	case p.tok.Kind == TokIDENT:
 		return p.parseLabelFilter()
 	default:
@@ -351,6 +353,37 @@ func (p *Parser) parseParserStage() (*ParserStage, error) {
 	parser := p.tok.Value
 	p.advance()
 	return &ParserStage{Parser: parser}, nil
+}
+
+// parseLabelsStage parses `drop`/`keep` followed by a comma-separated list of label names
+// or matchers. The list ends at the first token that cannot continue it — a `|`, the `[` of
+// a range, the `)` closing a range aggregation — exactly where Grafana's log-volume query
+// puts `| drop __error__[$__auto]`.
+func (p *Parser) parseLabelsStage() (*LabelsStage, error) {
+	st := &LabelsStage{Keep: p.tok.Value == "keep"}
+	p.advance()
+	for {
+		if p.tok.Kind != TokIDENT {
+			return nil, p.parseError("expected a label name after drop/keep, got %s", p.tok.Kind)
+		}
+		m := LabelMatcher{Label: p.tok.Value}
+		p.advance()
+		switch p.tok.Kind {
+		case TokEQ, TokNEQ, TokREQ, TokNRE:
+			m.Op = TokenToLabelOp(p.tok.Kind)
+			p.advance()
+			if p.tok.Kind != TokSTRING {
+				return nil, p.parseError("expected string value, got %s", p.tok.Kind)
+			}
+			m.Value = p.tok.Value
+			p.advance()
+		}
+		st.Labels = append(st.Labels, m)
+		if p.tok.Kind != TokCOMMA {
+			return st, nil
+		}
+		p.advance()
+	}
 }
 
 func (p *Parser) parseLabelFilter() (*LabelFilter, error) {

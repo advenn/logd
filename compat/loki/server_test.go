@@ -281,6 +281,26 @@ func TestLokiMetricQueryRange(t *testing.T) {
 	}
 }
 
+// Grafana's log-volume histogram — what Explore runs alongside every log query — ends in
+// `| drop __error__`. It was answered 400, so the histogram never rendered.
+func TestGrafanaLogVolumeQuery(t *testing.T) {
+	srv, w := setup(t)
+	h := srv.Handler()
+	body := pushJSON([]struct {
+		labels map[string]string
+		values [][2]string
+	}{{map[string]string{"region": "eu", "level": "error"}, [][2]string{{ns(1), "a"}, {ns(2), "b"}}}})
+	if rr := do(t, h, "POST", "/loki/api/v1/push", body, "application/json"); rr.Code != http.StatusNoContent {
+		t.Fatalf("push: %d", rr.Code)
+	}
+	w.Close()
+	q := `sum by (level) (count_over_time({region="eu"} | drop __error__[1m]))`
+	rr := do(t, h, "GET", "/loki/api/v1/query_range?query="+urlEncode(q)+"&start="+ns(0)+"&end="+ns(60)+"&step=60", "", "")
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"metric":{"level":"error"}`) {
+		t.Fatalf("log-volume query: %d %s", rr.Code, rr.Body.String())
+	}
+}
+
 // A real query whose text merely contains "vector(" must be evaluated, not short-circuited
 // to the health-check stub.
 func TestHealthCheckNotOverbroad(t *testing.T) {

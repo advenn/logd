@@ -50,11 +50,31 @@ func Translate(q *Query, ex *extract.Engine) ([]query.Predicate, error) {
 			// not a log-filter predicate.
 		case *ParserStage:
 			return nil, fmt.Errorf("logql: parser stage `| %s` is not supported yet", s.Parser)
+		case *LabelsStage:
+			if err := checkLabelsStage(s); err != nil {
+				return nil, err
+			}
 		default:
 			return nil, fmt.Errorf("logql: unsupported pipeline stage")
 		}
 	}
 	return preds, nil
+}
+
+// checkLabelsStage accepts the one drop/keep logd can honour: dropping __error__ and
+// __error_details__, which Grafana appends to its log-volume query. logd has no parser
+// stages, so it never sets either label and the drop is a no-op. Anything else would change
+// the labels results carry, which is not implemented, so it is refused rather than ignored.
+func checkLabelsStage(s *LabelsStage) error {
+	if s.Keep {
+		return fmt.Errorf("logql: `%s` is not supported", stageString(s))
+	}
+	for _, m := range s.Labels {
+		if m.Label != "__error__" && m.Label != "__error_details__" {
+			return fmt.Errorf("logql: `%s` is not supported: only __error__ and __error_details__ can be dropped (logd never sets them, so dropping them is a no-op)", stageString(s))
+		}
+	}
+	return nil
 }
 
 // TranslateMetric converts a parsed LogQL metric expression into a native MetricQuery.
