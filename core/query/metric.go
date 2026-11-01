@@ -70,10 +70,11 @@ const (
 	// maxMetricSteps caps the resolution of a matrix (Loki's default is ~11000); a finer
 	// step over a wide range is rejected rather than allocating per-step slices to OOM.
 	maxMetricSteps = 11000
-	// maxMetricEntries caps how many matching entries a single metric query will load
-	// (the metric path has no result limit, unlike log queries) — a coarse OOM guard.
-	maxMetricEntries = 20_000_000
 )
+
+// maxMetricEntries caps how many matching entries a single metric query will load
+// (the metric path has no result limit, unlike log queries) — a coarse OOM guard.
+var maxMetricEntries = 20_000_000
 
 type annotatedEntry struct {
 	ts  int64
@@ -118,37 +119,17 @@ func (e *Engine) ExecuteMetric(q MetricQuery) ([]MatrixSeries, error) {
 	// Gather entries that could fall in any window ([Start-Range, End]) PER SHARD, so each
 	// entry is labelled/unwrapped with its own shard's resolver (service names resolve per
 	// shard) before being merged into cross-shard streams.
-	streams := map[string]*streamGroup{}
-	total := 0
+	acc := &metricCollector{e: e, unwrap: q.Unwrap, streams: map[string]*streamGroup{}}
 	for _, sh := range e.shards {
-		r := e.resolverFor(sh)
-		entries, err := e.collectShard(sh, q.Preds, windowStart(q.Start, rng), q.End, false)
-		if err != nil {
+		acc.r = e.resolverFor(sh)
+		if err := e.collectShardInto(acc, sh, q.Preds, windowStart(q.Start, rng), q.End, false, Backward); err != nil {
 			return nil, err
 		}
-		total += len(entries)
-		if total > maxMetricEntries {
-			return nil, fmt.Errorf("metric query matched too many entries (%d, max %d) — narrow the time range or add filters", total, maxMetricEntries)
-		}
-		for _, en := range entries {
-			var val float64
-			if q.Unwrap != "" {
-				v, ok := e.unwrapValue(en, r, q.Unwrap)
-				if !ok {
-					continue // non-unwrappable entries are dropped (Loki)
-				}
-				val = v
-			}
-			labels := r.AllLabels(en)
-			key := labelKey(labels)
-			s := streams[key]
-			if s == nil {
-				s = &streamGroup{labels: labels}
-				streams[key] = s
-			}
-			s.entries = append(s.entries, annotatedEntry{ts: en.TS.UnixNano(), val: val})
+		if acc.done() {
+			return nil, fmt.Errorf("metric query matched too many entries (more than %d) — narrow the time range or add filters", maxMetricEntries)
 		}
 	}
+	streams := acc.streams
 
 	steps := stepsBetween(q.Start, step, int(n))
 	rangeSecs := float64(rng) / 1e9
@@ -177,6 +158,46 @@ func (e *Engine) ExecuteMetric(q MetricQuery) ([]MatrixSeries, error) {
 	sort.Slice(out, func(i, j int) bool { return labelKey(out[i].Labels) < labelKey(out[j].Labels) })
 	return out, nil
 }
+
+// metricCollector is the metric path's collector. It annotates each matching record as it
+// arrives — the stream it groups under and, for an unwrap, its value — and keeps only that:
+// 16 bytes per entry rather than the whole record. Once more than maxMetricEntries records
+// have matched it reports done, which stops the scan there. The cap used to be checked after
+// a shard's every matching record had been collected as a full LogEntry, so on a
+// single-shard daemon it bounded nothing.
+type metricCollector struct {
+	e       *Engine
+	r       Resolver // the resolver of the shard being collected
+	unwrap  string
+	streams map[string]*streamGroup
+	matched int
+}
+
+func (c *metricCollector) add(en model.LogEntry) {
+	if c.matched++; c.done() {
+		return
+	}
+	var val float64
+	if c.unwrap != "" {
+		v, ok := c.e.unwrapValue(en, c.r, c.unwrap)
+		if !ok {
+			return // non-unwrappable entries are dropped (Loki)
+		}
+		val = v
+	}
+	labels := c.r.AllLabels(en)
+	key := labelKey(labels)
+	s := c.streams[key]
+	if s == nil {
+		s = &streamGroup{labels: labels}
+		c.streams[key] = s
+	}
+	s.entries = append(s.entries, annotatedEntry{ts: en.TS.UnixNano(), val: val})
+}
+
+func (c *metricCollector) cutoff() (int64, bool)     { return 0, false } // every entry counts
+func (c *metricCollector) done() bool                { return c.matched > maxMetricEntries }
+func (c *metricCollector) results() []model.LogEntry { return nil }
 
 // entriesInWindow returns the annotations with ts in (lo, hi]. entries are sorted by ts.
 func entriesInWindow(entries []annotatedEntry, lo, hi int64) []annotatedEntry {

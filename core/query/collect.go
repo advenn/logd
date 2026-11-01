@@ -51,14 +51,19 @@ type collector interface {
 	// collector is full enough for that to prune anything. Callers use it to skip whole
 	// segments and pages that cannot contain a better record.
 	cutoff() (int64, bool)
+	// done reports that the collector will take no more records, so collection stops: the
+	// current scan at its next record, and no further segment is read. Only the metric
+	// collector ever says so, once it has refused the query for matching too many entries.
+	done() bool
 	results() []model.LogEntry
 }
 
 // sliceCollector keeps everything, preserving the pre-existing collect-all behaviour.
 type sliceCollector struct{ recs []model.LogEntry }
 
-func (c *sliceCollector) add(e model.LogEntry)     { c.recs = append(c.recs, e) }
-func (c *sliceCollector) cutoff() (int64, bool)    { return 0, false } // never prunes
+func (c *sliceCollector) add(e model.LogEntry)      { c.recs = append(c.recs, e) }
+func (c *sliceCollector) cutoff() (int64, bool)     { return 0, false } // never prunes
+func (c *sliceCollector) done() bool                { return false }
 func (c *sliceCollector) results() []model.LogEntry { return c.recs }
 
 // topKCollector keeps only the best `limit` records under entryLess.
@@ -86,6 +91,9 @@ func (c *topKCollector) add(e model.LogEntry) {
 		heap.Fix(&c.h, 0)
 	}
 }
+
+// done is always false: a full top-K still takes better records, and prunes by cutoff.
+func (c *topKCollector) done() bool { return false }
 
 func (c *topKCollector) cutoff() (int64, bool) {
 	if len(c.h.recs) < c.limit {

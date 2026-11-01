@@ -224,15 +224,6 @@ func (e *Engine) collectInto(acc collector, preds []Predicate, start, end int64,
 	return nil
 }
 
-// collectShard collects one shard's matching records, resolved with THAT shard's service
-// dictionary. The metric evaluator uses this so it can annotate each shard's entries with
-// the correct (per-shard) resolver before merging into cross-shard streams.
-func (e *Engine) collectShard(sh Shard, preds []Predicate, start, end int64, forceScan bool) ([]model.LogEntry, error) {
-	acc := &sliceCollector{}
-	err := e.collectShardInto(acc, sh, preds, start, end, forceScan, Backward)
-	return acc.results(), err
-}
-
 func (e *Engine) collectShardInto(acc collector, sh Shard, preds []Predicate, start, end int64, forceScan bool, dir Direction) error {
 	r := e.resolverFor(sh)
 	q := Query{Preds: preds, Direction: dir}
@@ -252,6 +243,9 @@ func (e *Engine) collectShardInto(acc collector, sh Shard, preds []Predicate, st
 	})
 
 	for _, seg := range ordered {
+		if acc.done() {
+			break
+		}
 		if cut, ok := acc.cutoff(); ok && segmentCannotBeat(seg.MinTS, seg.MaxTS, cut, dir) {
 			// Every remaining segment is ordered no better than this one, so nothing after
 			// it can beat the cutoff either.
@@ -288,7 +282,7 @@ func (e *Engine) querySegment(acc collector, seg *storage.SegmentMeta, q Query, 
 				if matchAll(q.Preds, rec, r) {
 					acc.add(rec)
 				}
-				return true
+				return !acc.done()
 			})
 		return skipIfGone(err)
 	}
@@ -325,7 +319,7 @@ func (e *Engine) querySegment(acc collector, seg *storage.SegmentMeta, q Query, 
 		if matchAll(residuals, rec, r) {
 			acc.add(rec)
 		}
-		return true
+		return !acc.done()
 	})
 	return skipIfGone(err)
 }
