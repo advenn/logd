@@ -157,6 +157,191 @@ func TestLowRateIngestStillRotates(t *testing.T) {
 	assertPrefixMatches(t, got, n)
 }
 
+// newSyncWriter returns a writer whose goroutine is never started, with its first segment
+// open. Tests use it to drive the writer goroutine's own methods (processEntry, flushPage)
+// from the test goroutine, so a failure can be injected between two records without racing
+// the goroutine. Close still flushes and seals as usual.
+func newSyncWriter(t *testing.T, dir string, opts Options) *Writer {
+	t.Helper()
+	w, err := NewWriter(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.rotateSegment(); err != nil {
+		t.Fatal(err)
+	}
+	w.resetPage()
+	return w
+}
+
+// segmentLogs lists the .log files in a shard's segments directory.
+func segmentLogs(t *testing.T, dir string) []string {
+	t.Helper()
+	logs, err := filepath.Glob(filepath.Join(dir, "segments", "*.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return logs
+}
+
+// syncWrites returns a func that appends k makeEntry records through processEntry, numbering
+// them on from the previous call, each with an int key on field "n" when keyed is set.
+func syncWrites(w *Writer, keyed bool) (write func(k int), count func() int) {
+	n := 0
+	write = func(k int) {
+		for j := 0; j < k; j++ {
+			r := record{entry: makeEntry(n, 1)}
+			if keyed {
+				r.keys = []index.KeyedValue{intKV("n", int64(n))}
+			}
+			w.processEntry(r)
+			n++
+		}
+	}
+	return write, func() int { return n }
+}
+
+// assertStillOn fails unless the writer is still appending to segment id, the manifest holds
+// only that segment (still active), and no other segment file exists.
+func assertStillOn(t *testing.T, w *Writer, dir, id, stage string) {
+	t.Helper()
+	if w.currSeg.ID != id {
+		t.Fatalf("%s: writer moved to %s although the rotation failed", stage, w.currSeg.ID)
+	}
+	if segs := w.manifest.All(); len(segs) != 1 || segs[0].ID != id || segs[0].State != SegmentActive {
+		t.Fatalf("%s: manifest should hold only the still-active segment, got %d entries", stage, len(segs))
+	}
+	if logs := segmentLogs(t, dir); len(logs) != 1 {
+		t.Fatalf("%s: the failed attempt left segment files behind: %v", stage, logs)
+	}
+}
+
+// TestFailedSegmentCreateKeepsWriting: a rotation that cannot create the next segment must
+// leave the writer on the segment it was writing, losing nothing. Rotation used to seal (and
+// close) the old segment first and only then create the next one, so one failed create —
+// EACCES here, ENOSPC in practice — left the writer holding a closed file: every later write
+// failed, every acknowledged record was dropped until a restart, and the manifest gained an
+// active entry with no file behind it.
+func TestFailedSegmentCreateKeepsWriting(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	dir := t.TempDir()
+	w := newSyncWriter(t, dir, Options{SegmentSizeBytes: 2 * PageSize, FlushInterval: time.Hour, BlockPages: -1})
+	first := w.currSeg.ID
+	write, count := syncWrites(w, false)
+
+	segDir := filepath.Join(dir, "segments")
+	if err := os.Chmod(segDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(segDir, 0o755) })
+	write(3 * entriesPerPage) // two page boundaries past the size limit
+	assertStillOn(t, w, dir, first, "create failed")
+
+	// The disk problem is gone: the next attempt rotates.
+	if err := os.Chmod(segDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w.rotateRetryAt = time.Time{} // skip the retry back-off
+	write(2 * entriesPerPage)
+	if w.currSeg.ID == first {
+		t.Fatal("rotation did not resume once the next segment could be created")
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadAll(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPrefixMatches(t, got, count())
+	for _, s := range mustManifest(t, dir).All() {
+		if s.State != SegmentSealed {
+			t.Fatalf("segment %s is %s after Close; a phantom active entry survived", s.ID, s.State)
+		}
+	}
+}
+
+// TestFailedSealKeepsWriting: when the next segment is created but the current one cannot be
+// sealed, the new files are undone and the writer keeps appending to the current segment. The
+// record whose page boundary triggered the attempt used to be dropped — after it had been
+// acknowledged — once per failed attempt.
+func TestFailedSealKeepsWriting(t *testing.T) {
+	dir := t.TempDir()
+	schema := []index.FieldType{{Name: "n", Kind: index.KindInt}}
+	w := newSyncWriter(t, dir, Options{Schema: schema, SegmentSizeBytes: 2 * PageSize, FlushInterval: time.Hour, BlockPages: -1})
+	first := w.currSeg.ID
+	write, count := syncWrites(w, true)
+
+	// A directory where the .tidx temp file must go makes the index flush, and so the seal,
+	// fail.
+	obstacle := index.TidxPath(strings.TrimSuffix(w.currSeg.Path, ".log"), "n") + ".tmp"
+	if err := os.Mkdir(obstacle, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(3 * entriesPerPage)
+	w.rotateRetryAt = time.Time{}
+	write(entriesPerPage)
+	assertStillOn(t, w, dir, first, "seal failed")
+
+	if err := os.Remove(obstacle); err != nil {
+		t.Fatal(err)
+	}
+	w.rotateRetryAt = time.Time{}
+	write(entriesPerPage)
+	if w.currSeg.ID == first {
+		t.Fatal("rotation did not resume once the segment could be sealed")
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ReadAll(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPrefixMatches(t, got, count())
+	segs := mustManifest(t, dir).All()
+	if len(segs) != 2 {
+		t.Fatalf("want the grown first segment and its successor, got %d segments", len(segs))
+	}
+	for _, s := range segs {
+		if s.State != SegmentSealed || !s.Indexed {
+			t.Fatalf("segment %s: state %s indexed=%v, want sealed and indexed", s.ID, s.State, s.Indexed)
+		}
+		r, err := index.OpenReader(index.TidxPath(strings.TrimSuffix(s.Path, ".log"), "n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if uint64(r.Count()) != s.Records {
+			t.Fatalf("segment %s: .tidx holds %d entries for %d records", s.ID, r.Count(), s.Records)
+		}
+	}
+}
+
+// TestCloseReportsFailedSeal: Close used to return nil whatever its final flush and seal did,
+// so a daemon whose last seal failed exited as if every record were safe.
+func TestCloseReportsFailedSeal(t *testing.T) {
+	dir := t.TempDir()
+	schema := []index.FieldType{{Name: "n", Kind: index.KindInt}}
+	w := newSyncWriter(t, dir, Options{Schema: schema, SegmentSizeBytes: 1 << 40, FlushInterval: time.Hour, BlockPages: -1})
+	for i := 0; i < 10; i++ {
+		w.processEntry(record{entry: makeEntry(i, 1), keys: []index.KeyedValue{intKV("n", int64(i))}})
+	}
+	obstacle := index.TidxPath(strings.TrimSuffix(w.currSeg.Path, ".log"), "n") + ".tmp"
+	if err := os.Mkdir(obstacle, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := w.Close()
+	if err == nil {
+		t.Fatal("Close returned nil although the final seal failed")
+	}
+	if again := w.Close(); again != err {
+		t.Fatalf("a second Close returned %v, want the same %v", again, err)
+	}
+}
+
 func TestSealWritesSchemaField(t *testing.T) {
 	dir := t.TempDir()
 	w, _ := NewWriter(dir, noTickOpts())

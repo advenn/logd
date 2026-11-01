@@ -171,13 +171,15 @@ func relativeSegmentPath(dir, path string) string {
 	return rel
 }
 
-// Add registers a new segment, assigning it a fresh ULID (returned in meta.ID) under the
-// lock. The caller uses meta.ID for naming, so segment naming never races with concurrent
-// readers, and the ULID is globally unique so it can't collide across shards (§10).
+// Add registers a new segment. The writer generates the ID (a ULID, globally unique so it
+// can't collide across shards, §10) and creates the segment's files under it before
+// registering it; a meta without an ID is assigned a fresh one here (returned in meta.ID).
 func (m *Manifest) Add(meta *SegmentMeta) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	meta.ID = newULID()
+	if meta.ID == "" {
+		meta.ID = newULID()
+	}
 	m.segments[meta.ID] = meta
 	m.byMinTS = append(m.byMinTS, meta)
 	m.sortLocked()

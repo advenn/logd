@@ -95,6 +95,10 @@ type Writer struct {
 	compressWG sync.WaitGroup     // in-flight background segment compressions
 	lastSync   time.Time          // when the active segment was last fsynced (group commit)
 	needsSync  bool               // a page has been written but not yet fsynced
+	// rotateRetryAt holds off the next rotation attempt after one failed (see maybeRotate).
+	rotateRetryAt time.Time
+	// closeErr is what the final flush and seal in shutdown reported, returned by Close.
+	closeErr error
 
 	// liveStreams holds the ACTIVE segment's label streams for immediate discovery
 	// (sealed segments are served from their .lidx). Concurrency-safe: written by the
@@ -401,9 +405,13 @@ func checkRecordSize(e model.LogEntry) error {
 // and persists all metadata. Idempotent and safe to call concurrently: the whole
 // cleanup (not just closing the channel) runs under closeOnce, so an explicit Close
 // racing the ctx-watcher's Close cannot double-flush/double-seal shared page state.
+//
+// It returns the error, if any, of that final flush and seal: records still in RAM when it
+// fails are not on disk, and a caller (the daemon's exit path) must be able to say so.
+// Every call returns the same result.
 func (w *Writer) Close() error {
 	w.closeOnce.Do(func() { w.shutdown(true) })
-	return nil
+	return w.closeErr
 }
 
 // stop simulates an abrupt process stop (a crash) for tests: it halts the writer
@@ -456,11 +464,15 @@ func (w *Writer) shutdown(graceful bool) {
 	if w.hdr.EntryCount > 0 {
 		if err := w.flushPage(); err != nil {
 			log.Printf("storage: flushing final page: %v", err)
+			w.closeErr = fmt.Errorf("flushing final page: %w", err)
 		}
 	}
 	if w.currSeg != nil {
 		if err := w.sealCurrentSegment(); err != nil {
 			log.Printf("storage: sealing segment on close: %v", err)
+			if w.closeErr == nil {
+				w.closeErr = fmt.Errorf("sealing segment on close: %w", err)
+			}
 		}
 	}
 	w.persistLookup()
@@ -501,9 +513,7 @@ func (w *Writer) writerLoop() {
 				// rate EVERY page goes out this way before it fills, so checking only on the
 				// page-full path let such a segment grow without bound and never seal.
 				if err == nil {
-					if err := w.maybeRotate(); err != nil {
-						log.Printf("storage: rotating segment: %v", err)
-					}
+					w.maybeRotate()
 				}
 			}
 			// Also the group-commit deadline check, so a page written just before the
@@ -550,10 +560,10 @@ func (w *Writer) processEntry(rec record) {
 			return
 		}
 		w.resetPage()
-		if err := w.maybeRotate(); err != nil {
-			log.Printf("storage: rotating segment: %v", err)
-			return
-		}
+		// A failed rotation must not cost this record: it was acknowledged when it was
+		// queued. maybeRotate leaves the active segment open in that case, so the record
+		// simply goes into it, and the segment keeps growing until a later rotation works.
+		w.maybeRotate()
 	}
 
 	// Target segment settled: intern into THIS segment's dictionary, stamp StreamID,
@@ -674,12 +684,27 @@ func (w *Writer) LiveStreams() []label.Set {
 // next segment at offsets computed for this one. Both places a page is written (a record
 // that does not fit, and the flush tick) call it, so the check cannot depend on which of
 // the two a stream's pages happen to take.
-func (w *Writer) maybeRotate() error {
+//
+// A failed rotation leaves the active segment open and active (see rotateSegment), so the
+// writer carries on appending to it and tries again at the first page boundary after
+// rotateRetryInterval. Retrying at every page instead would re-run a failing seal — which
+// rewrites every .tidx — thousands of times a second at full ingest, and log each one.
+func (w *Writer) maybeRotate() {
 	if w.currSeg.Size < w.opts.SegmentSizeBytes && !w.indexMemExceeded() {
-		return nil
+		return
 	}
-	return w.rotateSegment()
+	if time.Now().Before(w.rotateRetryAt) {
+		return
+	}
+	if err := w.rotateSegment(); err != nil {
+		w.rotateRetryAt = time.Now().Add(rotateRetryInterval)
+		log.Printf("storage: rotating segment (next attempt in %v at the earliest): %v", rotateRetryInterval, err)
+	}
 }
+
+// rotateRetryInterval is how long the writer waits after a failed rotation before trying
+// again.
+const rotateRetryInterval = time.Second
 
 // indexMemExceeded reports whether the active segment's in-RAM typed-range index has
 // grown past the configured memory budget (the dominant index-RAM consumer; the label
@@ -829,30 +854,58 @@ func (w *Writer) flushPage() error {
 
 // ---- segment lifecycle ----
 
+// rotateSegment seals the active segment (if any) and makes a fresh one active.
+//
+// The new segment's files are created BEFORE the old segment is sealed. Sealing closes the
+// old segment, and it used to come first: a failure to create the next one (ENOSPC, EACCES,
+// EMFILE) then left the writer holding a closed file, so every later page write failed with
+// "file already closed", every acknowledged record was dropped until a restart, and the
+// manifest kept an active entry with no file behind it. In this order a failure at either
+// step undoes only the new files and leaves the old segment open and active, exactly as
+// before the attempt, so the writer can keep appending to it and retry.
 func (w *Writer) rotateSegment() error {
+	// ULIDs need no coordination, so the ID — and with it the file name — is known before
+	// the manifest hears of the segment.
+	id := newULID()
+	path := SegmentPath(w.dir, id)
+	seg, err := CreateSegment(path)
+	if err != nil {
+		os.Remove(path)
+		return err
+	}
+	seg.ID = id
+
+	iw, err := OpenIndexWriter(indexPathFor(path))
+	if err != nil {
+		seg.Close()
+		os.Remove(path)
+		return fmt.Errorf("opening index writer: %w", err)
+	}
+	discard := func() {
+		iw.Close()
+		seg.Close()
+		os.Remove(indexPathFor(path))
+		os.Remove(path)
+	}
+
+	// Make the new .log/.idx directory entries durable before the manifest starts
+	// referencing them; otherwise a crash could leave a manifest naming a file whose
+	// dirent was never synced, and recovery would fail to open it.
+	if err := fsyncDir(w.segDir); err != nil {
+		discard()
+		return fmt.Errorf("fsync segments dir: %w", err)
+	}
+
 	if w.currSeg != nil {
 		if err := w.sealCurrentSegment(); err != nil {
+			discard()
 			return err
 		}
 	}
 
-	// Register first to obtain the ID under the manifest lock, then name the file
-	// from that ID (never read manifest.nextID outside the lock).
-	meta := &SegmentMeta{State: SegmentActive, MinTS: emptyMinTS, MaxTS: emptyMaxTS, Schema: []FieldSchema{}}
-	w.manifest.Add(meta)
-	meta.Path = SegmentPath(w.dir, meta.ID)
-
-	seg, err := CreateSegment(meta.Path)
-	if err != nil {
-		return err
-	}
-	seg.ID = meta.ID
-
-	iw, err := OpenIndexWriter(indexPathFor(meta.Path))
-	if err != nil {
-		seg.Close()
-		return fmt.Errorf("opening index writer: %w", err)
-	}
+	// Registered complete: every field is set before the manifest (and so a concurrent
+	// query) can see the entry.
+	w.manifest.Add(&SegmentMeta{ID: id, Path: path, State: SegmentActive, MinTS: emptyMinTS, MaxTS: emptyMaxTS, Schema: []FieldSchema{}})
 
 	w.currSeg = seg
 	w.idxWriter = iw
@@ -867,13 +920,6 @@ func (w *Writer) rotateSegment() error {
 	w.liveMu.Lock()
 	w.liveStreams = make(map[string]label.Set)
 	w.liveMu.Unlock()
-
-	// Make the new .log/.idx directory entries durable before the manifest starts
-	// referencing them; otherwise a crash could leave a manifest naming a file whose
-	// dirent was never synced, and recovery would fail to open it.
-	if err := fsyncDir(w.segDir); err != nil {
-		return fmt.Errorf("fsync segments dir: %w", err)
-	}
 
 	// Persist the manifest now so a crash right after rotation still knows this
 	// active segment exists (recovery can then reopen and repair it).
@@ -958,8 +1004,11 @@ func (w *Writer) sealCurrentSegment() error {
 		w.idxWriter = nil
 	}
 	segPath := w.currSeg.Path
+	// The seal is committed: the segment is fsynced and the manifest says it is sealed. A
+	// close error cannot undo that, and returning it would tell rotateSegment to keep
+	// writing to a segment whose descriptor is already gone.
 	if err := w.currSeg.Close(); err != nil {
-		return err
+		log.Printf("storage: closing sealed segment %s: %v", w.currSeg.ID, err)
 	}
 
 	// Compress OFF the writer goroutine. Inline, it doubled ingest latency on a 500k load
