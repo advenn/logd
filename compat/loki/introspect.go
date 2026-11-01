@@ -64,12 +64,17 @@ func kindName(k index.ValueKind) string {
 // handleIndexStats reports what this daemon is configured to extract and how those
 // templates are faring against live traffic. It is the feedback signal for tuning the
 // index list: without it, choosing templates is guesswork.
-func (s *Server) handleIndexStats(w http.ResponseWriter, _ *http.Request) {
+//
+// With multitenancy on, Labels lists only the requester's own label keys (never the
+// internal tenant label). The template counters stay daemon-wide: extraction runs once per
+// record for all tenants and keeps no per-tenant tally, and the templates themselves are
+// daemon configuration. They reveal aggregate match counts across tenants, not data.
+func (s *Server) handleIndexStats(w http.ResponseWriter, r *http.Request) {
 	resp := indexStatsResponse{
 		Templates: []templateStat{},
 		Literals:  []string{},
 		Schema:    []schemaField{},
-		Labels:    s.qe.Labels(),
+		Labels:    s.labelKeys(r),
 	}
 	if s.ex != nil {
 		for _, st := range s.ex.Stats() {

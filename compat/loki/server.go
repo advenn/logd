@@ -306,7 +306,7 @@ func (s *Server) handleTail(w http.ResponseWriter, r *http.Request) {
 				ws.writeClose(wsCloseGoingAway)
 				return
 			}
-			msg, err := json.Marshal(tailResponse{Streams: groupStreams(drainTail(ch, e)), DroppedEntries: []any{}})
+			msg, err := json.Marshal(tailResponse{Streams: s.streamsFor(drainTail(ch, e)), DroppedEntries: []any{}})
 			if err != nil {
 				return
 			}
@@ -336,6 +336,12 @@ func drainTail(ch <-chan model.LogEntry, first model.LogEntry) []model.LogEntry 
 }
 
 func (s *Server) handleLabels(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, labelResponse(s.labelKeys(r)))
+}
+
+// labelKeys lists the label keys the requester may see: its own streams' keys when
+// multitenancy is on, and never the internal tenant label.
+func (s *Server) labelKeys(r *http.Request) []string {
 	if t := s.tenant(r); t != "" {
 		seen := map[string]struct{}{}
 		for _, m := range scopeSeries(s.qe.Series(), t) {
@@ -343,19 +349,25 @@ func (s *Server) handleLabels(w http.ResponseWriter, r *http.Request) {
 				seen[k] = struct{}{}
 			}
 		}
-		writeJSON(w, labelResponse(sortedSetKeys(seen)))
-		return
+		return sortedSetKeys(seen)
 	}
-	writeJSON(w, labelResponse(s.qe.Labels()))
+	keys := s.qe.Labels()
+	out := keys[:0:0]
+	for _, k := range keys {
+		if k != model.TenantLabel {
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 func (s *Server) handleLabelValues(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
+	if name == model.TenantLabel { // don't expose the internal tenant label
+		writeJSON(w, labelResponse(nil))
+		return
+	}
 	if t := s.tenant(r); t != "" {
-		if name == model.TenantLabel { // don't expose the internal tenant label
-			writeJSON(w, labelResponse(nil))
-			return
-		}
 		seen := map[string]struct{}{}
 		for _, m := range scopeSeries(s.qe.Series(), t) {
 			if v, ok := m[name]; ok {
@@ -369,31 +381,37 @@ func (s *Server) handleLabelValues(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSeries(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]any{"status": "success", "data": s.series(r)})
+}
+
+// series lists the label sets the requester may see: its own streams when multitenancy is
+// on, each without the internal tenant label.
+func (s *Server) series(r *http.Request) []map[string]string {
 	series := s.qe.Series()
 	if t := s.tenant(r); t != "" {
-		series = scopeSeries(series, t)
+		return scopeSeries(series, t)
 	}
-	writeJSON(w, map[string]any{"status": "success", "data": series})
+	for _, m := range series {
+		delete(m, model.TenantLabel)
+	}
+	return series
 }
 
 // streamsFor groups results into Loki streams, stripping the internal tenant label from
-// the response so it never surfaces in query stream labels (Grafana would show it).
+// the response so it never surfaces in query or tail stream labels (Grafana would show
+// it). It is stripped even with multitenancy off, for data stored while it was on.
 func (s *Server) streamsFor(results []model.LogEntry) []streamResult {
 	streams := groupStreams(results)
-	if s.multitenant {
-		for i := range streams {
-			delete(streams[i].Stream, model.TenantLabel)
-		}
+	for i := range streams {
+		delete(streams[i].Stream, model.TenantLabel)
 	}
 	return streams
 }
 
 // hideTenant removes the internal tenant label from metric series labels.
 func (s *Server) hideTenant(series []query.MatrixSeries) []query.MatrixSeries {
-	if s.multitenant {
-		for _, ser := range series {
-			delete(ser.Labels, model.TenantLabel)
-		}
+	for _, ser := range series {
+		delete(ser.Labels, model.TenantLabel)
 	}
 	return series
 }

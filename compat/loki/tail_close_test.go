@@ -15,6 +15,12 @@ import (
 // positioned after the handshake.
 func dialTail(t *testing.T, ts *httptest.Server) (net.Conn, *bufio.Reader) {
 	t.Helper()
+	return dialTailAs(t, ts, "")
+}
+
+// dialTailAs is dialTail with an X-Scope-OrgID header (none when tenant is "").
+func dialTailAs(t *testing.T, ts *httptest.Server, tenant string) (net.Conn, *bufio.Reader) {
+	t.Helper()
 	host := strings.TrimPrefix(ts.URL, "http://")
 	conn, err := net.Dial("tcp", host)
 	if err != nil {
@@ -22,7 +28,11 @@ func dialTail(t *testing.T, ts *httptest.Server) (net.Conn, *bufio.Reader) {
 	}
 	t.Cleanup(func() { conn.Close() })
 	req := "GET /loki/api/v1/tail?query=" + urlEncode(`{region="eu"}`) + " HTTP/1.1\r\nHost: " + host + "\r\n" +
-		"Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+		"Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+	if tenant != "" {
+		req += "X-Scope-OrgID: " + tenant + "\r\n"
+	}
+	req += "\r\n"
 	if _, err := conn.Write([]byte(req)); err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +48,7 @@ func dialTail(t *testing.T, ts *httptest.Server) (net.Conn, *bufio.Reader) {
 	}
 }
 
-// readServerFrame reads one unmasked server frame with a 7-bit length.
+// readServerFrame reads one unmasked server frame of at most 64 KB.
 func readServerFrame(t *testing.T, conn net.Conn, br *bufio.Reader) (byte, []byte) {
 	t.Helper()
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
@@ -46,7 +56,15 @@ func readServerFrame(t *testing.T, conn net.Conn, br *bufio.Reader) (byte, []byt
 	if _, err := io.ReadFull(br, hdr[:]); err != nil {
 		t.Fatalf("read frame: %v (the server closed the socket without a Close frame)", err)
 	}
-	payload := make([]byte, hdr[1]&0x7F)
+	n := int(hdr[1] & 0x7F)
+	if n == 126 {
+		var ext [2]byte
+		if _, err := io.ReadFull(br, ext[:]); err != nil {
+			t.Fatal(err)
+		}
+		n = int(binary.BigEndian.Uint16(ext[:]))
+	}
+	payload := make([]byte, n)
 	if _, err := io.ReadFull(br, payload); err != nil {
 		t.Fatal(err)
 	}

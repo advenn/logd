@@ -63,9 +63,12 @@ func (s *Server) handleIndexStatsLoki(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, est)
 }
 
+// Streams and entries are the requester's own (the query carries the tenant predicate).
+// Chunks counts the time-pruned segments, which tenants share: it describes the store's
+// layout, not anyone's data.
 func (s *Server) estimate(r *http.Request) indexStatsResponseLoki {
 	var out indexStatsResponseLoki
-	out.Streams = uint64(len(s.qe.Series()))
+	out.Streams = uint64(len(s.series(r)))
 
 	expr := r.FormValue("query")
 	if expr == "" {
