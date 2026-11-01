@@ -5,6 +5,7 @@
 #   make load        generate a corpus and push identical bytes to all three
 #   make explain     show which access path logd chose
 #   make compare     time logd's index path against its own forced scan
+#   make pg-load     load the same corpus into PostgreSQL (both variants), print cost and size
 #   make down        tear everything down
 
 COMPOSE  ?= docker compose
@@ -23,7 +24,7 @@ VL_URL   ?= http://localhost:9428
 # including high-cardinality ones, and its stream count stops matching the others.
 VL_PUSH  ?= $(VL_URL)/insert/loki/api/v1/push?_stream_fields=app,env,region
 
-.PHONY: up down clean ps logs corpus load explain compare bench verify-loki test alloy
+.PHONY: up down clean ps logs corpus load pg-load explain compare bench verify-loki test alloy
 
 up:
 	$(COMPOSE) up -d --build
@@ -61,6 +62,12 @@ load:
 		-push=$(LOKI_URL)/loki/api/v1/push \
 		-push='$(VL_PUSH)' \
 		-label app=checkout -label env=prod -label region=eu
+
+# Load the same manifest into PostgreSQL: COPY in the push driver's 1000-line batches, both
+# the pre-structured and the unstructured variant, then load time, lines/s and sizes. Run it
+# after `make load` so PostgreSQL holds exactly what the log stores received.
+pg-load:
+	@./scripts/pg-load.sh $(CORPUS) app
 
 # Show logd's chosen access path. "mode":"index" on sealed segments is the differentiator
 # working; the active (unsealed) segment always scans by design.

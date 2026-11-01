@@ -6,6 +6,7 @@ name: logd-testbed
 #
 #   docker compose up -d            bring up the stack
 #   make corpus load                generate a corpus and push it to the three log stores
+#   make pg-load                    load the same corpus into PostgreSQL
 #   open http://localhost:3000      Explore, switch datasource, compare
 #
 # Resource limits are set on every backend deliberately. On a shared dev box an unpinned
