@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/advenn/logd/compat/loki"
+	"github.com/advenn/logd/compat/loki/push"
 	"github.com/advenn/logd/core/config"
 	"github.com/advenn/logd/core/extract"
 	"github.com/advenn/logd/core/ingest"
@@ -203,6 +204,25 @@ func TestPushStoresValidLinesRejectsOversized(t *testing.T) {
 	}
 	if len(lines) != 2 {
 		t.Fatalf("stored lines = %q, want the two that fit", lines)
+	}
+}
+
+// A push over the per-request entry cap is refused as a whole with 413, before anything is
+// stored, and says why.
+func TestPushOverEntryCapRefused(t *testing.T) {
+	srv, _ := setup(t)
+	h := srv.Handler()
+	values := make([][2]string, push.MaxEntries+1)
+	for i := range values {
+		values[i] = [2]string{ns(1), ""}
+	}
+	body := pushJSON([]struct {
+		labels map[string]string
+		values [][2]string
+	}{{map[string]string{"region": "eu"}, values}})
+	rr := do(t, h, "POST", "/loki/api/v1/push", body, "application/json")
+	if rr.Code != http.StatusRequestEntityTooLarge || !strings.Contains(rr.Body.String(), "smaller batches") {
+		t.Fatalf("push of %d entries: got %d %s, want 413", len(values), rr.Code, rr.Body.String())
 	}
 }
 

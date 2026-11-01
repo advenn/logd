@@ -6,8 +6,11 @@
 package push
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"strconv"
 	"strings"
@@ -17,6 +20,17 @@ import (
 	"github.com/golang/snappy"
 	"google.golang.org/protobuf/encoding/protowire"
 )
+
+// MaxEntries caps the entries one push request may carry. The body and decompressed-size
+// caps bound bytes, not memory: an empty protobuf entry is two bytes on the wire but a full
+// LogEntry once decoded, so a 768 KB snappy body could decode into 8M entries and allocate
+// 5.7 GB. Real shippers batch far below this (Promtail and Alloy send ~1 MB batches; the
+// testbed generator sends 1,000 entries per request), so it only refuses abuse.
+const MaxEntries = 100_000
+
+// ErrTooManyEntries is returned for a push carrying more than MaxEntries entries. Decoding
+// stops at the first entry over the cap, so the refusal itself costs bounded memory.
+var ErrTooManyEntries = fmt.Errorf("push carries more than %d entries; send it in smaller batches", MaxEntries)
 
 // Decode decodes a push request body into entries, choosing protobuf+snappy or JSON by
 // Content-Type (empty/JSON → JSON; x-protobuf → protobuf).
@@ -84,52 +98,133 @@ func toEntry(labels map[string]string, ts time.Time, line string) model.LogEntry
 
 // ---- JSON push ----
 
-type jsonPush struct {
-	Streams []struct {
-		Stream map[string]string   `json:"stream"`
-		// Each value is [ "<unix_nano>", "<line>" ] or [ "<unix_nano>", "<line>",
-		// {structured metadata} ] — the optional 3rd element carries per-entry labels.
-		Values [][]json.RawMessage `json:"values"`
-	} `json:"streams"`
+// jsonStream is one element of a JSON push's "streams" array.
+type jsonStream struct {
+	Stream map[string]string `json:"stream"`
+	// Each value is [ "<unix_nano>", "<line>" ] or [ "<unix_nano>", "<line>",
+	// {structured metadata} ] — the optional 3rd element carries per-entry labels. Kept raw
+	// so the values are decoded one at a time (see decodeJSONValues).
+	Values json.RawMessage `json:"values"`
 }
 
+// decodeJSON walks {"streams":[...]} one stream at a time and each stream's values one at
+// a time, so what is retained is the entries and nothing else. Unmarshalling the whole
+// request first held every value twice — as [][]json.RawMessage, then as a LogEntry — and a
+// 31 MB body of empty values allocated 3.8 GB before anything could refuse it.
 func decodeJSON(body []byte) ([]model.LogEntry, error) {
-	var p jsonPush
-	if err := json.Unmarshal(body, &p); err != nil {
+	var out []model.LogEntry
+	if err := decodeJSONRequest(json.NewDecoder(bytes.NewReader(body)), &out); err != nil {
+		if errors.Is(err, ErrTooManyEntries) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("loki json push: %w", err)
 	}
-	var out []model.LogEntry
-	for _, s := range p.Streams {
-		st := newStream(s.Stream)
-		for _, v := range s.Values {
-			if len(v) < 2 {
-				return nil, fmt.Errorf("loki json push: value needs [ts, line], got %d elements", len(v))
-			}
-			var tsStr, line string
-			if err := json.Unmarshal(v[0], &tsStr); err != nil {
-				return nil, fmt.Errorf("loki json push: bad timestamp: %w", err)
-			}
-			if err := json.Unmarshal(v[1], &line); err != nil {
-				return nil, fmt.Errorf("loki json push: bad line: %w", err)
-			}
-			nano, err := strconv.ParseInt(tsStr, 10, 64)
+	return out, nil
+}
+
+func decodeJSONRequest(dec *json.Decoder, out *[]model.LogEntry) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if tok != nil { // a JSON null request carries nothing, as json.Unmarshal treated it
+		if tok != json.Delim('{') {
+			return errors.New("request must be a JSON object")
+		}
+		for dec.More() {
+			key, err := dec.Token()
 			if err != nil {
-				return nil, fmt.Errorf("loki json push: bad timestamp %q: %w", tsStr, err)
+				return err
 			}
-			if len(v) >= 3 {
-				var meta map[string]string
-				if err := json.Unmarshal(v[2], &meta); err != nil {
-					return nil, fmt.Errorf("loki json push: bad structured metadata: %w", err)
+			// encoding/json matches field names case-insensitively; keep doing so.
+			if k, _ := key.(string); !strings.EqualFold(k, "streams") {
+				var skip json.RawMessage
+				if err := dec.Decode(&skip); err != nil {
+					return err
 				}
-				if len(meta) > 0 {
-					out = append(out, toEntry(mergeLabels(s.Stream, meta), time.Unix(0, nano), line))
-					continue
-				}
+				continue
 			}
-			out = append(out, st.entry(time.Unix(0, nano), line))
+			if err := decodeJSONStreams(dec, out); err != nil {
+				return err
+			}
+		}
+		if _, err := dec.Token(); err != nil { // the closing }
+			return err
 		}
 	}
-	return out, nil
+	if _, err := dec.Token(); err != io.EOF {
+		return errors.New("unexpected data after the request object")
+	}
+	return nil
+}
+
+func decodeJSONStreams(dec *json.Decoder, out *[]model.LogEntry) error {
+	tok, err := dec.Token()
+	if err != nil || tok == nil { // "streams": null is an empty push
+		return err
+	}
+	if tok != json.Delim('[') {
+		return errors.New("streams must be an array")
+	}
+	for dec.More() {
+		var s jsonStream
+		if err := dec.Decode(&s); err != nil {
+			return err
+		}
+		if err := decodeJSONValues(s, out); err != nil {
+			return err
+		}
+	}
+	_, err = dec.Token() // the closing ]
+	return err
+}
+
+// decodeJSONValues appends one stream's values to out, refusing the push once it exceeds
+// MaxEntries.
+func decodeJSONValues(s jsonStream, out *[]model.LogEntry) error {
+	if len(s.Values) == 0 || string(s.Values) == "null" {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(s.Values))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('[') {
+		return errors.New("values must be an array")
+	}
+	st := newStream(s.Stream)
+	for dec.More() {
+		if len(*out) >= MaxEntries {
+			return ErrTooManyEntries
+		}
+		var v []json.RawMessage
+		if err := dec.Decode(&v); err != nil {
+			return err
+		}
+		if len(v) < 2 {
+			return fmt.Errorf("value needs [ts, line], got %d elements", len(v))
+		}
+		var tsStr, line string
+		if err := json.Unmarshal(v[0], &tsStr); err != nil {
+			return fmt.Errorf("bad timestamp: %w", err)
+		}
+		if err := json.Unmarshal(v[1], &line); err != nil {
+			return fmt.Errorf("bad line: %w", err)
+		}
+		nano, err := strconv.ParseInt(tsStr, 10, 64)
+		if err != nil {
+			return fmt.Errorf("bad timestamp %q: %w", tsStr, err)
+		}
+		if len(v) >= 3 {
+			var meta map[string]string
+			if err := json.Unmarshal(v[2], &meta); err != nil {
+				return fmt.Errorf("bad structured metadata: %w", err)
+			}
+			if len(meta) > 0 {
+				*out = append(*out, toEntry(mergeLabels(s.Stream, meta), time.Unix(0, nano), line))
+				continue
+			}
+		}
+		*out = append(*out, st.entry(time.Unix(0, nano), line))
+	}
+	return nil
 }
 
 // ---- protobuf+snappy push ----
@@ -157,23 +252,7 @@ func decodeProto(body []byte) ([]model.LogEntry, error) {
 		if num != 1 || typ != protowire.BytesType {
 			return nil
 		}
-		labels, entries, err := decodeStream(buf)
-		if err != nil {
-			return err
-		}
-		m, err := parseLabels(labels)
-		if err != nil {
-			return err
-		}
-		st := newStream(m)
-		for _, e := range entries {
-			if len(e.meta) == 0 {
-				out = append(out, st.entry(e.ts, e.line))
-				continue
-			}
-			out = append(out, toEntry(mergeLabels(m, e.meta), e.ts, e.line))
-		}
-		return nil
+		return decodeStream(buf, &out)
 	})
 	return out, err
 }
@@ -184,21 +263,44 @@ type protoEntry struct {
 	meta map[string]string // per-entry structured metadata (EntryAdapter field 3)
 }
 
-func decodeStream(data []byte) (labels string, entries []protoEntry, err error) {
-	err = walk(data, func(num protowire.Number, buf []byte, typ protowire.Type) error {
-		switch {
-		case num == 1 && typ == protowire.BytesType:
+// decodeStream appends one StreamAdapter's entries to out, converting each straight into a
+// LogEntry rather than collecting the stream's entries into a slice of their own first, and
+// refuses the push once it exceeds MaxEntries. Converting needs the stream labels, and
+// protobuf fields may arrive in any order, so a first pass over the (already decompressed)
+// bytes finds them; skipping fields allocates nothing.
+func decodeStream(data []byte, out *[]model.LogEntry) error {
+	var labels string
+	if err := walk(data, func(num protowire.Number, buf []byte, typ protowire.Type) error {
+		if num == 1 && typ == protowire.BytesType {
 			labels = string(buf)
-		case num == 2 && typ == protowire.BytesType:
-			e, err := decodeEntry(buf)
-			if err != nil {
-				return err
-			}
-			entries = append(entries, e)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	m, err := parseLabels(labels)
+	if err != nil {
+		return err
+	}
+	st := newStream(m)
+	return walk(data, func(num protowire.Number, buf []byte, typ protowire.Type) error {
+		if num != 2 || typ != protowire.BytesType {
+			return nil
+		}
+		if len(*out) >= MaxEntries {
+			return ErrTooManyEntries
+		}
+		e, err := decodeEntry(buf)
+		if err != nil {
+			return err
+		}
+		if len(e.meta) == 0 {
+			*out = append(*out, st.entry(e.ts, e.line))
+		} else {
+			*out = append(*out, toEntry(mergeLabels(m, e.meta), e.ts, e.line))
 		}
 		return nil
 	})
-	return labels, entries, err
 }
 
 func decodeEntry(data []byte) (protoEntry, error) {

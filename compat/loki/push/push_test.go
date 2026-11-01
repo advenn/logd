@@ -2,6 +2,9 @@ package push
 
 import (
 	"encoding/binary"
+	"errors"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/advenn/logd/core/model"
@@ -178,4 +181,61 @@ func decodeProtoStream(t *testing.T, stream []byte) ([]model.LogEntry, error) {
 	req = protowire.AppendTag(req, 1, protowire.BytesType)
 	req = protowire.AppendBytes(req, stream)
 	return decodeProto(snappy.Encode(nil, req))
+}
+
+// emptyEntriesBody is a snappy+protobuf push of one stream carrying n empty EntryAdapters,
+// each two bytes on the wire: the cheapest way to make a small body decode into many
+// entries.
+func emptyEntriesBody(n int) []byte {
+	var st []byte
+	st = protowire.AppendTag(st, 1, protowire.BytesType)
+	st = protowire.AppendString(st, `{a="b"}`)
+	for i := 0; i < n; i++ {
+		st = append(st, 0x12, 0x00)
+	}
+	var req []byte
+	req = protowire.AppendTag(req, 1, protowire.BytesType)
+	req = protowire.AppendBytes(req, st)
+	return snappy.Encode(nil, req)
+}
+
+// The decompressed-size cap does not bound memory on its own: an empty entry is two bytes
+// on the wire but a full LogEntry in memory, so a 768 KB body allocated 5.7 GB. A push
+// carrying more than MaxEntries entries must be refused, and refused before it has all been
+// materialised.
+func TestDecodeRejectsTooManyEntries(t *testing.T) {
+	if _, err := Decode("application/x-protobuf", emptyEntriesBody(MaxEntries)); err != nil {
+		t.Fatalf("a push of exactly MaxEntries entries must be accepted: %v", err)
+	}
+	if _, err := Decode("application/x-protobuf", emptyEntriesBody(MaxEntries+1)); !errors.Is(err, ErrTooManyEntries) {
+		t.Fatalf("protobuf push of MaxEntries+1 entries: err = %v, want ErrTooManyEntries", err)
+	}
+
+	var b strings.Builder
+	b.WriteString(`{"streams":[{"stream":{"a":"b"},"values":[`)
+	for i := 0; i <= MaxEntries; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(`["1",""]`)
+	}
+	b.WriteString(`]}]}`)
+	if _, err := Decode("application/json", []byte(b.String())); !errors.Is(err, ErrTooManyEntries) {
+		t.Fatalf("JSON push of MaxEntries+1 entries: err = %v, want ErrTooManyEntries", err)
+	}
+
+	// The review's amplification body: 8M empty entries in ~770 KB. Decoding must stop at
+	// the cap rather than allocate gigabytes first.
+	body := emptyEntriesBody(8 << 20)
+	runtime.GC()
+	var m0, m1 runtime.MemStats
+	runtime.ReadMemStats(&m0)
+	_, err := Decode("application/x-protobuf", body)
+	runtime.ReadMemStats(&m1)
+	if !errors.Is(err, ErrTooManyEntries) {
+		t.Fatalf("8M-entry push: err = %v, want ErrTooManyEntries", err)
+	}
+	if alloc := m1.TotalAlloc - m0.TotalAlloc; alloc > 256<<20 {
+		t.Fatalf("decoding a %d KB body allocated %d MB before refusing it", len(body)>>10, alloc>>20)
+	}
 }

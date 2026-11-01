@@ -110,7 +110,11 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 	}
 	entries, err := push.Decode(r.Header.Get("Content-Type"), body)
 	if err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		code := http.StatusBadRequest
+		if errors.Is(err, push.ErrTooManyEntries) {
+			code = http.StatusRequestEntityTooLarge
+		}
+		s.writeError(w, code, err.Error())
 		return
 	}
 	if t := s.tenant(r); t != "" {
