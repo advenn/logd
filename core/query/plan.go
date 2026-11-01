@@ -96,10 +96,11 @@ func (e *Engine) plan(seg *storage.SegmentMeta, preds []Predicate) ([]plannedLoo
 				return r.LookupEqual(zeroKey), true // existence: offsets that contain the literal
 			}})
 		case LabelEqual:
-			// Only allowlisted, non-reserved keys are indexed. A non-allowlisted key
+			// Only allowlisted, non-reserved keys are pushed. A non-allowlisted key
 			// scans (resolver reads Extra); a reserved key (level/service) scans too,
-			// because the index derives it from Extra while the resolver reads the
-			// first-class field — pushing it could drop matches. An empty-string value
+			// because the resolver falls back to the first-class field when Extra lacks
+			// the key and the index (derived from Extra) holds no such value — pushing it
+			// would drop those matches. An empty-string value
 			// also scans: {k=""} matches records that LACK k (absent==empty), which the
 			// index (only records that HAVE k) can't surface. LabelNotEqual is a residual.
 			// A key whose value-cardinality cap breached in this segment has over-cap

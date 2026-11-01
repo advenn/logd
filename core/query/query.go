@@ -44,8 +44,8 @@ type Resolver interface {
 	// FieldValues returns every typed value extracted for a template field on this
 	// record (empty if the field doesn't occur).
 	FieldValues(e model.LogEntry, field string) []index.Value
-	// AllLabels returns the record's full label set (Extra labels plus the first-class
-	// level/service), for metric-query grouping.
+	// AllLabels returns the record's label set as it carries it (the Extra labels), for
+	// metric-query grouping.
 	AllLabels(e model.LogEntry) map[string]string
 }
 

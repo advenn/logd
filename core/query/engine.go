@@ -409,10 +409,22 @@ type engineResolver struct {
 	ex *extract.Engine
 }
 
-// Label resolves the first-class labels level and service, then falls back to the
-// Extra JSON blob. (Extra-as-label is a compat-era convenience; the native label index
-// arrives in Phase 6. Only string-valued Extra fields resolve.)
+// Label resolves a label key from the record's labels (the Extra blob). The reserved keys
+// level and service fall back to the first-class fields — the canonical Level, the
+// interned ServiceID — only when Extra does not carry them.
+//
+// Extra wins because it is what responses show: a Loki push keeps its stream labels in
+// Extra, and resolving the fields first made {level="error"} miss rows displayed as
+// level="error" (the field says "ERROR") and {service="api"} miss everything (the push path
+// never sets ServiceID).
 func (r *engineResolver) Label(e model.LogEntry, key string) (string, bool) {
+	// Single-key scan rather than ParseExtraLabels: this runs once per record PER label
+	// predicate on both the scan and the index re-verify paths, and building a whole map to
+	// read one key made it 28.7% of query CPU. ExtraLabel is observationally identical
+	// (differential + fuzz tested in core/model).
+	if v, ok := model.ExtraLabel(e.Extra, key); ok {
+		return v, true
+	}
 	switch key {
 	case "level":
 		return e.Level.String(), true
@@ -420,27 +432,19 @@ func (r *engineResolver) Label(e model.LogEntry, key string) (string, bool) {
 		if name, ok := r.lt.GetName(e.ServiceID); ok && name != "" {
 			return name, true
 		}
-		return "", false
-	default:
-		// Single-key scan rather than ParseExtraLabels: this runs once per record PER
-		// label predicate on both the scan and the index re-verify paths, and building a
-		// whole map to read one key made it 28.7% of query CPU. ExtraLabel is
-		// observationally identical (differential + fuzz tested in core/model).
-		return model.ExtraLabel(e.Extra, key)
 	}
+	return "", false
 }
 
-// AllLabels returns the record's full label set: the Extra labels, plus the first-class
-// level and service resolved from the record's fields (overriding any Extra value for
-// those reserved keys, consistent with Label).
+// AllLabels returns the record's label set for metric grouping: exactly the Extra labels.
+// It does not add the first-class level or service: the log path shows a stream's labels
+// as Extra carries them, so a metric over the same records must group by the same set, or
+// `sum by (level)` reports series ("INFO", or a renamed "WARN" for a pushed "warning")
+// that no stream in the log view carries.
 func (r *engineResolver) AllLabels(e model.LogEntry) map[string]string {
 	m := model.ParseExtraLabels(e.Extra)
 	if m == nil {
 		m = map[string]string{}
-	}
-	m["level"] = e.Level.String()
-	if name, ok := r.lt.GetName(e.ServiceID); ok && name != "" {
-		m["service"] = name
 	}
 	return m
 }

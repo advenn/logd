@@ -225,8 +225,8 @@ func TestShardedFanInLimitDeterministic(t *testing.T) {
 	}
 }
 
-// A metric grouped by `service` must merge correctly across shards even though each shard
-// interns the service name to its OWN ServiceID (AllLabels resolves ID→name per shard).
+// A metric grouped by `service` must merge correctly across shards: the grouping key is the
+// service label each record carries, never a per-shard interned ServiceID.
 func TestShardedFanInServiceGrouping(t *testing.T) {
 	baseT := time.Unix(1700000000, 0).UTC()
 	svcs := []string{"api", "web", "api", "db", "web", "api"}

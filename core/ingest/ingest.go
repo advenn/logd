@@ -130,9 +130,10 @@ func DeriveLabels(extra string, labelKeys []string) label.Set {
 	// purely to sort and deduplicate a handful of keys, which NewSetPairs does in place.
 	var pairs []label.Pair
 	for _, k := range labelKeys {
-		if model.IsReservedLabelKey(k) {
-			continue // level/service resolve from entry fields, never from Extra (see model)
-		}
+		// level and service are included: a value Extra carries is exactly what the query
+		// resolver returns for them, so indexing it makes them discoverable. They are never
+		// pushed down (model.IsReservedLabelKey), so the values the resolver takes from the
+		// entry fields instead, which this index lacks, cannot be dropped by a lookup.
 		v, ok := model.ExtraLabel(extra, k)
 		if !ok {
 			continue

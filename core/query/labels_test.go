@@ -15,8 +15,8 @@ import (
 	"github.com/advenn/logd/core/storage"
 )
 
-// Allowlist uses only NON-reserved keys (level/service resolve from first-class fields,
-// not Extra, so they are never indexed or pushed).
+// Allowlist uses only NON-reserved keys (level/service can resolve from first-class
+// fields, so they are never pushed).
 var labelAllowlist = []string{"region", "code"}
 
 // buildLabeled ingests a labeled dataset across several sealed segments ("trace" is
@@ -70,9 +70,10 @@ func TestLabelPushdownEqualsScan(t *testing.T) {
 	}
 }
 
-// A reserved key (service) allowlisted by mistake must still be CORRECT: it resolves from
-// the interned ServiceID (scan), never from the possibly-different Extra value, and
-// pushdown must not drop matches. This is the exact false-negative the review constructed.
+// A reserved key (service) on the allowlist must still be CORRECT when the two sources
+// disagree: Extra's value wins, the interned ServiceID answers only when Extra lacks the
+// key, and pushdown must not drop matches — the index holds only the Extra values, so a
+// lookup would miss the record that matches via ServiceID.
 func TestReservedLabelScansCorrectly(t *testing.T) {
 	dir := t.TempDir()
 	eng, _ := extract.Compile(config.IndexConfig{})
@@ -83,20 +84,24 @@ func TestReservedLabelScansCorrectly(t *testing.T) {
 	apiID := w.InternService("api")
 	// ServiceID says "api" but Extra says "web" — the two sources disagree on purpose.
 	ig.Ingest(model.LogEntry{TS: time.Unix(t0, 0).UTC(), Level: model.LogLevelInfo, ServiceID: apiID, Extra: `{"service":"web"}`, Message: "m"})
+	// ServiceID only.
+	ig.Ingest(model.LogEntry{TS: time.Unix(t0+1, 0).UTC(), Level: model.LogLevelInfo, ServiceID: apiID, Message: "n"})
 	w.Close()
 	e := qr.NewEngineWithLabels(w, eng, []string{"service"})
 
-	q := qr.Query{Start: ts(0), End: ts(1000), Preds: []qr.Predicate{qr.LabelEqual{Key: "service", Value: "api"}}}
-	idx, _ := e.Execute(q)
-	scan, _ := e.ExecuteScan(q)
-	equalResults(t, "reserved service=api", idx, scan)
-	if len(idx) != 1 {
-		t.Fatalf("service resolves from ServiceID; service=api must match the record, got %d", len(idx))
-	}
-	// Explain: reserved key must NOT push down.
-	for _, p := range e.Explain(q) {
-		if p.Mode != "scan" {
-			t.Fatalf("reserved label 'service' must scan, got %q", p.Mode)
+	for value, want := range map[string]string{"api": "n", "web": "m"} {
+		q := qr.Query{Start: ts(0), End: ts(1000), Preds: []qr.Predicate{qr.LabelEqual{Key: "service", Value: value}}}
+		idx, _ := e.Execute(q)
+		scan, _ := e.ExecuteScan(q)
+		equalResults(t, "reserved service="+value, idx, scan)
+		if len(idx) != 1 || idx[0].Message != want {
+			t.Fatalf("service=%s must match only %q, got %v", value, want, idx)
+		}
+		// Explain: reserved key must NOT push down.
+		for _, p := range e.Explain(q) {
+			if p.Mode != "scan" {
+				t.Fatalf("reserved label 'service' must scan, got %q", p.Mode)
+			}
 		}
 	}
 }
@@ -192,4 +197,91 @@ func TestLabelDegradeToScan(t *testing.T) {
 		t.Fatal(err)
 	}
 	equalResults(t, "label-degrade-to-scan", got, want)
+}
+
+// level and service carried as labels (what every Loki push does) must match, group and be
+// discovered by the value the record carries — the value responses show. They resolved from
+// the first-class fields instead: {level="error"} matched nothing while {level="ERROR"}
+// matched the rows displayed as level="error"; a metric grouped a pushed "warning" as
+// "WARN"; {service="api"} matched nothing because the push path never sets ServiceID; and
+// neither key was ever discoverable. The fields still answer when the label is absent.
+func TestReservedLabelsResolveFromRecordLabels(t *testing.T) {
+	dir := t.TempDir()
+	eng, _ := extract.Compile(config.IndexConfig{})
+	allow := []string{"app", "level", "service"}
+	w, _ := storage.NewWriter(dir, storage.Options{SegmentSizeBytes: 1 << 40, FlushInterval: time.Hour, LabelKeys: allow})
+	w.Start(nil)
+	ig := ingest.NewWithLabels(eng, w, allow)
+	worker := w.InternService("worker")
+	recs := []model.LogEntry{
+		// As push.Decode builds them: Level parsed from the label, the label kept in Extra.
+		{Level: model.LogLevelError, Extra: `{"app":"x","level":"error"}`, Message: "pushed error"},
+		{Level: model.LogLevelWarn, Extra: `{"app":"x","level":"warning"}`, Message: "pushed warning"},
+		{Level: model.LogLevelInfo, Extra: `{"app":"y"}`, Message: "no level label"},
+		{Level: model.LogLevelInfo, Extra: `{"app":"z","service":"api"}`, Message: "pushed service"},
+		// Native: level and service only as fields.
+		{Level: model.LogLevelError, ServiceID: worker, Extra: `{"app":"n"}`, Message: "native"},
+	}
+	for i, r := range recs {
+		r.TS = time.Unix(t0+int64(i), 0).UTC()
+		if err := ig.Ingest(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w.Close()
+	e := qr.NewEngineWithLabels(w, eng, allow)
+
+	cases := []struct {
+		name  string
+		preds []qr.Predicate
+		want  []string
+	}{
+		{"level=error", []qr.Predicate{qr.LabelEqual{Key: "level", Value: "error"}}, []string{"pushed error"}},
+		{"level=warning", []qr.Predicate{qr.LabelEqual{Key: "level", Value: "warning"}}, []string{"pushed warning"}},
+		{"level=WARN", []qr.Predicate{qr.LabelEqual{Key: "level", Value: "WARN"}}, nil},
+		{"level=ERROR (field, label absent)", []qr.Predicate{qr.LabelEqual{Key: "level", Value: "ERROR"}}, []string{"native"}},
+		{"service=api", []qr.Predicate{qr.LabelEqual{Key: "service", Value: "api"}}, []string{"pushed service"}},
+		{"app=z, service!=api", []qr.Predicate{qr.LabelEqual{Key: "app", Value: "z"}, qr.LabelNotEqual{Key: "service", Value: "api"}}, nil},
+		{"service=worker (field, label absent)", []qr.Predicate{qr.LabelEqual{Key: "service", Value: "worker"}}, []string{"native"}},
+	}
+	for _, c := range cases {
+		q := qr.Query{Start: ts(0), End: ts(100), Preds: c.preds, Direction: qr.Forward}
+		idx, _ := e.Execute(q)
+		scan, _ := e.ExecuteScan(q)
+		equalResults(t, c.name, idx, scan)
+		var got []string
+		for _, r := range idx {
+			got = append(got, r.Message)
+		}
+		if fmt.Sprint(got) != fmt.Sprint(c.want) {
+			t.Fatalf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+
+	// Grouping shows exactly the labels the record carries, as the log path does: no
+	// canonical level or interned service is invented for a record that lacks the label.
+	m, err := e.ExecuteMetric(qr.MetricQuery{Range: 100 * int64(time.Second), RangeOp: qr.RangeCount,
+		VectorOp: qr.VecSum, Grouping: []string{"level", "service"}, Start: ts(10), End: ts(10), Step: int64(time.Second)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	groups := map[string]float64{}
+	for _, s := range m {
+		groups[fmt.Sprint(s.Labels)] = s.Points[0].Value
+	}
+	want := map[string]float64{"map[level:error]": 1, "map[level:warning]": 1, "map[service:api]": 1, "map[]": 2}
+	if fmt.Sprint(groups) != fmt.Sprint(want) {
+		t.Fatalf("sum by (level, service): got %v, want %v", groups, want)
+	}
+
+	// Discovery lists both keys with the carried values.
+	if got := fmt.Sprint(e.Labels()); got != "[app level service]" {
+		t.Fatalf("Labels() = %s, want [app level service]", got)
+	}
+	if got := fmt.Sprint(e.LabelValues("level")); got != "[error warning]" {
+		t.Fatalf("LabelValues(level) = %s", got)
+	}
+	if got := fmt.Sprint(e.LabelValues("service")); got != "[api]" {
+		t.Fatalf("LabelValues(service) = %s", got)
+	}
 }

@@ -31,8 +31,9 @@ index:
       pattern: "took {ms:int}ms"
 
 # Label-key allowlist: only these Extra keys are indexed for fast label-equality and
-# label discovery. Everything else is scan-only. (level/service are first-class and
-# always resolved from the record's fields, never indexed.)
+# label discovery. Everything else is scan-only. (level/service resolve from the record's
+# own labels, falling back to its Level/ServiceID fields when it has none; they are listed in
+# discovery when allowlisted, but always scanned, never pushed down.)
 labels:
   - region
   - env

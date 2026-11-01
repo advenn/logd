@@ -57,11 +57,13 @@ func WithExtraLabel(extra, key, value string) string {
 	return string(b)
 }
 
-// IsReservedLabelKey reports whether a label key is resolved from a first-class record
-// FIELD rather than from Extra: "level" comes from LogEntry.Level and "service" from the
-// interned ServiceID. Such keys must NOT be indexed into the Extra-derived label index
-// nor pushed down — otherwise the index (Extra value) and the scan (field value) could
-// disagree and drop records. They are always resolved by scanning the record's fields.
+// IsReservedLabelKey reports whether a label key can resolve from a first-class record
+// FIELD: "level" from LogEntry.Level and "service" from the interned ServiceID. Extra's value
+// wins when the record carries the key; the field answers only when it does not. The
+// Extra-derived label index therefore lacks the field-resolved values, so such keys must
+// never be pushed down — an index lookup would drop the records that match via the field.
+// They are indexed like any other allowlisted key (for discovery), but always resolved by
+// scanning.
 func IsReservedLabelKey(key string) bool {
 	return key == "level" || key == "service"
 }
