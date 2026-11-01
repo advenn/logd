@@ -2,6 +2,8 @@ package loki_test
 
 import (
 	"bufio"
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"io"
 	"net"
@@ -223,6 +225,41 @@ func TestPushOverEntryCapRefused(t *testing.T) {
 	rr := do(t, h, "POST", "/loki/api/v1/push", body, "application/json")
 	if rr.Code != http.StatusRequestEntityTooLarge || !strings.Contains(rr.Body.String(), "smaller batches") {
 		t.Fatalf("push of %d entries: got %d %s, want 413", len(values), rr.Code, rr.Body.String())
+	}
+}
+
+// A gzip-encoded JSON push is accepted, as Loki accepts it; it was answered 400.
+func TestPushGzipJSON(t *testing.T) {
+	srv, w := setup(t)
+	h := srv.Handler()
+	body := pushJSON([]struct {
+		labels map[string]string
+		values [][2]string
+	}{{map[string]string{"region": "eu"}, [][2]string{{ns(1), "zipped"}}}})
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	zw.Write([]byte(body))
+	zw.Close()
+	req := httptest.NewRequest("POST", "/loki/api/v1/push", &gz)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "gzip")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("gzip JSON push: %d %s", rr.Code, rr.Body.String())
+	}
+	w.Close()
+	got := do(t, h, "GET", "/loki/api/v1/query_range?query="+urlEncode(`{region="eu"}`)+"&start="+ns(0)+"&end="+ns(10), "", "")
+	if !strings.Contains(got.Body.String(), "zipped") {
+		t.Fatalf("the gzip push was not stored: %s", got.Body.String())
+	}
+	req = httptest.NewRequest("POST", "/loki/api/v1/push", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "br")
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "not supported") {
+		t.Fatalf("br push: %d %s, want 400 not supported", rr.Code, rr.Body.String())
 	}
 }
 

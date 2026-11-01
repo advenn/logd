@@ -108,6 +108,10 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "read body: "+err.Error())
 		return
 	}
+	if body, err = push.Decompress(r.Header.Get("Content-Encoding"), body); err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	entries, err := push.Decode(r.Header.Get("Content-Type"), body)
 	if err != nil {
 		code := http.StatusBadRequest

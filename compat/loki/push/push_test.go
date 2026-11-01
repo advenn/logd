@@ -1,8 +1,12 @@
 package push
 
 import (
+	"bytes"
+	"compress/flate"
+	"compress/gzip"
 	"encoding/binary"
 	"errors"
+	"io"
 	"runtime"
 	"strings"
 	"testing"
@@ -237,5 +241,66 @@ func TestDecodeRejectsTooManyEntries(t *testing.T) {
 	}
 	if alloc := m1.TotalAlloc - m0.TotalAlloc; alloc > 256<<20 {
 		t.Fatalf("decoding a %d KB body allocated %d MB before refusing it", len(body)>>10, alloc>>20)
+	}
+}
+
+// gzip and deflate bodies are decoded, as Loki accepts them; snappy and no encoding pass
+// through (snappy is the protobuf body's own framing); anything else is refused.
+func TestDecompressEncodings(t *testing.T) {
+	body := []byte(`{"streams":[]}`)
+	var gz, fl bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	zw.Write(body)
+	zw.Close()
+	fw, _ := flate.NewWriter(&fl, flate.DefaultCompression)
+	fw.Write(body)
+	fw.Close()
+	for enc, in := range map[string][]byte{"": body, "snappy": body, "gzip": gz.Bytes(), "deflate": fl.Bytes()} {
+		got, err := Decompress(enc, in)
+		if err != nil || !bytes.Equal(got, body) {
+			t.Fatalf("Content-Encoding %q: %q, %v", enc, got, err)
+		}
+	}
+	if _, err := Decompress("br", body); err == nil || !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("br: err = %v, want not supported", err)
+	}
+	if _, err := Decompress("gzip", []byte("not gzip")); err == nil {
+		t.Fatal("a corrupt gzip body must be an error")
+	}
+}
+
+// A gzip body is held to the same decompressed-size cap as snappy.
+func TestDecompressGzipBombRejected(t *testing.T) {
+	var gz bytes.Buffer
+	zw, _ := gzip.NewWriterLevel(&gz, gzip.BestSpeed)
+	if _, err := io.CopyN(zw, zeroReader{}, maxDecompressed+1); err != nil {
+		t.Fatal(err)
+	}
+	zw.Close()
+	if _, err := Decompress("gzip", gz.Bytes()); err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("a %d KB body inflating past %d MB: err = %v", gz.Len()>>10, maxDecompressed>>20, err)
+	}
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
+}
+
+// Without a Content-Type a push is snappy-compressed protobuf, as in Loki (which decodes
+// JSON only for application/json); it used to be decoded as JSON and refused.
+func TestDecodeDefaultsToProtobuf(t *testing.T) {
+	stream := appendTestEntry(protowire.AppendString(protowire.AppendTag(nil, 1, protowire.BytesType), `{a="b"}`), 1, "hello", nil)
+	req := protowire.AppendBytes(protowire.AppendTag(nil, 1, protowire.BytesType), stream)
+	for _, ct := range []string{"", "application/x-protobuf", "application/octet-stream"} {
+		entries, err := Decode(ct, snappy.Encode(nil, req))
+		if err != nil || len(entries) != 1 || entries[0].Message != "hello" {
+			t.Fatalf("Content-Type %q: %v, %v", ct, entries, err)
+		}
+	}
+	if entries, err := Decode("application/json; charset=utf-8", []byte(`{"streams":[{"stream":{"a":"b"},"values":[["1","x"]]}]}`)); err != nil || len(entries) != 1 {
+		t.Fatalf("JSON with a charset: %v, %v", entries, err)
 	}
 }

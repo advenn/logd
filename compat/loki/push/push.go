@@ -7,10 +7,13 @@ package push
 
 import (
 	"bytes"
+	"compress/flate"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"regexp"
 	"strconv"
 	"strings"
@@ -32,13 +35,46 @@ const MaxEntries = 100_000
 // stops at the first entry over the cap, so the refusal itself costs bounded memory.
 var ErrTooManyEntries = fmt.Errorf("push carries more than %d entries; send it in smaller batches", MaxEntries)
 
-// Decode decodes a push request body into entries, choosing protobuf+snappy or JSON by
-// Content-Type (empty/JSON → JSON; x-protobuf → protobuf).
+// Decode decodes a push request body into entries, choosing by Content-Type as Loki does
+// (pkg/loghttp/push): application/json is JSON, and anything else — x-protobuf, or no
+// Content-Type at all — is snappy-compressed protobuf. A missing Content-Type used to be
+// read as JSON, so a protobuf push without one was refused.
 func Decode(contentType string, body []byte) ([]model.LogEntry, error) {
-	if strings.Contains(contentType, "application/x-protobuf") {
-		return decodeProto(body)
+	if mediaType, _, _ := mime.ParseMediaType(contentType); mediaType == "application/json" {
+		return decodeJSON(body)
 	}
-	return decodeJSON(body)
+	return decodeProto(body)
+}
+
+// Decompress undoes a push's Content-Encoding as Loki does: gzip and deflate (raw DEFLATE,
+// compress/flate, as Loki reads it) are inflated here under the same maxDecompressed cap as
+// snappy; snappy and no encoding pass through, since snappy is the protobuf body's own
+// framing and Decode undoes it. Any other encoding is refused.
+func Decompress(contentEncoding string, body []byte) ([]byte, error) {
+	var r io.ReadCloser
+	switch contentEncoding {
+	case "", "snappy":
+		return body, nil
+	case "gzip":
+		zr, err := gzip.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("gzip: %w", err)
+		}
+		r = zr
+	case "deflate":
+		r = flate.NewReader(bytes.NewReader(body))
+	default:
+		return nil, fmt.Errorf("Content-Encoding %q not supported", contentEncoding)
+	}
+	defer r.Close()
+	out, err := io.ReadAll(io.LimitReader(r, maxDecompressed+1))
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", contentEncoding, err)
+	}
+	if len(out) > maxDecompressed {
+		return nil, fmt.Errorf("push too large: decompresses to more than %d bytes", maxDecompressed)
+	}
+	return out, nil
 }
 
 // mergeLabels overlays per-entry structured metadata onto the stream labels (metadata
@@ -229,10 +265,10 @@ func decodeJSONValues(s jsonStream, out *[]model.LogEntry) error {
 
 // ---- protobuf+snappy push ----
 
-// maxDecompressed caps the snappy-decompressed push size. snappy.Decode allocates the
-// declared decompressed length BEFORE validating the payload, so an adversarial length
-// header in a tiny body could otherwise force a multi-GB allocation (decompression
-// bomb). Reject oversized declarations up front.
+// maxDecompressed caps the decompressed push size (snappy here; gzip and deflate in
+// Decompress). snappy.Decode allocates the declared decompressed length BEFORE validating
+// the payload, so an adversarial length header in a tiny body could otherwise force a
+// multi-GB allocation (decompression bomb). Reject oversized declarations up front.
 const maxDecompressed = 128 << 20 // 128 MB
 
 func decodeProto(body []byte) ([]model.LogEntry, error) {
