@@ -5,7 +5,25 @@ import (
 	"sort"
 
 	"github.com/advenn/logd/core/model"
+	"github.com/advenn/logd/core/storage"
 )
+
+// ranked is a collected record together with its shard's service dictionary, which the
+// ordering needs for its last tiebreaker (see entryLess).
+type ranked struct {
+	model.LogEntry
+	services *storage.LookupTable // nil when the record's shard is unknown (unit tests)
+}
+
+// serviceName is the record's service as a NAME. ServiceID alone is a per-shard interning
+// ID, so the same service has different IDs on different shards.
+func (r ranked) serviceName() string {
+	if r.services == nil {
+		return ""
+	}
+	name, _ := r.services.GetName(r.ServiceID)
+	return name
+}
 
 // entryLess is THE ordering for query results: event time in the requested direction,
 // then a deterministic tiebreaker on client-visible content.
@@ -17,12 +35,15 @@ import (
 // total on the compared fields is what lets the fan-in invariant (sharded == single-shard)
 // hold at a limit boundary.
 //
-// Level and ServiceID are included even though the previous comparator stopped at Extra.
+// Level and the service are included even though the previous comparator stopped at Extra.
 // equalResults (the differential oracle) compares them, so records tying on
-// (TS, Message, Extra) but differing in Level/ServiceID were previously ordered by
+// (TS, Message, Extra) but differing in Level/service were previously ordered by
 // collection order alone — latent, since no fixture produced such ties, but early
-// termination would have made it live.
-func entryLess(a, b model.LogEntry, dir Direction) bool {
+// termination would have made it live. The service is compared by name, not ServiceID:
+// the ID is interned per shard, so "auth" was ID 0 on one shard and "billing" ID 0 on
+// another, and a limit=1 over the same two records kept auth on one shard and billing on
+// two. The name is looked up only when everything else ties.
+func entryLess(a, b ranked, dir Direction) bool {
 	ta, tb := a.TS.UnixNano(), b.TS.UnixNano()
 	if ta != tb {
 		if dir == Forward {
@@ -39,14 +60,15 @@ func entryLess(a, b model.LogEntry, dir Direction) bool {
 	if a.Level != b.Level {
 		return a.Level < b.Level
 	}
-	return a.ServiceID < b.ServiceID
+	return a.serviceName() < b.serviceName()
 }
 
 // collector accumulates matching records. Two implementations: an unbounded one for the
 // metric path (which needs every entry in the window or its aggregations under-count), and
 // a bounded top-K for log queries, which is what lets the engine stop early.
 type collector interface {
-	add(model.LogEntry)
+	// add offers a matching record with the resolver of the shard it came from.
+	add(e model.LogEntry, r *engineResolver)
 	// cutoff returns the event time of the worst record currently kept, and whether the
 	// collector is full enough for that to prune anything. Callers use it to skip whole
 	// segments and pages that cannot contain a better record.
@@ -61,10 +83,10 @@ type collector interface {
 // sliceCollector keeps everything, preserving the pre-existing collect-all behaviour.
 type sliceCollector struct{ recs []model.LogEntry }
 
-func (c *sliceCollector) add(e model.LogEntry)      { c.recs = append(c.recs, e) }
-func (c *sliceCollector) cutoff() (int64, bool)     { return 0, false } // never prunes
-func (c *sliceCollector) done() bool                { return false }
-func (c *sliceCollector) results() []model.LogEntry { return c.recs }
+func (c *sliceCollector) add(e model.LogEntry, _ *engineResolver) { c.recs = append(c.recs, e) }
+func (c *sliceCollector) cutoff() (int64, bool)                   { return 0, false } // never prunes
+func (c *sliceCollector) done() bool                              { return false }
+func (c *sliceCollector) results() []model.LogEntry               { return c.recs }
 
 // topKCollector keeps only the best `limit` records under entryLess.
 //
@@ -80,14 +102,18 @@ func newTopK(limit int, dir Direction) *topKCollector {
 	return &topKCollector{limit: limit, dir: dir, h: entryHeap{dir: dir}}
 }
 
-func (c *topKCollector) add(e model.LogEntry) {
+func (c *topKCollector) add(e model.LogEntry, r *engineResolver) {
+	re := ranked{LogEntry: e}
+	if r != nil {
+		re.services = r.lt
+	}
 	if len(c.h.recs) < c.limit {
-		heap.Push(&c.h, e)
+		heap.Push(&c.h, re)
 		return
 	}
 	// Full: replace the worst only if this record is strictly better.
-	if entryLess(e, c.h.recs[0], c.dir) {
-		c.h.recs[0] = e
+	if entryLess(re, c.h.recs[0], c.dir) {
+		c.h.recs[0] = re
 		heap.Fix(&c.h, 0)
 	}
 }
@@ -103,14 +129,18 @@ func (c *topKCollector) cutoff() (int64, bool) {
 }
 
 func (c *topKCollector) results() []model.LogEntry {
-	out := make([]model.LogEntry, len(c.h.recs))
-	copy(out, c.h.recs)
-	sort.Slice(out, func(i, j int) bool { return entryLess(out[i], out[j], c.dir) })
+	sorted := make([]ranked, len(c.h.recs))
+	copy(sorted, c.h.recs)
+	sort.Slice(sorted, func(i, j int) bool { return entryLess(sorted[i], sorted[j], c.dir) })
+	out := make([]model.LogEntry, len(sorted))
+	for i := range sorted {
+		out[i] = sorted[i].LogEntry
+	}
 	return out
 }
 
 type entryHeap struct {
-	recs []model.LogEntry
+	recs []ranked
 	dir  Direction
 }
 
@@ -121,7 +151,7 @@ func (h entryHeap) Len() int { return len(h.recs) }
 func (h entryHeap) Less(i, j int) bool { return entryLess(h.recs[j], h.recs[i], h.dir) }
 func (h entryHeap) Swap(i, j int)      { h.recs[i], h.recs[j] = h.recs[j], h.recs[i] }
 
-func (h *entryHeap) Push(x any) { h.recs = append(h.recs, x.(model.LogEntry)) }
+func (h *entryHeap) Push(x any) { h.recs = append(h.recs, x.(ranked)) }
 func (h *entryHeap) Pop() any {
 	old := h.recs
 	n := len(old)

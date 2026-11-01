@@ -121,7 +121,6 @@ func (e *Engine) ExecuteMetric(q MetricQuery) ([]MatrixSeries, error) {
 	// shard) before being merged into cross-shard streams.
 	acc := &metricCollector{e: e, unwrap: q.Unwrap, streams: map[string]*streamGroup{}}
 	for _, sh := range e.shards {
-		acc.r = e.resolverFor(sh)
 		if err := e.collectShardInto(acc, sh, q.Preds, windowStart(q.Start, rng), q.End, false, Backward); err != nil {
 			return nil, err
 		}
@@ -167,25 +166,24 @@ func (e *Engine) ExecuteMetric(q MetricQuery) ([]MatrixSeries, error) {
 // single-shard daemon it bounded nothing.
 type metricCollector struct {
 	e       *Engine
-	r       Resolver // the resolver of the shard being collected
 	unwrap  string
 	streams map[string]*streamGroup
 	matched int
 }
 
-func (c *metricCollector) add(en model.LogEntry) {
+func (c *metricCollector) add(en model.LogEntry, r *engineResolver) {
 	if c.matched++; c.done() {
 		return
 	}
 	var val float64
 	if c.unwrap != "" {
-		v, ok := c.e.unwrapValue(en, c.r, c.unwrap)
+		v, ok := c.e.unwrapValue(en, r, c.unwrap)
 		if !ok {
 			return // non-unwrappable entries are dropped (Loki)
 		}
 		val = v
 	}
-	labels := c.r.AllLabels(en)
+	labels := r.AllLabels(en)
 	key := labelKey(labels)
 	s := c.streams[key]
 	if s == nil {

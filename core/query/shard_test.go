@@ -277,3 +277,51 @@ func equalStr(a, b []string) bool {
 	}
 	return true
 }
+
+// A limit that cuts a group of records identical but for their service must keep the same
+// member however the data is sharded. The last tiebreaker was ServiceID, a per-shard
+// interning ID: with one shard "auth" (ID 0) beat "billing" (ID 1), with two shards both
+// were ID 0 and the tie fell to collection order, which returned "billing".
+func TestShardedTieBreaksOnServiceName(t *testing.T) {
+	ts := time.Unix(1700000000, 0).UTC()
+	marker := map[string]time.Time{"auth": ts.Add(time.Hour), "billing": ts.Add(2 * time.Hour)}
+	build := func(n int, order []string) *qr.Engine {
+		root := t.TempDir()
+		var writers []*storage.Writer
+		var shards []qr.Shard
+		for i := 0; i < n; i++ {
+			w, err := storage.NewWriter(filepath.Join(root, fmt.Sprint(i)), storage.Options{FlushInterval: time.Hour})
+			if err != nil {
+				t.Fatal(err)
+			}
+			w.Start(nil)
+			writers, shards = append(writers, w), append(shards, w)
+		}
+		for i, svc := range order {
+			w := writers[i%n]
+			e := model.LogEntry{TS: ts, IngestedAt: marker[svc], Level: model.LogLevelInfo, Message: "same line"}
+			e.ServiceID = w.InternService(svc)
+			if err := w.Write(e); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, w := range writers {
+			w.Close()
+		}
+		return qr.NewShardedEngine(shards, nil, nil)
+	}
+	for _, layout := range []struct {
+		shards int
+		order  []string
+	}{{1, []string{"auth", "billing"}}, {1, []string{"billing", "auth"}}, {2, []string{"billing", "auth"}}, {2, []string{"auth", "billing"}}} {
+		for _, dir := range []qr.Direction{qr.Forward, qr.Backward} {
+			res, err := build(layout.shards, layout.order).Execute(qr.Query{Limit: 1, Direction: dir})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(res) != 1 || !res[0].IngestedAt.Equal(marker["auth"]) {
+				t.Fatalf("shards=%d order=%v dir=%d: limit=1 kept %v, want the auth record", layout.shards, layout.order, dir, res)
+			}
+		}
+	}
+}

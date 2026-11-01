@@ -38,7 +38,11 @@ func (e *Engine) executeCollectAll(q Query) ([]model.LogEntry, error) {
 	if err != nil {
 		return out, err
 	}
-	sort.SliceStable(out, func(i, j int) bool { return entryLess(out[i], out[j], q.Direction) })
+	// The fixture is single-shard, so every record's service resolves through shard 0.
+	services := e.shards[0].ServiceLookup()
+	sort.SliceStable(out, func(i, j int) bool {
+		return entryLess(ranked{out[i], services}, ranked{out[j], services}, q.Direction)
+	})
 	if len(out) > limit {
 		out = out[:limit]
 	}
@@ -205,7 +209,7 @@ func TestTopKCollectorOrdering(t *testing.T) {
 		t.Error("an unfilled collector must not prune")
 	}
 	for _, e := range []model.LogEntry{mk(1, "a"), mk(5, "b"), mk(3, "c"), mk(9, "d"), mk(2, "e")} {
-		c.add(e)
+		c.add(e, nil)
 	}
 	got := messages(c.results())
 	if len(got) != 3 || got[0] != "d" || got[1] != "b" || got[2] != "c" {
@@ -226,11 +230,11 @@ func TestTopKTiesBrokenByContent(t *testing.T) {
 	}
 	forward := newTopK(2, Backward)
 	for _, m := range []string{"zeta", "alpha", "mid"} {
-		forward.add(mk(m))
+		forward.add(mk(m), nil)
 	}
 	reversed := newTopK(2, Backward)
 	for _, m := range []string{"mid", "alpha", "zeta"} { // same set, different arrival order
-		reversed.add(mk(m))
+		reversed.add(mk(m), nil)
 	}
 	a, b := messages(forward.results()), messages(reversed.results())
 	if len(a) != 2 || a[0] != "alpha" || a[1] != "mid" {

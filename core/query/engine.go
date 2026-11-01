@@ -262,7 +262,7 @@ func (e *Engine) collectShardInto(acc collector, sh Shard, preds []Predicate, st
 // pushdown when the planner finds pushable predicates and the segment is indexed;
 // otherwise (or on any .tidx error) it scans. Either way the survivors are re-verified
 // against the FULL predicate set, so the two paths return identical results.
-func (e *Engine) querySegment(acc collector, seg *storage.SegmentMeta, q Query, start, end int64, r Resolver, forceScan bool) error {
+func (e *Engine) querySegment(acc collector, seg *storage.SegmentMeta, q Query, start, end int64, r *engineResolver, forceScan bool) error {
 	scan := func() error {
 		// Walk pages in the query's direction so a bounded accumulator fills from the pages
 		// it will actually keep, and prune pages that cannot beat what it already holds.
@@ -280,7 +280,7 @@ func (e *Engine) querySegment(acc collector, seg *storage.SegmentMeta, q Query, 
 		err := storage.ScanSegmentPages(seg.Path, start, end, q.Direction == Backward, skipPage,
 			func(rec model.LogEntry) bool {
 				if matchAll(q.Preds, rec, r) {
-					acc.add(rec)
+					acc.add(rec, r)
 				}
 				return !acc.done()
 			})
@@ -317,7 +317,7 @@ func (e *Engine) querySegment(acc collector, seg *storage.SegmentMeta, q Query, 
 			return true
 		}
 		if matchAll(residuals, rec, r) {
-			acc.add(rec)
+			acc.add(rec, r)
 		}
 		return !acc.done()
 	})
@@ -393,7 +393,7 @@ func (e *Engine) mergedTail(preds []Predicate, buffer int) (<-chan model.LogEntr
 	}
 }
 
-func (e *Engine) resolverFor(sh Shard) Resolver {
+func (e *Engine) resolverFor(sh Shard) *engineResolver {
 	return &engineResolver{lt: sh.ServiceLookup(), ex: e.ex}
 }
 
