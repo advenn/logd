@@ -1,6 +1,7 @@
 package query
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/advenn/logd/core/index"
@@ -108,5 +109,47 @@ func TestReaderCacheInsertRaceKeepsOneEntry(t *testing.T) {
 	c.insert(entryOfSize("a", 100)) // the loser of the race
 	if n, used, _ := c.Stats(); n != 1 || used != 100 {
 		t.Errorf("duplicate insert double-counted: %d entries / %d bytes", n, used)
+	}
+}
+
+// TestReaderCacheReloadsRewrittenSidecar: a path is not a version. A seal that fails after
+// writing a segment's sidecars is retried later and rewrites them with the records appended
+// since; a reader cached under the path alone kept answering from the first version, so a
+// pushed-down predicate missed every record added in between.
+func TestReaderCacheReloadsRewrittenSidecar(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "seg-1.n.tidx")
+	write := func(n int) {
+		t.Helper()
+		entries := make([]index.Entry, n)
+		for i := range entries {
+			entries[i] = index.Entry{Key: index.EncodeKey(index.Value{Kind: index.KindInt, Int: int64(i)}), Offset: uint64(i)}
+		}
+		if err := index.WriteTIDX(path, index.KindInt, 0, entries); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := newReaderCache(1 << 20)
+
+	write(3)
+	first, err := c.tidx(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Count() != 3 {
+		t.Fatalf("first load: %d entries, want 3", first.Count())
+	}
+	write(5) // the retried seal's rewrite (an atomic rename, as every sidecar write is)
+	r, err := c.tidx(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Count() != 5 {
+		t.Fatalf("served the cached reader for the replaced file: %d entries, want 5", r.Count())
+	}
+	if n, _, _ := c.Stats(); n != 1 {
+		t.Fatalf("the replaced file's reader should have been dropped, cache holds %d entries", n)
+	}
+	if again, _ := c.tidx(path); again != r {
+		t.Fatal("an unchanged file must still be served from the cache")
 	}
 }

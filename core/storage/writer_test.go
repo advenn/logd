@@ -320,6 +320,47 @@ func TestFailedSealKeepsWriting(t *testing.T) {
 	}
 }
 
+// TestFailedSealSaveLeavesSegmentActive: a seal whose manifest save fails must not be visible
+// in memory either. It used to be applied first and saved second, so after a failed save the
+// live manifest said "sealed, indexed" while the writer kept appending to the segment — and
+// the planner pushed predicates into a .tidx missing every later record.
+func TestFailedSealSaveLeavesSegmentActive(t *testing.T) {
+	dir := t.TempDir()
+	schema := []index.FieldType{{Name: "n", Kind: index.KindInt}}
+	w := newSyncWriter(t, dir, Options{Schema: schema, SegmentSizeBytes: 2 * PageSize, FlushInterval: time.Hour, BlockPages: -1})
+	first := w.currSeg.ID
+	write, count := syncWrites(w, true)
+
+	// A directory where the manifest's temp file must go makes the save fail.
+	obstacle := filepath.Join(dir, "manifest.json.tmp")
+	if err := os.Mkdir(obstacle, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(entriesPerPage + 1) // one page boundary at the size limit: the seal runs, its save fails
+	if s := w.manifest.Get(first); s == nil || s.State != SegmentActive || s.Indexed {
+		t.Fatalf("after a failed seal save the segment reads as %+v, want active and not indexed", s)
+	}
+	write(entriesPerPage) // the writer keeps appending to it
+
+	if err := os.Remove(obstacle); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s := mustManifest(t, dir).Get(first)
+	if s == nil || s.State != SegmentSealed || s.Records != uint64(count()) {
+		t.Fatalf("after Close the segment reads as %+v, want sealed with all %d records", s, count())
+	}
+	r, err := index.OpenReader(index.TidxPath(strings.TrimSuffix(s.Path, ".log"), "n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Count() != count() {
+		t.Fatalf(".tidx holds %d entries for %d records", r.Count(), count())
+	}
+}
+
 // TestCloseReportsFailedSeal: Close used to return nil whatever its final flush and seal did,
 // so a daemon whose last seal failed exited as if every record were safe.
 func TestCloseReportsFailedSeal(t *testing.T) {

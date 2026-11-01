@@ -994,8 +994,9 @@ func (w *Writer) sealCurrentSegment() error {
 		sort.Strings(info.LabelKeys)
 		info.LabelKeysRecorded = true
 	}
-	w.manifest.SealSegment(w.currSeg.ID, info)
-	if err := w.manifest.Save(w.dir); err != nil {
+	// Saved before it is applied in memory: if the save fails, the segment stays active
+	// everywhere, which is the truth, since the writer goes on appending to it.
+	if err := w.manifest.SealSegment(w.dir, w.currSeg.ID, info); err != nil {
 		return fmt.Errorf("saving manifest after seal: %w", err)
 	}
 

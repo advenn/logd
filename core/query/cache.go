@@ -2,6 +2,7 @@ package query
 
 import (
 	"container/list"
+	"os"
 	"sync"
 
 	"github.com/advenn/logd/core/index"
@@ -17,9 +18,15 @@ import (
 // re-read ~29 MB and re-decoded ~1.2M entries before doing any useful work. That is why a
 // broad indexed query measured SLOWER than simply scanning the segment.
 //
-// Caching is safe because sealed segments are immutable: a .tidx/.lidx is written once at
-// seal and never modified, so a reader for a given path is valid for as long as the file
-// exists.
+// A sealed segment's sidecars are immutable, but a path is not proof of that: a seal that
+// failed after writing them is retried later, rewriting both with the records appended in
+// between, and a .lidx left by such an attempt is visible to label discovery while the
+// segment is still active. A reader keyed by path alone kept serving the first version
+// after the rewrite — a .tidx or .lidx missing every later record, i.e. false negatives on
+// pushdown. So each entry remembers the file it was loaded from, and a hit counts only
+// while the path still names that same file (see sameFile). The sidecars are always
+// replaced by an atomic rename, so a rewrite is a new file; the check costs one stat per
+// use.
 //
 // Retention deleting a segment is NOT a correctness problem here, which is worth stating
 // because it looks like one. The query path only visits segments returned by
@@ -42,9 +49,18 @@ type readerCache struct {
 
 type cacheEntry struct {
 	path string
+	info os.FileInfo // the file the reader was loaded from, stat'ed BEFORE reading it
 	size int64
 	tidx *index.Reader
 	lidx *label.Reader
+}
+
+// sameFile reports whether the file at path is still the one entry e was loaded from. The
+// stat is taken before the load, so a file replaced mid-load is recorded under its old
+// identity and is merely reloaded next time — never served stale.
+func (e *cacheEntry) sameFile(cur os.FileInfo) bool {
+	return e.info != nil && os.SameFile(e.info, cur) &&
+		e.info.Size() == cur.Size() && e.info.ModTime().Equal(cur.ModTime())
 }
 
 // defaultIndexCacheBytes is the budget when a caller does not set one. Sized so a handful
@@ -84,9 +100,16 @@ func (c *readerCache) insert(e *cacheEntry) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if el, ok := c.items[e.path]; ok { // lost a load race: keep the existing entry
-		c.ll.MoveToFront(el)
-		return
+	if el, ok := c.items[e.path]; ok {
+		old := el.Value.(*cacheEntry)
+		if e.info == nil || old.info != nil && os.SameFile(old.info, e.info) {
+			c.ll.MoveToFront(el) // lost a load race: keep the existing entry
+			return
+		}
+		// The file was replaced since the cached reader was loaded: this one supersedes it.
+		c.ll.Remove(el)
+		delete(c.items, old.path)
+		c.used -= old.size
 	}
 	el := c.ll.PushFront(e)
 	c.items[e.path] = el
@@ -123,27 +146,35 @@ func (c *readerCache) Forget(segBase string) {
 
 // tidx returns a typed-range reader for path, from cache when possible.
 func (c *readerCache) tidx(path string) (*index.Reader, error) {
-	if e, ok := c.lookup(path); ok && e.tidx != nil {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if e, ok := c.lookup(path); ok && e.tidx != nil && e.sameFile(info) {
 		return e.tidx, nil
 	}
 	r, err := index.OpenReader(path)
 	if err != nil {
 		return nil, err
 	}
-	c.insert(&cacheEntry{path: path, size: r.SizeBytes(), tidx: r})
+	c.insert(&cacheEntry{path: path, info: info, size: r.SizeBytes(), tidx: r})
 	return r, nil
 }
 
 // lidx returns a label reader for path, from cache when possible.
 func (c *readerCache) lidx(path string) (*label.Reader, error) {
-	if e, ok := c.lookup(path); ok && e.lidx != nil {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if e, ok := c.lookup(path); ok && e.lidx != nil && e.sameFile(info) {
 		return e.lidx, nil
 	}
 	r, err := label.OpenReader(path)
 	if err != nil {
 		return nil, err
 	}
-	c.insert(&cacheEntry{path: path, size: r.SizeBytes(), lidx: r})
+	c.insert(&cacheEntry{path: path, info: info, size: r.SizeBytes(), lidx: r})
 	return r, nil
 }
 

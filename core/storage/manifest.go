@@ -212,21 +212,39 @@ func (m *Manifest) SetBounds(id string, minTS, maxTS int64) {
 }
 
 // SealSegment finalizes a segment's bounds, records the schema it was actually
-// indexed with, and flips it to sealed — all under the write lock. Callers must NOT
-// mutate SegmentMeta fields directly: doing so races concurrent readers (Filter/Save)
-// that read those fields. The schema is the set of fields that have a .tidx for this
-// segment; an empty schema means "scan this segment" (design §7.3), which is how a
-// crash-recovered segment (whose in-RAM index was incomplete) is marked.
-func (m *Manifest) SealSegment(id string, info SealInfo) {
+// indexed with, and flips it to sealed, persisting the result to dir/manifest.json.
+// Callers must NOT mutate SegmentMeta fields directly: doing so races concurrent
+// readers (Filter/Save) that read those fields. The schema is the set of fields that
+// have a .tidx for this segment; an empty schema means "scan this segment" (design
+// §7.3), which is how a crash-recovered segment (whose in-RAM index was incomplete) is
+// marked.
+//
+// The seal is saved FIRST and applied in memory only once that succeeded. Applied first,
+// a failed save left the live manifest saying "sealed, indexed" while the writer, whose
+// seal had failed, kept appending to the segment: the planner then pushed predicates into
+// a .tidx that lacked every later record, and returned fewer rows than a scan. Nothing
+// else mutates the manifest between the save and the commit — every mutation runs on the
+// writer goroutine, which is the one sealing — so the saved file is exactly the state
+// committed after it.
+func (m *Manifest) SealSegment(dir, id string, info SealInfo) error {
+	if err := m.save(dir, id, &info); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s, ok := m.segments[id]; ok {
-		s.State = SegmentSealed
-		s.MinTS, s.MaxTS = info.MinTS, info.MaxTS
-		s.Schema, s.Indexed, s.Records, s.CappedKeys = info.Schema, info.Indexed, info.Records, info.CappedKeys
-		s.LabelKeys, s.LabelKeysRecorded = info.LabelKeys, info.LabelKeysRecorded
+		info.applyTo(s)
 		m.sortLocked()
 	}
+	return nil
+}
+
+// applyTo marks s sealed with the bounds and index facts in info.
+func (info *SealInfo) applyTo(s *SegmentMeta) {
+	s.State = SegmentSealed
+	s.MinTS, s.MaxTS = info.MinTS, info.MaxTS
+	s.Schema, s.Indexed, s.Records, s.CappedKeys = info.Schema, info.Indexed, info.Records, info.CappedKeys
+	s.LabelKeys, s.LabelKeysRecorded = info.LabelKeys, info.LabelKeysRecorded
 }
 
 // Remove deletes a segment from the manifest (used by retention). Returns the removed
@@ -308,6 +326,12 @@ func (m *Manifest) Get(id string) *SegmentMeta {
 // itself is durable (a rename can otherwise be lost on crash even though the temp
 // file's bytes are on disk). This is the atomic-seal guarantee of §7.5.
 func (m *Manifest) Save(dir string) error {
+	return m.save(dir, "", nil)
+}
+
+// save is Save, except that when seal is non-nil the segment sealID is written as seal
+// describes it rather than as it is in memory (see SealSegment).
+func (m *Manifest) save(dir, sealID string, seal *SealInfo) error {
 	// Marshal while holding the read lock so a concurrent writer cannot mutate a
 	// *SegmentMeta's fields mid-serialization (a torn read). Save is not on the hot
 	// path (seal/rotate/recovery only), so holding the lock across marshal is fine.
@@ -317,6 +341,9 @@ func (m *Manifest) Save(dir string) error {
 	out := make([]SegmentMeta, len(m.byMinTS))
 	for i, s := range m.byMinTS {
 		out[i] = *s
+		if seal != nil && s.ID == sealID {
+			seal.applyTo(&out[i])
+		}
 		out[i].Path = relativeSegmentPath(dir, s.Path)
 	}
 	data, err := json.MarshalIndent(out, "", "  ")

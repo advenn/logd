@@ -458,3 +458,69 @@ func TestDegradeToScanWhenIndexMissing(t *testing.T) {
 	}
 	equalResults(t, "degrade-to-scan", got, want)
 }
+
+// TestFailedSealPushdownEqualsScan: a seal whose manifest save failed used to be applied in
+// memory anyway. The writer, whose seal had failed, kept appending to the segment, while the
+// planner pushed predicates into the .tidx the attempt had written — missing every later
+// record — and the reader cache kept serving that .tidx even after a later seal rewrote it.
+func TestFailedSealPushdownEqualsScan(t *testing.T) {
+	dir := t.TempDir()
+	eng, err := extract.Compile(config.IndexConfig{Templates: []config.Template{{Name: "latency", Pattern: "took {ms:int}ms"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := storage.NewWriter(dir, storage.Options{Schema: eng.IndexedFields(), SegmentSizeBytes: 3 * storage.PageSize, FlushInterval: time.Hour, BlockPages: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Start(nil)
+	ig := ingest.New(eng, w)
+	e := qr.NewEngine(w, eng)
+	put := func(from, to int) {
+		t.Helper()
+		for i := from; i < to; i++ {
+			lat := 100
+			if i%10 == 0 {
+				lat = 500
+			}
+			msg := fmt.Sprintf("req %04d took %dms padding-padding-padding-padding-padding-padding", i, lat)
+			if err := ig.Ingest(model.LogEntry{TS: time.Unix(t0+int64(i), 0).UTC(), Level: model.LogLevelInfo, Message: msg}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	q := qr.Query{Start: ts(0), End: ts(1000), Limit: 100000, Preds: []qr.Predicate{qr.TypedCompare{Field: "latency_ms", Op: qr.OpGt, Value: intV(200)}}}
+	check := func(stage string) {
+		t.Helper()
+		idx, err := e.Execute(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scan, err := e.ExecuteScan(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		equalResults(t, stage, idx, scan)
+	}
+
+	put(0, 60) // under the size limit
+	// A directory where the manifest's temp file must go makes the next save fail.
+	obstacle := filepath.Join(dir, "manifest.json.tmp")
+	if err := os.Mkdir(obstacle, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	put(60, 140)                       // crosses the limit: the seal runs, its save fails
+	time.Sleep(100 * time.Millisecond) // let the writer get there, and past it
+	check("after a failed seal")
+
+	if err := os.Remove(obstacle); err != nil {
+		t.Fatal(err)
+	}
+	put(140, 400)
+	time.Sleep(100 * time.Millisecond)
+	check("after more writes")
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	check("after the seal succeeded")
+}
