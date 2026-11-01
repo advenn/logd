@@ -1,14 +1,19 @@
-# logd testbed — head-to-head with Loki and VictoriaLogs
+# logd testbed — head-to-head with Loki, VictoriaLogs and PostgreSQL
 
 One `docker compose up` brings up **logd, Grafana Loki, VictoriaLogs and Grafana**, feeds
 all three identical traffic, and lets you compare them on the same queries in the same UI.
+**PostgreSQL** runs alongside as the relational baseline, loaded from the same manifest and
+queried over HTTP through a small shim, so the harness can time it the same way.
 
 ```sh
-make up          # logd + Loki + VictoriaLogs + Grafana
-make load        # generate a corpus, push identical bytes to all three
+make up          # logd + Loki + VictoriaLogs + PostgreSQL (+ shim) + Grafana
+make load        # generate a corpus, push identical bytes to all three log stores
+make pg-load     # load the same corpus into PostgreSQL, print load time and sizes
+make gate        # every engine's row count against the manifest's ground truth
 make explain     # which access path did logd choose?
 make compare     # logd's index path vs its own forced scan
 make bench       # interleaved latency across logd, Loki and VictoriaLogs
+make hdfs        # the Loghub HDFS replay, end to end (destructive: fresh volumes)
 open http://localhost:3000    # Explore → switch datasource → same query, three engines
 ```
 
@@ -304,6 +309,214 @@ Loki and VictoriaLogs do and what shippers already expect. Pinned by
 
 ---
 
+## PostgreSQL baseline (E-3)
+
+The question it answers: *why not just use PostgreSQL with an extracted column and a B-tree?*
+So it is configured the way a competent DBA would configure a small dedicated box — every
+deviation from the defaults is commented in `stack/postgres/postgresql.conf` — and gets the
+same 2 CPUs / 3 GB as the other backends. Image: `postgres:17` pinned by digest (17.11).
+
+### Schema: two variants, one database
+
+`stack/postgres/schema.sql`, with the reasoning inline. Both variants share one server, one
+buffer pool and one config, and differ only in how the value is stored:
+
+| table | variant | value | indexes |
+|---|---|---|---|
+| `logs` | **pre-structured** | `latency_ms integer GENERATED ALWAYS AS ((substring(line FROM 'took=([0-9]+)ms'))::integer) STORED` | `(latency_ms, ts_ns) WHERE latency_ms IS NOT NULL`, `(ts_ns)` |
+| `logs_raw` | **unstructured** | extracted at query time with the same expression | `(ts_ns)` |
+| `hdfs_logs` / `hdfs_logs_raw` | the same, for the HDFS replay | `size_bytes bigint … 'size ([0-9]+)'` | the same shapes |
+
+- **The pre-structured variant is what a DBA would deploy** for a field known up front, and it
+  needs exactly the up-front knowledge a logd template needs. The unstructured one is the
+  fallback for a question nobody anticipated — PostgreSQL's scan, the counterpart of logd's
+  forced scan.
+- **Generated column, not loader extraction**, so PostgreSQL pays for its own extraction at
+  insert, as logd does at ingest. Adding one to an existing table rewrites it under an exclusive
+  lock; for that case the right tool is an expression index built `CONCURRENTLY`.
+- **`(latency_ms, ts_ns)`**: the value predicate is the selective one, so it leads; `ts_ns`
+  second lets the time window be checked inside the index (it changes nothing when the window
+  covers the table, as here, and is what keeps "slow requests in the last hour" cheap over
+  weeks of data). **Partial**, because 19% of corpus lines and 68% of HDFS lines carry no value,
+  and every comparison implies `IS NOT NULL`.
+- **Labels in a `streams` dictionary**, not a jsonb per row (58 bytes per line for
+  `{app, env, region}`, over a quarter of what the row would be). **`ts_ns bigint`**, not `timestamptz`, which
+  cannot hold the manifest's nanosecond primary key.
+- **Partitioning by time** (daily, `DROP PARTITION` for retention) is how production would
+  expire data; it is described in the schema and not used, because the corpora span minutes.
+
+### Loading: `make pg-load` / `scripts/pg-load.sh`
+
+`cmd/pgload` COPYs the manifest in the push driver's 1,000-line batches, each its own
+transaction (durable when COPY returns: `synchronous_commit` is left on), with the indexes in
+place, each variant alone on the server. Every load starts from a `CHECKPOINT`; `VACUUM (ANALYZE)`
+runs after it and is timed separately. It fails if the generated column extracted a value from a
+different number of rows than the manifest says carry one.
+
+One run each, on the shared dev box (load average 4–8 during the run) — directional:
+
+| dataset | variant | load | lines/s | WAL written | heap | indexes | **total** |
+|---|---|---:|---:|---:|---:|---:|---:|
+| corpus, 500k | structured | 7.58 s | 65,936 | 128.5 MB | 74.6 MB | 26.4 MB (value 15.2, ts 11.3) | **101.0 MB** |
+| corpus, 500k | unstructured | 3.59 s | 139,218 | 94.4 MB | 72.8 MB | 11.3 MB | **84.1 MB** |
+| HDFS, 2M | structured | 17.85 s | 112,016 | 512.9 MB | 378.9 MB | 65.4 MB (value 20.5, ts 44.9) | **444.3 MB** |
+| HDFS, 2M | unstructured | 11.27 s | 177,468 | 456.7 MB | 372.7 MB | 44.9 MB | **417.7 MB** |
+
+MB = 10⁶ bytes; total = `pg_total_relation_size`, WAL excluded. For scale, the 2026-09-27 run
+measured logd at 15.6 MB, Loki at 10.4 MB (flushed) and VictoriaLogs at 8.1 MB for a 500k corpus
+from the same seed. PostgreSQL's heap is uncompressed — a row is only TOAST-compressed once it
+exceeds ~2 KB — and each line carries a 24-byte tuple header and a 4-byte line pointer.
+
+### Querying: `pgshim` on port 7300
+
+Every other engine is timed over HTTP including result serialisation, so PostgreSQL is too:
+`cmd/pgshim` runs the query, groups rows into streams and returns Loki's JSON, newest first
+with the limit applied (Loki's backward direction). The query is one whitelisted predicate —
+`<field> <op> <integer>`, op one of `> >= < <= =` — parsed strictly and always bound as a
+parameter; nothing from the request becomes SQL. The variant is required and travels in the
+URL, which is how bench-vs.sh passes engine-specific parameters:
+
+```
+GET http://localhost:7300/loki/api/v1/query_range?variant=structured     query=latency_ms > 200
+GET http://localhost:7300/loki/api/v1/query_range?variant=unstructured   query=latency_ms > 200
+    &start=<ns>&end=<ns>&limit=<n>    (window [start, end); limit default 100)
+GET http://localhost:7300/loki/api/v1/query_range?variant=structured&dataset=hdfs    query=size_bytes < 90000
+```
+
+As bench-vs.sh rows:
+
+```sh
+add "PostgreSQL (structured)"   "http://localhost:7300/loki/api/v1/query_range?variant=structured"   "latency_ms > $T" loki
+add "PostgreSQL (unstructured)" "http://localhost:7300/loki/api/v1/query_range?variant=unstructured" "latency_ms > $T" loki
+```
+
+The SQL behind them (`internal/pgdata`, held to `schema.sql` by a test):
+
+```sql
+-- structured
+SELECT stream_id, ts_ns, line FROM logs WHERE latency_ms > $1::bigint
+  AND ts_ns >= $2 AND ts_ns < $3 ORDER BY ts_ns DESC LIMIT $4
+-- unstructured: the LIKE prefilter is the counterpart of Loki's |= "took="
+SELECT stream_id, ts_ns, line FROM logs_raw WHERE line LIKE '%took=%'
+  AND (substring(line FROM 'took=([0-9]+)ms'))::integer > $1::bigint
+  AND ts_ns >= $2 AND ts_ns < $3 ORDER BY ts_ns DESC LIMIT $4
+```
+
+**Correctness:** both variants return the manifest's exact rows (not just counts) at every
+threshold — 27,089 / 3,861 / 1,066 / 469 on the 500k corpus, and the HDFS counts below.
+
+What the planner does (`EXPLAIN ANALYZE`, server side, 500k corpus): the structured variant is a
+bitmap scan of the partial index plus an in-memory sort — 38.7 ms at 5.4%, 0.8 ms at 0.094%. The
+unstructured app query walks the `ts_ns` index backwards evaluating the regex per row
+(2.14 s at 5.4%, single process); forcing a parallel seq scan would be 1.63 s, and is not done,
+because that would be tuning the planner per query. On the 2M-line HDFS table the planner picks the
+parallel seq scan itself (1.1 s). JIT stays at its default and never fires: the costliest plan is
+costed just under `jit_above_cost`.
+
+**Fairness notes to quote with any PostgreSQL number:**
+
+- **Serialisation runs outside PostgreSQL's 2 CPUs.** The other engines serialise inside their own
+  budget; the shim is a separate container capped at 1 CPU / 512 MB. It encodes one response on
+  one goroutine, so the cap does not throttle it, but the PostgreSQL side has up to 3 CPUs in all.
+- **Durability is not equal, and favours the others**: PostgreSQL's numbers are for batches
+  fsynced before COPY returns; logd acknowledges at enqueue and group-commits every 50 ms; Loki and
+  VictoriaLogs acknowledge from memory.
+- **The load is not concurrent with the log stores' push**: they are pushed to together by one
+  fan-out driver, PostgreSQL is loaded afterwards, alone.
+- `plan_cache_mode = force_custom_plan` on the shim's connections, so every threshold is planned
+  with its real value rather than a generic plan's fixed 33% estimate after five executions.
+
+---
+
+## Public dataset: Loghub HDFS replay (E-2)
+
+The synthetic corpus was designed alongside logd's template, so they agree by construction.
+`loggen -replay` pushes a real dataset through the same driver instead, with a ground-truth
+manifest in the same schema. `make hdfs` (`scripts/hdfs-run.sh`) does the whole run: fresh
+volumes, replay push to logd/Loki/VictoriaLogs, PostgreSQL load, gate per threshold, queries.
+
+```sh
+go run ./cmd/loggen -replay ~/.cache/logd-datasets/HDFS.log -replay-count 2000000 \
+  -replay-value-regex 'size ([0-9]+)' -replay-value-name size_bytes -label app=hdfs \
+  -manifest ~/.cache/logd-bench/hdfs-2000000.jsonl -push … -push … -push '…?_stream_fields=app,component'
+```
+
+- **Line text byte-for-byte.** Only the terminator is removed — HDFS.log is CRLF throughout, and
+  the CR goes with the LF. Nothing is prefixed; the original `081109 203518` stays in the text.
+- **Timestamps synthetic**, `base + i·1ms`, strictly monotonic, `-base-ts=auto` ending a minute
+  before now — the source has one-second resolution, and an old replay is invisible to Loki.
+- **Labels**: `app=hdfs` plus `component`, the logger's outer class lowercased
+  (`dfs.DataNode$PacketResponder` → `datanode`), capped at 10 values with `other` as overflow.
+  First 2M lines: **4 values** — datanode 1,432,269, fsnamesystem 500,833, datablockscanner 55,989,
+  fsdataset 10,909. The whole file has 5 (plus `pendingreplicationblocks`, 47 lines).
+- **Manifest**: corpus schema plus `value` / `value_name` (`size_bytes`) on lines that carry one,
+  so `window.sh` and `gate.py` read it unchanged. ~530 MB at 2M lines: it goes to
+  `~/.cache/logd-bench`, not `corpus/`, because `/tmp` is often a small tmpfs.
+- **logd** uses `stack/logd/logd-hdfs.yaml` (template `size {bytes:int}` → field `size_bytes`;
+  allowlist `app`, `component`), selected with `LOGD_CONFIG`, which hdfs-run.sh sets.
+
+### What the data looks like (first 2,000,000 lines)
+
+633,736 lines (31.7%) carry a size, in five forms; none carries two, so logd's any-occurrence
+predicate and the engines' first-match extraction cannot disagree:
+
+| lines | form |
+|---:|---|
+| 316,774 | `INFO dfs.FSNamesystem: BLOCK* NameSystem.addStoredBlock: blockMap updated: IP is added to blk_X size N` |
+| 316,494 | `INFO dfs.DataNode$PacketResponder: Received block blk_X of size N from /IP` |
+| 280 | `INFO dfs.DataNode$DataXceiver: Received block blk_X src: /IP dest: /IP of size N` |
+| 182 | `WARN dfs.FSNamesystem: BLOCK* NameSystem.addStoredBlock: Redundant addStoredBlock request received for blk_X on IP size N` |
+| 6 | `INFO dfs.FSNamesystem: BLOCK* NameSystem.addStoredBlock: addStoredBlock request received for blk_X on IP size N But it does not belong to any file.` |
+
+The distribution is a point mass: **602,065 of the 633,736 sizes (95%) are exactly 67108864**, a
+full 64 MiB block; the rest clump around 3.53–3.55 MB and 28.48–28.50 MB, plus 181 below
+90 KB (min 0). So the selective end of a sweep is *small* blocks, `size_bytes < T`:
+
+| `size_bytes <` | rows | of all lines |
+|---:|---:|---:|
+| 67108864 | 31,671 | 1.58% |
+| 28490000 | 20,483 | 1.02% |
+| 3535000 | 2,123 | 0.106% |
+| 90000 | 181 | 0.0091% |
+
+**5% is not reachable with one threshold**: everything below 64 MiB is 1.58%, and `>= 67108864`
+jumps to 30.1% (602,065 rows, above bench-vs.sh's 200,000 limit).
+
+### Queries, all verified against the manifest
+
+```
+logd          {app="hdfs"} | size_bytes < T                     (/loki/api/v1/query_range; forced scan: /logd/api/v1/query_scan)
+Loki regexp   {app="hdfs"} |= "size " | regexp "size (?P<size_bytes>[0-9]+)" | size_bytes < T
+Loki pattern  {app="hdfs"} |= "size " | pattern "<_> size <size_bytes> <_>" | pattern "<_> size <size_bytes>" | size_bytes < T
+VictoriaLogs  _stream:{app="hdfs"} "size" | extract_regexp "size (?P<size_bytes>[0-9]+)" | size_bytes:<T
+VictoriaLogs  _stream:{app="hdfs"} "size" | extract "size <size_bytes> " | extract if (size_bytes:"") "size <size_bytes>" | size_bytes:<T
+PostgreSQL    http://localhost:7300/loki/api/v1/query_range?variant=structured&dataset=hdfs     query=size_bytes < T
+              http://localhost:7300/loki/api/v1/query_range?variant=unstructured&dataset=hdfs   query=size_bytes < T
+```
+
+**The real dataset exposed a query-language difference the synthetic one could not.** In two of
+the five forms the number is followed by text, in three it ends the line. logd's template ends in
+its capture, so the digits end it and one template covers all five. A single Loki `| pattern
+"<_> size <size_bytes>"` captures `N from /10.x` on the first kind, the numeric filter fails, and
+Loki keeps those lines with an `__error__` label instead of dropping them: **200,000 rows (the
+limit), 199,740 of them errors, for 2,123 expected** — a wrong answer with no error status. Two
+pattern stages are exact (the first parser to extract a label wins in Loki 3.7). VictoriaLogs'
+single `extract` returns 1,136 or 987 of the 2,123 rows (at `< 3535000`), depending on the
+trailing space; `extract_regexp`, or a second `extract if (size_bytes:"")`, is exact.
+
+**Gate (one run):** at all four thresholds, all eight rows — logd index, logd forced scan, Loki
+pattern, Loki regexp, VictoriaLogs extract_regexp and extract, PostgreSQL structured and
+unstructured — returned the manifest's count, and at `< 3535000` the exact (ts, line) rows.
+
+Ingest during that run (2,000 requests of 1,000 lines, concurrent fan-out, zero retries, one run on
+a loaded box): VictoriaLogs 12.6 s (159k lines/s), Loki 17.9 s (112k), logd 18.8 s (106k).
+
+bench-vs.sh's queries are written for the synthetic corpus's field (`latency_ms`, `took=`; only
+`APP` and `THRESHOLD` are variables), so an HDFS sweep needs the queries above, with
+`eval "$(./scripts/window.sh <manifest> env)"` for the window.
+
+---
+
 ## Honest caveats
 
 Read these before quoting any number above.
@@ -335,6 +548,11 @@ Read these before quoting any number above.
   measures what a client actually waits for.
 - **All latencies include HTTP and JSON serialization** of ~2,806 rows, identical across
   engines, which compresses the visible ratio relative to raw engine time.
+- **PostgreSQL with a generated column and a partial B-tree is a serious baseline**, not a straw
+  man: in the gate's single unwarmed samples (loaded box, logd's active segment unsealed) the
+  structured variant answered in 4–73 ms on the corpus and 6–144 ms on HDFS, below every log
+  store in the same run. It pays on disk (5.4–6.5× logd's settled 15.6 MB), at ingest, and in a
+  schema per field; measure it on a quiet machine before quoting any latency.
 - **logd's advantage requires the template to be declared in advance.** On an undeclared
   field it falls back to scan and the advantage disappears entirely. That is the honest
   shape of the trade: logd is not a drop-in Loki replacement, it asks the operator to
@@ -374,16 +592,25 @@ scan, and the daemon reports nothing wrong. `candidates: 0` is how you see it.
 ## Layout
 
 ```
-docker-compose.yml            logd + Loki + VictoriaLogs + Grafana (+ alloy profile)
-Makefile                      up / load / explain / compare / index-stats / verify-loki
-stack/logd/logd.yaml          templates + label allowlist for the testbed
+docker-compose.yml            logd + Loki + VictoriaLogs + PostgreSQL + pgshim + Grafana (+ alloy)
+Makefile                      up / load / pg-load / gate / hdfs / explain / compare / ...
+stack/logd/logd.yaml          templates + label allowlist for the synthetic corpus
+stack/logd/logd-hdfs.yaml     the same for the HDFS replay (LOGD_CONFIG selects it)
 stack/loki/loki.yaml          single-binary filesystem Loki; every deviation commented
-stack/grafana/provisioning/   all three datasources
-cmd/loggen/                   corpus generator + multi-target Loki push driver
-internal/loggen/              ported generator; corpus.go and push.go are new
+stack/postgres/               postgresql.conf (every non-default commented) + schema.sql
+stack/pgshim/Dockerfile       the shim's image, built from testbed/ alone
+stack/grafana/provisioning/   the three log-store datasources
+cmd/loggen/                   corpus generator, replay mode, multi-target Loki push driver
+cmd/pgload/                   manifest -> PostgreSQL via COPY, with load time and sizes
+cmd/pgshim/                   PostgreSQL behind a Loki-shaped query_range endpoint
+internal/loggen/              ported generator; corpus.go, replay.go and push.go are new
+internal/pgdata/              PostgreSQL tables, extraction expressions, predicate parser
 scripts/bench-vs.sh           interleaved A/B latency across all engines
 scripts/compare-self.sh       index vs forced scan, with a correctness gate first
 scripts/resultset.py          canonical result set of a Loki-JSON or LogsQL-JSONL response
+scripts/gate.py               every engine vs the manifest's ground truth; the exact queries
+scripts/hdfs-run.sh           the HDFS replay end to end
+scripts/pg-load.sh            load a manifest into PostgreSQL
 scripts/window.sh             derives the query window from a manifest
 ```
 
@@ -401,4 +628,8 @@ scripts/window.sh             derives the query window from a manifest
   (installed via `GF_INSTALL_PLUGINS`, which downloads at container start and is the
   flakiest part of `up`).
 - `docker compose down -v` between benchmark runs. Without `-v` the volumes persist and the
-  disk figures include the previous run.
+  disk figures include the previous run. `COMPOSE_PROJECT_NAME=<other>` runs a second, isolated
+  set of volumes (container names are fixed, so not at the same time as the first).
+- PostgreSQL's schema is applied by `/docker-entrypoint-initdb.d` on a **fresh** volume only. After
+  editing `schema.sql`, `docker compose down -v` (or drop the tables by hand); `pgload` truncates
+  and reloads data but never alters tables.

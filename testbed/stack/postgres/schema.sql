@@ -16,7 +16,7 @@
 -- corpus manifest's ground truth (loggen's tookRe), and like it takes the FIRST occurrence.
 
 -- One row per distinct label set. Storing the labels inline as jsonb would cost 58 bytes per
--- row for {app, env, region} -- about a third of the table for this corpus -- and repeat the
+-- row for {app, env, region} -- over a quarter of the row it would sit in -- and repeat the
 -- same three strings 500,000 times. Every log store in this comparison keeps a stream
 -- dictionary rather than per-line labels, and a DBA would normalise them the same way.
 CREATE TABLE streams (
