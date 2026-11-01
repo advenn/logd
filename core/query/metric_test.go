@@ -234,3 +234,28 @@ func TestMetricExtremeBoundsTerminate(t *testing.T) {
 		}
 	}
 }
+
+// A query without a step gets Loki's default resolution, max(1s, range/250) in whole
+// seconds, rather than a fixed 15s (which made a one-week query exceed the step cap).
+func TestMetricDefaultStep(t *testing.T) {
+	e := buildMetricData(t, []struct {
+		region  string
+		sec     int
+		latency int
+	}{{"eu", 5, 1}})
+	sec := int64(time.Second)
+	for _, c := range []struct {
+		span, want int64
+	}{{1000 * sec, 4 * sec}, {1001 * sec, 4 * sec}, {60 * sec, sec}, {7 * 24 * 3600 * sec, 2419 * sec}} {
+		m, err := e.ExecuteMetric(qr.MetricQuery{Range: 3600 * sec, RangeOp: qr.RangeCount, Start: nanoAt(5), End: nanoAt(5) + c.span})
+		if err != nil {
+			t.Fatalf("span %ds: %v", c.span/sec, err)
+		}
+		if len(m) != 1 || len(m[0].Points) < 2 {
+			t.Fatalf("span %ds: %+v", c.span/sec, m)
+		}
+		if got := m[0].Points[1].TS - m[0].Points[0].TS; got != c.want {
+			t.Fatalf("span %ds: step %ds, want %ds", c.span/sec, got/sec, c.want/sec)
+		}
+	}
+}

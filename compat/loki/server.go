@@ -236,12 +236,12 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		at, err := s.parseTime(r.FormValue("time"), s.now())
+		at, err := parseTimestamp("time", r.FormValue("time"), s.now())
 		if err != nil {
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		mq.Start, mq.End = at, at // instant: single step
+		mq.Start, mq.End = at.UnixNano(), at.UnixNano() // instant: single step
 		series, err := s.qe.ExecuteMetric(mq)
 		if err != nil {
 			s.writeError(w, http.StatusInternalServerError, err.Error())
@@ -434,13 +434,13 @@ func (s *Server) logQuery(r *http.Request, ast *logql.Query) (query.Query, error
 	if err != nil {
 		return query.Query{}, err
 	}
-	limit := 100
-	if l, err := strconv.Atoi(r.FormValue("limit")); err == nil && l > 0 {
-		limit = l
+	limit, err := parseLimit(r.FormValue("limit"))
+	if err != nil {
+		return query.Query{}, err
 	}
-	dir := query.Backward
-	if r.FormValue("direction") == "forward" {
-		dir = query.Forward
+	dir, err := parseDirection(r.FormValue("direction"))
+	if err != nil {
+		return query.Query{}, err
 	}
 	return query.Query{Start: start, End: end, Preds: preds, Limit: limit, Direction: dir}, nil
 }
@@ -455,70 +455,10 @@ func (s *Server) metricQuery(r *http.Request, ast *logql.MetricExpr) (query.Metr
 	if mq.Start, mq.End, err = s.timeRange(r); err != nil {
 		return query.MetricQuery{}, err
 	}
-	mq.Step = s.parseStep(r)
+	if mq.Step, err = parseStep(r.FormValue("step")); err != nil {
+		return query.MetricQuery{}, err
+	}
 	return mq, nil
-}
-
-// timeRange resolves [start, end] from start/end (range) or time (instant), defaulting to
-// the last hour.
-func (s *Server) timeRange(r *http.Request) (start, end int64, err error) {
-	endStr := r.FormValue("end")
-	if endStr == "" {
-		endStr = r.FormValue("time")
-	}
-	if end, err = s.parseTime(endStr, s.now()); err != nil {
-		return 0, 0, err
-	}
-	if start, err = s.parseTime(r.FormValue("start"), time.Unix(0, end).Add(-time.Hour)); err != nil {
-		return 0, 0, err
-	}
-	return start, end, nil
-}
-
-// parseStep reads the query resolution: Grafana sends `step` as float seconds; a Go
-// duration string is also accepted. 0 lets the metric evaluator pick a default.
-func (s *Server) parseStep(r *http.Request) int64 {
-	v := r.FormValue("step")
-	if v == "" {
-		return 0
-	}
-	if secs, err := strconv.ParseFloat(v, 64); err == nil {
-		return int64(secs * 1e9)
-	}
-	if d, err := time.ParseDuration(v); err == nil {
-		return d.Nanoseconds()
-	}
-	return 0
-}
-
-// The range of timestamps a query may name: the Unix epoch up to the start of 2262, just
-// short of where int64 nanoseconds end (2262-04-11). Anything outside it is not a time any
-// real query means, and inside the engine it is a time that arithmetic can overflow on:
-// time=MaxInt64 once made the metric step cursor wrap and a single GET exhaust memory. The
-// engine now guards its own arithmetic too; this answers such a request with a 400 instead
-// of an empty result.
-var (
-	minQueryTime = time.Unix(0, 0)
-	maxQueryTime = time.Date(2262, 1, 1, 0, 0, 0, 0, time.UTC)
-)
-
-// parseTime accepts a unix-nanosecond string (what Grafana sends) or RFC3339, else def. A
-// given timestamp outside [minQueryTime, maxQueryTime] is an error.
-func (s *Server) parseTime(v string, def time.Time) (int64, error) {
-	if v == "" {
-		return def.UnixNano(), nil
-	}
-	t := def
-	if nano, err := strconv.ParseInt(v, 10, 64); err == nil {
-		t = time.Unix(0, nano)
-	} else if ts, err := time.Parse(time.RFC3339Nano, v); err == nil {
-		t = ts
-	}
-	if t.Before(minQueryTime) || t.After(maxQueryTime) {
-		return 0, fmt.Errorf("timestamp %q is outside the supported range (%s to %s)", v,
-			minQueryTime.UTC().Format(time.RFC3339), maxQueryTime.Format(time.RFC3339))
-	}
-	return t.UnixNano(), nil
 }
 
 // groupStreams groups result entries into Loki streams keyed by their label set (Extra

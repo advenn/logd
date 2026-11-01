@@ -1,8 +1,11 @@
 package loki_test
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -48,5 +51,126 @@ func TestTimestampsOutsideSupportedRangeRejected(t *testing.T) {
 	rr := doWithin(t, h, "/loki/api/v1/query_range?query="+metric+"&start=0&end=3600000000000&step=60", 5*time.Second)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("a query from the epoch: got %d; body %s", rr.Code, rr.Body.String())
+	}
+}
+
+// pushAt stores one line per offset (seconds after base) in region eu and seals the data.
+func pushAt(t *testing.T, offsets ...int) http.Handler {
+	t.Helper()
+	srv, w := setup(t)
+	h := srv.Handler()
+	var values [][2]string
+	for _, o := range offsets {
+		values = append(values, [2]string{ns(o), fmt.Sprintf("line %d", o)})
+	}
+	body := pushJSON([]struct {
+		labels map[string]string
+		values [][2]string
+	}{{map[string]string{"region": "eu"}, values}})
+	if rr := do(t, h, "POST", "/loki/api/v1/push", body, "application/json"); rr.Code != http.StatusNoContent {
+		t.Fatalf("push: %d %s", rr.Code, rr.Body.String())
+	}
+	w.Close()
+	return h
+}
+
+// lines runs a log query_range with the given extra parameters and returns its lines in
+// response order.
+func lines(t *testing.T, h http.Handler, params string) []string {
+	t.Helper()
+	rr := do(t, h, "GET", "/loki/api/v1/query_range?query="+urlEncode(`{region="eu"}`)+params, "", "")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("query_range%s: %d %s", params, rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Data struct {
+			Result []struct {
+				Values [][2]string `json:"values"`
+			} `json:"result"`
+		} `json:"data"`
+	}
+	json.Unmarshal(rr.Body.Bytes(), &resp)
+	var out []string
+	for _, s := range resp.Data.Result {
+		for _, v := range s.Values {
+			out = append(out, v[1])
+		}
+	}
+	return out
+}
+
+// Request parameters are read as Loki reads them (pkg/loghttp/params.go): an integer of
+// at most 10 digits is seconds, longer is nanoseconds; a decimal is float seconds; RFC3339
+// works; `since` sets the start when there is none; direction is case-insensitive.
+// "1700000002" used to be read as nanoseconds (1970), a float fell back to the last hour,
+// and since and FORWARD were ignored.
+func TestQueryParamsParsedAsLoki(t *testing.T) {
+	h := pushAt(t, 1, 2, 3, 8)
+	sec := func(o int) string { return strconv.FormatInt(base+int64(o), 10) }
+	for params, want := range map[string]string{
+		"&start=" + sec(2) + "&end=" + sec(3) + "&direction=forward":                                  "[line 2 line 3]",
+		"&start=" + ns(2) + "&end=" + ns(3) + "&direction=forward":                                    "[line 2 line 3]",
+		"&start=" + sec(1) + ".5&end=" + sec(2) + ".5":                                                "[line 2]",
+		"&start=" + urlEncode("2023-11-14T22:13:21Z") + "&end=" + urlEncode("2023-11-14T22:13:22.5Z"): "[line 2 line 1]",
+		"&end=" + ns(10) + "&since=5s":                                                                "[line 8]",
+		"&end=" + ns(10) + "&since=1m&direction=FORWARD":                                              "[line 1 line 2 line 3 line 8]",
+		"&end=" + ns(10) + "&since=1m&direction=Backward&limit=2":                                     "[line 8 line 3]",
+	} {
+		if got := fmt.Sprint(lines(t, h, params)); got != want {
+			t.Fatalf("%s: got %s, want %s", params, got, want)
+		}
+	}
+}
+
+// A parameter that cannot be parsed is a 400, as in Loki, not silently replaced by a
+// default (an unparseable start used to mean "the last hour").
+func TestBadQueryParamsRejected(t *testing.T) {
+	h := pushAt(t, 1)
+	logQ := "/loki/api/v1/query_range?query=" + urlEncode(`{region="eu"}`) + "&start=" + ns(0) + "&end=" + ns(10)
+	metricQ := "/loki/api/v1/query_range?query=" + urlEncode(`count_over_time({region="eu"}[1m])`) + "&start=" + ns(0) + "&end=" + ns(10)
+	for _, target := range []string{
+		"/loki/api/v1/query_range?query=" + urlEncode(`{region="eu"}`) + "&start=yesterday",
+		"/loki/api/v1/query_range?query=" + urlEncode(`{region="eu"}`) + "&end=NaN",
+		"/loki/api/v1/query_range?query=" + urlEncode(`{region="eu"}`) + "&since=forever",
+		"/loki/api/v1/query?query=" + urlEncode(`count_over_time({region="eu"}[1m])`) + "&time=noon",
+		logQ + "&limit=-1",
+		logQ + "&limit=0",
+		logQ + "&limit=lots",
+		logQ + "&limit=1000001",
+		logQ + "&direction=sideways",
+		metricQ + "&step=0",
+		metricQ + "&step=-15",
+		metricQ + "&step=often",
+		metricQ + "&step=1e300",
+	} {
+		if rr := do(t, h, "GET", target, "", ""); rr.Code != http.StatusBadRequest {
+			t.Fatalf("GET %s: got %d %s, want 400", target, rr.Code, rr.Body.String())
+		}
+	}
+	if rr := do(t, h, "GET", logQ+"&limit=1000000", "", ""); rr.Code != http.StatusOK {
+		t.Fatalf("limit at the maximum: got %d %s", rr.Code, rr.Body.String())
+	}
+}
+
+// Without a step, a metric query takes Loki's default resolution, max(1s, range/250)
+// truncated to whole seconds, instead of a fixed 15s.
+func TestMetricDefaultStepMatchesLoki(t *testing.T) {
+	h := pushAt(t, 1, 2, 3)
+	target := "/loki/api/v1/query_range?query=" + urlEncode(`count_over_time({region="eu"}[1h])`) + "&start=" + ns(0) + "&end=" + ns(1000)
+	rr := do(t, h, "GET", target, "", "")
+	var resp struct {
+		Data struct {
+			Result []struct {
+				Values [][2]any `json:"values"`
+			} `json:"result"`
+		} `json:"data"`
+	}
+	json.Unmarshal(rr.Body.Bytes(), &resp)
+	if rr.Code != http.StatusOK || len(resp.Data.Result) != 1 || len(resp.Data.Result[0].Values) < 2 {
+		t.Fatalf("%d %s", rr.Code, rr.Body.String())
+	}
+	v := resp.Data.Result[0].Values
+	if step := v[1][0].(float64) - v[0][0].(float64); step != 4 { // floor(1000s/250)
+		t.Fatalf("default step = %vs, want 4s", step)
 	}
 }

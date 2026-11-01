@@ -66,7 +66,6 @@ type MatrixSeries struct {
 }
 
 const (
-	defaultStep = int64(15e9) // 15s
 	// maxMetricSteps caps the resolution of a matrix (Loki's default is ~11000); a finer
 	// step over a wide range is rejected rather than allocating per-step slices to OOM.
 	maxMetricSteps = 11000
@@ -99,7 +98,7 @@ func (e *Engine) ExecuteMetric(q MetricQuery) ([]MatrixSeries, error) {
 	}
 	step := q.Step
 	if step <= 0 {
-		step = defaultStep
+		step = defaultStep(q.Start, q.End)
 	}
 	rng := q.Range
 	if rng <= 0 {
@@ -343,6 +342,18 @@ func reduceLabels(labels map[string]string, grouping []string, without bool) map
 		}
 	}
 	return out
+}
+
+// defaultStep is the resolution of a query that names none: Loki's default (itself
+// Prometheus'), about 250 points across the range in whole seconds, and at least 1s. A fixed
+// 15s answered a one-week query with the 11,000-step error and a one-minute query with four
+// points.
+func defaultStep(start, end int64) int64 {
+	secs := int64(1)
+	if end > start {
+		secs = max(secs, int64((uint64(end)-uint64(start))/1e9/250))
+	}
+	return secs * 1e9
 }
 
 // stepsBetween returns the n evaluation times start, start+step, …. It counts by index
