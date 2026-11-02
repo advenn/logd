@@ -3,6 +3,7 @@ package loki
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -53,10 +54,19 @@ func TestWSReadMaskedFrame(t *testing.T) {
 	}
 }
 
+// A client frame without a mask is refused (RFC 6455 §5.1), before its payload is read.
+func TestWSReadUnmaskedFrameRejected(t *testing.T) {
+	frame := []byte{0x81, 0x02, 'h', 'i'}
+	c := &wsConn{br: bufio.NewReader(bytes.NewReader(frame))}
+	if _, _, err := c.readFrame(); !errors.Is(err, errWSUnmasked) {
+		t.Fatalf("readFrame of an unmasked frame: err = %v, want errWSUnmasked", err)
+	}
+}
+
 // A frame declaring an oversized payload is rejected, not allocated.
 func TestWSReadFrameTooLarge(t *testing.T) {
-	// 64-bit length header declaring 1 GiB.
-	frame := []byte{0x81, 127, 0, 0, 0, 0, 0x40, 0, 0, 0}
+	// masked, 64-bit length header declaring 1 GiB.
+	frame := []byte{0x81, 0x80 | 127, 0, 0, 0, 0, 0x40, 0, 0, 0}
 	c := &wsConn{br: bufio.NewReader(bytes.NewReader(frame))}
 	if _, _, err := c.readFrame(); err == nil {
 		t.Fatal("expected an oversized-frame rejection")

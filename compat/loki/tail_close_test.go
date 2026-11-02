@@ -109,3 +109,25 @@ func TestTailSendsGoingAwayOnShutdown(t *testing.T) {
 		t.Fatalf("on shutdown: opcode byte %#x payload %v, want a Close (0x88) carrying 1001", op, got)
 	}
 }
+
+// A client frame without a mask is a protocol error the server must close the connection
+// over (RFC 6455 §5.1): a Close carrying 1002, then the socket is dropped. It used to be
+// read and unmasked as if nothing were wrong.
+func TestTailClosesOnUnmaskedClientFrame(t *testing.T) {
+	srv, _ := setup(t)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	conn, br := dialTail(t, ts)
+
+	if _, err := conn.Write([]byte{0x81, 0x02, 'h', 'i'}); err != nil { // unmasked text "hi"
+		t.Fatal(err)
+	}
+	op, got := readServerFrame(t, conn, br)
+	if op != 0x88 || len(got) < 2 || binary.BigEndian.Uint16(got) != 1002 {
+		t.Fatalf("reply to an unmasked frame: opcode byte %#x payload %v, want a Close (0x88) carrying 1002", op, got)
+	}
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if n, err := br.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("after the Close: read %d bytes, err %v; want the server to drop the connection (EOF)", n, err)
+	}
+}

@@ -25,11 +25,17 @@ const (
 	maxControlFrame = 125              // RFC 6455: control-frame payloads are ≤125 bytes
 	wsWriteTimeout  = 10 * time.Second // bound a single frame write so a non-reading client can't pin the goroutine
 
-	wsCloseGoingAway = 1001 // RFC 6455 §7.4.1: the server is going away
+	wsCloseGoingAway     = 1001 // RFC 6455 §7.4.1: the server is going away
+	wsCloseProtocolError = 1002 // RFC 6455 §7.4.1: the peer broke the protocol
 )
 
-// errWSClosed is returned for a write after this side has sent its Close frame.
-var errWSClosed = errors.New("websocket: close frame already sent")
+var (
+	// errWSClosed is returned for a write after this side has sent its Close frame.
+	errWSClosed = errors.New("websocket: close frame already sent")
+	// errWSUnmasked is readFrame's answer to a client frame without a mask, which RFC 6455
+	// §5.1 obliges the server to close the connection over.
+	errWSUnmasked = errors.New("websocket: unmasked client frame")
+)
 
 type wsConn struct {
 	conn      net.Conn
@@ -137,11 +143,16 @@ func (c *wsConn) writeFrame(opcode byte, payload []byte) error {
 }
 
 // readLoop consumes client frames only to notice a close/EOF (closing done) and to answer
-// pings with pongs. Client→server frames are masked.
+// pings with pongs. Client→server frames are masked; an unmasked one is answered with a
+// Close carrying 1002 (protocol error), and closing done then drops the connection.
 func (c *wsConn) readLoop(done chan<- struct{}) {
 	defer close(done)
 	for {
 		opcode, payload, err := c.readFrame()
+		if errors.Is(err, errWSUnmasked) {
+			c.writeClose(wsCloseProtocolError)
+			return
+		}
 		if err != nil {
 			return
 		}
@@ -166,7 +177,12 @@ func (c *wsConn) readFrame() (opcode byte, payload []byte, err error) {
 		return 0, nil, err
 	}
 	opcode = h[0] & 0x0F
-	masked := h[1]&0x80 != 0
+	// RFC 6455 §5.1: every client frame is masked, and the server MUST close the
+	// connection on one that is not. Refused before its length is read: nothing in an
+	// unmasked frame is trusted, so it is never read or allocated for.
+	if h[1]&0x80 == 0 {
+		return 0, nil, errWSUnmasked
+	}
 	n := int(h[1] & 0x7F)
 	switch n {
 	case 126:
@@ -191,19 +207,15 @@ func (c *wsConn) readFrame() (opcode byte, payload []byte, err error) {
 		return 0, nil, fmt.Errorf("ws control frame too large: %d", n)
 	}
 	var mask [4]byte
-	if masked {
-		if _, err = io.ReadFull(c.br, mask[:]); err != nil {
-			return 0, nil, err
-		}
+	if _, err = io.ReadFull(c.br, mask[:]); err != nil {
+		return 0, nil, err
 	}
 	payload = make([]byte, n)
 	if _, err = io.ReadFull(c.br, payload); err != nil {
 		return 0, nil, err
 	}
-	if masked {
-		for i := range payload {
-			payload[i] ^= mask[i%4]
-		}
+	for i := range payload {
+		payload[i] ^= mask[i%4]
 	}
 	return opcode, payload, nil
 }
