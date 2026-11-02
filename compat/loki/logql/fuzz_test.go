@@ -15,7 +15,8 @@ import (
 // hands a raw request parameter. Parsing must never panic; a query that parses must
 // translate without panicking, with and without declared templates; and the predicates,
 // labels and unwrap hooks it translates to must evaluate on a few lines without panicking,
-// as they do for every record a query reads.
+// as they do for every record a query reads. Every typed comparison it translates to must
+// also carry the field's declared kind, or the engine refuses the query (design §9.3).
 //
 // `go test` runs the seeds below (and any crashers kept in testdata/fuzz/). To search:
 //
@@ -49,6 +50,8 @@ func FuzzParseTranslate(f *testing.F) {
 		`{app="api"} | logfmt --strict --keep-empty`,
 		`{app="api"} | pattern "<_>took=<latency_ms>ms<_>" | latency_ms > 200`,
 		`{app="api"} | pattern "<_> took <ms>ms <_>" | ms > 10`,
+		`{app="api"} | pattern "<_>dur <dur_s>s<_>" | dur_s > 2`,
+		`count_over_time({app="api"} | pattern "<_>req=<req_id><_>" | req_id = "550e8400-e29b-41d4-a716-446655440000" [5m])`,
 		`{app="api"} | pattern "<a><b>"`,
 		`{app="api"} | regexp "took=(?P<latency_ms>[0-9]+)ms" | latency_ms >= 200`,
 		`{app="api"} | regexp "(?P<a>["`,
@@ -107,6 +110,7 @@ func FuzzParseTranslate(f *testing.F) {
 				if err != nil {
 					continue
 				}
+				checkKinds(t, input, tr.Preds, eng)
 				for _, line := range lines {
 					for _, p := range tr.Preds {
 						p.Match(line, r)
@@ -118,6 +122,7 @@ func FuzzParseTranslate(f *testing.F) {
 				if err != nil {
 					continue
 				}
+				checkKinds(t, input, mq.Preds, eng)
 				for _, line := range lines {
 					for _, p := range mq.Preds {
 						p.Match(line, r)
@@ -132,6 +137,24 @@ func FuzzParseTranslate(f *testing.F) {
 			}
 		}
 	})
+}
+
+// checkKinds fails if a typed comparison's value is not of the kind ex declares for its
+// field.
+func checkKinds(t *testing.T, input string, preds []query.Predicate, ex *extract.Engine) {
+	t.Helper()
+	for _, p := range preds {
+		tc, ok := p.(query.TypedCompare)
+		if !ok {
+			continue
+		}
+		if ex == nil {
+			t.Fatalf("%q: a TypedCompare on %q without an extraction engine", input, tc.Field)
+		}
+		if kind, declared := ex.FieldKind(tc.Field); !declared || kind != tc.Value.Kind {
+			t.Fatalf("%q: TypedCompare on %q has value kind %d, the field is declared %v (kind %d)", input, tc.Field, tc.Value.Kind, declared, kind)
+		}
+	}
 }
 
 // fuzzResolver resolves labels from a record's Extra and typed fields with an extraction

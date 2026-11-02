@@ -208,7 +208,7 @@ func (e *Engine) Execute(q Query) ([]model.LogEntry, error) { return e.execute(q
 func (e *Engine) ExecuteScan(q Query) ([]model.LogEntry, error) { return e.execute(q, true) }
 
 func (e *Engine) execute(q Query, forceScan bool) ([]model.LogEntry, error) {
-	if err := validatePreds(q.Preds); err != nil {
+	if err := validatePreds(q.Preds, e.ex); err != nil {
 		return nil, err
 	}
 	start := q.Start

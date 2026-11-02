@@ -51,7 +51,8 @@ func (e *Engine) plan(seg *storage.SegmentMeta, src segmentIndex, preds []Predic
 			kind, pattern, ok := schemaField(seg, pred.Field)
 			// Push only when: not != (not selective); the field is indexed in this
 			// segment; the query value's Kind MATCHES the field's indexed kind (a cross-kind
-			// predicate would encode its key in the wrong kind-space); and the index was
+			// predicate would encode its key in the wrong kind-space; validatePreds refuses
+			// one against the live extractor, but Explain plans without it); and the index was
 			// built from the SAME pattern that defines the field now. The scan path extracts
 			// with the live config, so an index built from an edited — or since removed —
 			// template would answer for a different field than the scan does. Otherwise the

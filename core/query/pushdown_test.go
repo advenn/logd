@@ -207,10 +207,13 @@ func TestPushdownEqualsScan(t *testing.T) {
 	equalResults(t, "time window + latency>400", idx, scan)
 }
 
-// A mistyped predicate (query value's Kind differs from the field's indexed kind) must
-// NOT push down — it would encode the key in the wrong kind-space and search the wrong
-// index, diverging from the scan oracle. It must fall back to scan (residual).
-func TestPushdownCrossKindDoesNotDiverge(t *testing.T) {
+// A mistyped predicate — the query value's Kind differs from the kind the extractor declares
+// for the field — has no meaningful answer: every value of the field has the declared kind,
+// so the comparison would order the two by kind alone. The native API is strict (design
+// §9.3), so both paths refuse it at plan time. They used to agree on it only because the
+// planner kept it off the index (its key would be encoded in the wrong kind-space) and the
+// scan answered it by kind order: `score_v > 0` matched all four records, `< 0` none.
+func TestPushdownCrossKindRejected(t *testing.T) {
 	dir := t.TempDir()
 	eng, _ := extract.Compile(config.IndexConfig{Templates: []config.Template{{Name: "score", Pattern: "score {v:float} pts"}}})
 	w, _ := storage.NewWriter(dir, storage.Options{Schema: eng.IndexedFields(), SegmentSizeBytes: 1 << 40, FlushInterval: time.Hour})
@@ -224,18 +227,56 @@ func TestPushdownCrossKindDoesNotDiverge(t *testing.T) {
 	w.Close()
 	e := qr.NewEngine(w, eng)
 
-	// Int value against a float field (a query-builder mistype) for every operator.
-	for _, op := range []qr.Op{qr.OpGt, qr.OpLt, qr.OpGe, qr.OpLe, qr.OpEq} {
-		q := qr.Query{Start: ts(0), End: ts(1000), Preds: []qr.Predicate{qr.TypedCompare{Field: "score_v", Op: op, Value: intV(0)}}}
-		idx, _ := e.Execute(q)
-		scan, _ := e.ExecuteScan(q)
-		equalResults(t, fmt.Sprintf("cross-kind op=%d", op), idx, scan)
+	// Int, str and uuid values against a float field (a query-builder mistype), for every
+	// operator, on every entry point.
+	for _, v := range []index.Value{intV(0), {Kind: index.KindStr, Str: "0"}, {Kind: index.KindUUID}} {
+		for _, op := range []qr.Op{qr.OpEq, qr.OpNe, qr.OpLt, qr.OpLe, qr.OpGt, qr.OpGe} {
+			preds := []qr.Predicate{qr.TypedCompare{Field: "score_v", Op: op, Value: v}}
+			q := qr.Query{Start: ts(0), End: ts(1000), Preds: preds}
+			if _, err := e.Execute(q); !errors.Is(err, qr.ErrInvalidPredicate) {
+				t.Errorf("Execute score_v op=%d kind %d: err = %v, want ErrInvalidPredicate", op, v.Kind, err)
+			}
+			if _, err := e.ExecuteScan(q); !errors.Is(err, qr.ErrInvalidPredicate) {
+				t.Errorf("ExecuteScan score_v op=%d kind %d: err = %v, want ErrInvalidPredicate", op, v.Kind, err)
+			}
+			mq := qr.MetricQuery{Preds: preds, RangeOp: qr.RangeCount, Range: int64(time.Minute), Start: ts(0), End: ts(60), Step: int64(time.Minute)}
+			if _, err := e.ExecuteMetric(mq); !errors.Is(err, qr.ErrInvalidPredicate) {
+				t.Errorf("ExecuteMetric score_v op=%d kind %d: err = %v, want ErrInvalidPredicate", op, v.Kind, err)
+			}
+		}
 	}
-	// And it must be reported as a scan, not a (wrong) index push.
+	// Explain, which plans without executing, still never pushes it into the index.
 	for _, p := range e.Explain(qr.Query{Start: ts(0), End: ts(1000), Preds: []qr.Predicate{qr.TypedCompare{Field: "score_v", Op: qr.OpGt, Value: intV(0)}}}) {
 		if p.Mode != "scan" {
 			t.Fatalf("cross-kind predicate should not push down, Explain said %q", p.Mode)
 		}
+	}
+
+	// The value of the declared kind is answered, identically by both paths.
+	q := qr.Query{Start: ts(0), End: ts(1000), Preds: []qr.Predicate{qr.TypedCompare{Field: "score_v", Op: qr.OpGt, Value: index.Value{Kind: index.KindFloat}}}}
+	idx, err := e.Execute(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scan, _ := e.ExecuteScan(q)
+	equalResults(t, "score_v > 0.0", idx, scan)
+	if len(idx) != 2 {
+		t.Fatalf("score_v > 0.0: %d records, want 2", len(idx))
+	}
+
+	// A field the engine's extractor does not declare has no declared kind to differ from:
+	// as before, the query is answered — by a scan that finds no value for the field.
+	q.Preds = []qr.Predicate{qr.TypedCompare{Field: "score_v", Op: qr.OpLt, Value: intV(0)}}
+	for name, other := range map[string]*qr.Engine{
+		"engine without the template": qr.NewEngine(w, compileOrFail(t, config.IndexConfig{})),
+		"no extraction engine":        qr.NewEngine(w, nil),
+	} {
+		idx, err1 := other.Execute(q)
+		scan, err2 := other.ExecuteScan(q)
+		if err1 != nil || err2 != nil {
+			t.Fatalf("%s: Execute err %v, ExecuteScan err %v; want both answered", name, err1, err2)
+		}
+		equalResults(t, name, idx, scan)
 	}
 }
 

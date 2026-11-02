@@ -104,7 +104,7 @@ type streamGroup struct {
 
 // ExecuteMetric evaluates a metric query into a matrix.
 func (e *Engine) ExecuteMetric(q MetricQuery) ([]MatrixSeries, error) {
-	if err := validatePreds(q.Preds); err != nil {
+	if err := validatePreds(q.Preds, e.ex); err != nil {
 		return nil, err
 	}
 	step := q.Step

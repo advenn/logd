@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/advenn/logd/core/extract"
 	"github.com/advenn/logd/core/index"
 	"github.com/advenn/logd/core/model"
 )
@@ -194,7 +195,9 @@ const (
 
 // TypedCompare matches records where the named template field has (at least one)
 // occurrence satisfying "value <Op> Value". A record lacking the field satisfies only
-// OpNe (empty-label semantics), matching the §9 re-verify behavior.
+// OpNe (empty-label semantics), matching the §9 re-verify behavior. Value must be of the
+// kind the engine's extractor declares for Field; another kind is refused at plan time
+// (validatePreds).
 type TypedCompare struct {
 	Field string
 	Op    Op
@@ -224,7 +227,16 @@ func (p TypedCompare) Match(e model.LogEntry, r Resolver) bool {
 // record for it and the index path none. Compare and the key encoding now order such a value
 // identically, so the paths would agree regardless; rejecting it tells the caller the query
 // is malformed instead of answering it by an ordering nobody asked for.
-func validatePreds(preds []Predicate) error {
+//
+// So is a TypedCompare whose value is of another kind than the one ex, the engine's
+// extractor, declares for the field: `latency_ms > 2.5` on an int field, or an int bound on
+// a float one. Every value of the field has the declared kind, so Compare ordered the two by
+// kind alone, and `<` or `>` matched every record carrying the field or none, whatever the
+// bound. A compat layer converts its literals to the declared kind (compat/loki parses
+// `| dur_s > 2` on a float field as 2.0), so only a native caller can build one. A field
+// ex does not declare — no template defines it, or there is no extractor — has no declared
+// kind, and is left as it was: the scan finds no value for it.
+func validatePreds(preds []Predicate, ex *extract.Engine) error {
 	for _, p := range preds {
 		if dc, ok := p.(DynamicCompare); ok {
 			if err := dc.validate(); err != nil {
@@ -233,7 +245,15 @@ func validatePreds(preds []Predicate) error {
 			continue
 		}
 		tc, ok := p.(TypedCompare)
-		if !ok || tc.Value.Kind != index.KindFloat {
+		if !ok {
+			continue
+		}
+		if ex != nil {
+			if kind, declared := ex.FieldKind(tc.Field); declared && tc.Value.Kind != kind {
+				return fmt.Errorf("%w: field %q is %s, compared with a %s value", ErrInvalidPredicate, tc.Field, kindName(kind), kindName(tc.Value.Kind))
+			}
+		}
+		if tc.Value.Kind != index.KindFloat {
 			continue
 		}
 		if f := tc.Value.Float; math.IsNaN(f) || math.IsInf(f, 0) {
@@ -241,6 +261,21 @@ func validatePreds(preds []Predicate) error {
 		}
 	}
 	return nil
+}
+
+// kindName is a value kind as the index config spells it.
+func kindName(k index.ValueKind) string {
+	switch k {
+	case index.KindInt:
+		return "int"
+	case index.KindFloat:
+		return "float"
+	case index.KindStr:
+		return "str"
+	case index.KindUUID:
+		return "uuid"
+	}
+	return fmt.Sprintf("kind %d", k)
 }
 
 func satisfies(cmp int, op Op) bool {

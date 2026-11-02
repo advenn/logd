@@ -1,6 +1,7 @@
 package query_test
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -46,7 +47,7 @@ import (
 // queried with, recorded in the manifest or not. The corpus has many timestamp ties (one
 // per second over a short span, some a nanosecond or two apart) and arrives out of order.
 // Per query: one to three ANDed predicates over typed fields of every kind (with a
-// cross-kind value now and then), line filters, label equality, inequality, regex and
+// cross-kind value now and then, which both paths must refuse), line filters, label equality, inequality, regex and
 // comparison, level; the time window; the limit; and the direction. The metric probe
 // varies the shard count, open or closed writers (and active segments that never fill), the
 // range aggregation, step, range and window, and sum by app, by level or by nothing; its
@@ -540,7 +541,7 @@ func TestRandDiff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fails, total := 0, 0
+	fails, total, rejected := 0, 0, 0
 	fail := func(format string, args ...any) {
 		fails++
 		if fails <= rdMaxReported {
@@ -584,12 +585,21 @@ func TestRandDiff(t *testing.T) {
 		for i := 0; i < queries; i++ {
 			q, d := rdRandQuery(r, recs, span)
 			total++
-			want := rdOracle(recs, ex, q)
 			for _, sp := range b.eng.Explain(q) {
 				reasons[sp.Reason]++
 			}
 			got, err1 := b.eng.Execute(q)
 			scan, err2 := b.eng.ExecuteScan(q)
+			if rdCrossKind(q, ex) {
+				// A value of another kind than the field's has no meaningful answer: the
+				// native API refuses it at plan time, on both paths (design §9.3).
+				rejected++
+				if !errors.Is(err1, qr.ErrInvalidPredicate) || !errors.Is(err2, qr.ErrInvalidPredicate) {
+					fail("seed=%d %s: cross-kind predicate: Execute err %v, ExecuteScan err %v; want ErrInvalidPredicate from both", s, d, err1, err2)
+				}
+				continue
+			}
+			want := rdOracle(recs, ex, q)
 			if err1 != nil || err2 != nil {
 				fail("seed=%d %s: Execute err %v, ExecuteScan err %v", s, d, err1, err2)
 				continue
@@ -604,7 +614,20 @@ func TestRandDiff(t *testing.T) {
 		b.close()
 		os.RemoveAll(root)
 	}
-	t.Logf("drift=%v seeds=%d..%d queries=%d: failures: %d explain reasons: %v", drift, first, first+seeds-1, total, fails, reasons)
+	t.Logf("drift=%v seeds=%d..%d queries=%d (%d cross-kind, refused): failures: %d explain reasons: %v", drift, first, first+seeds-1, total, rejected, fails, reasons)
+}
+
+// rdCrossKind reports whether q compares a field the engine's extractor declares with a
+// value of another kind.
+func rdCrossKind(q qr.Query, ex *extract.Engine) bool {
+	for _, p := range q.Preds {
+		if tc, ok := p.(qr.TypedCompare); ok {
+			if kind, declared := ex.FieldKind(tc.Field); declared && kind != tc.Value.Kind {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ---- metric oracle ----

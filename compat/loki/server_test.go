@@ -318,6 +318,63 @@ func TestLokiMetricQueryRange(t *testing.T) {
 	}
 }
 
+// The native API refuses a typed comparison whose value is of another kind than the field's
+// (design §9.3), so the Loki layer must give every literal the field's kind: an int literal
+// on a float field is that float (`| dur_s > 2` compares with 2.0), whether the filter is
+// plain, follows a pattern equal to the template, or is inside a metric query. A literal
+// that is not of the field's type, 2.5 on an int field, is refused at translation, as it was.
+func TestTypedFilterLiteralsTakeTheFieldKind(t *testing.T) {
+	eng, err := extract.Compile(config.IndexConfig{Templates: []config.Template{
+		{Name: "latency", Pattern: "took {ms:int}ms"},
+		{Name: "dur", Pattern: "dur {s:float}s"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := storage.NewWriter(t.TempDir(), storage.Options{Schema: eng.IndexedFields(), SegmentSizeBytes: 1 << 40, FlushInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Start(nil)
+	ig := ingest.NewWithLabels(eng, w, []string{"region"})
+	h := loki.NewServer(ig, query.NewEngineWithLabels(w, eng, []string{"region"}), eng).Handler()
+	body := pushJSON([]struct {
+		labels map[string]string
+		values [][2]string
+	}{{map[string]string{"region": "eu"}, [][2]string{
+		{ns(1), "dur 1.5s took 1ms"}, {ns(2), "dur 2s took 2ms"}, {ns(3), "dur 2.5s took 3ms"}, {ns(4), "dur 3s took 4ms"},
+	}}})
+	if rr := do(t, h, "POST", "/loki/api/v1/push", body, "application/json"); rr.Code != http.StatusNoContent {
+		t.Fatalf("push: %d %s", rr.Code, rr.Body.String())
+	}
+	w.Close()
+
+	for expr, want := range map[string]int{
+		`{region="eu"} | dur_s > 2`:                                 2,
+		`{region="eu"} | dur_s >= 2`:                                3,
+		`{region="eu"} | dur_s = 2`:                                 1,
+		`{region="eu"} | dur_s < 2.5`:                               2,
+		`{region="eu"} | pattern "<_>dur <dur_s>s<_>" | dur_s > 2`:  2,
+		`{region="eu"} | pattern "<_>dur <dur_s>s<_>" | dur_s <= 2`: 2,
+		`{region="eu"} | latency_ms >= 2`:                           3,
+	} {
+		rr := do(t, h, "GET", "/loki/api/v1/query_range?"+queryRangeParams(expr), "", "")
+		if rr.Code != http.StatusOK {
+			t.Fatalf("%s: %d %s", expr, rr.Code, rr.Body.String())
+		}
+		if got := countRows(t, rr.Body.Bytes()); got != want {
+			t.Fatalf("%s: %d rows, want %d", expr, got, want)
+		}
+	}
+	metric := "/loki/api/v1/query?query=" + urlEncode(`count_over_time({region="eu"} | dur_s > 2 [1m])`) + "&time=" + ns(30)
+	if rr := do(t, h, "GET", metric, "", ""); rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"2"`) {
+		t.Fatalf("count_over_time with dur_s > 2: %d %s, want the value 2", rr.Code, rr.Body.String())
+	}
+	if rr := do(t, h, "GET", "/loki/api/v1/query_range?"+queryRangeParams(`{region="eu"} | latency_ms > 2.5`), "", ""); rr.Code != http.StatusBadRequest {
+		t.Fatalf("latency_ms > 2.5 on an int field: %d %s, want 400", rr.Code, rr.Body.String())
+	}
+}
+
 // Grafana's log-volume histogram — what Explore runs alongside every log query — ends in
 // `| drop __error__`. It was answered 400, so the histogram never rendered.
 func TestGrafanaLogVolumeQuery(t *testing.T) {

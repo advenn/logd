@@ -99,10 +99,10 @@ Query-side index pushdown is Phase 5; Phase 3 builds and verifies the index.
 
 - **Query planner + index pushdown** (`core/query/plan.go`): per time-pruned, indexed segment (sealed, or since Phase 9 the active one through its in-memory index), a `TypedCompare` (`= < <= > >=`, kind-matched) or a `LineContains` on a configured literal is pushed into the field's `.tidx` — binary-search equality or a range-walk with **inclusive-widened bounds** (so a lossy string key equal to the bound is never dropped). Candidate offset sets are intersected across predicates, smallest set first.
 - **Materialize + re-verify** (`storage.FetchRecords`): only candidate records are read (each page or block once, in offset order), then **every predicate the index has not proven is re-applied exactly** — lossy-key false positives are filtered, while a predicate answered exactly by a lossless int/float/uuid key is settled and not re-extracted — so the result is identical to a scan.
-- **Always-correct fallbacks**: a non-indexed (crash-recovered, never re-indexed) segment, a `!=`, a field absent from a segment's schema, a cross-kind predicate, or a missing/corrupt `.tidx` all degrade to scan (never a wrong answer).
+- **Always-correct fallbacks**: a non-indexed (crash-recovered, never re-indexed) segment, a `!=`, a field absent from a segment's schema, or a missing/corrupt `.tidx` all degrade to scan (never a wrong answer). A cross-kind predicate — a value of another kind than the field's declared type — has no meaningful answer and is refused at plan time.
 - **`Explain`** reports index-vs-scan per segment; **`ExecuteScan`** forces the scan path.
 
-The contract is enforced by a **differential oracle test**: `Execute(q)` (pushdown) must equal `ExecuteScan(q)` (scan) for a large battery of queries over multiple segments — typed ranges/equality/`!=`, lossy string ranges beyond 16 bytes, negative-int bounds, literals, labels, intersections, limits, directions, degrade-to-scan, cross-kind, and config change. It does, for every one.
+The contract is enforced by a **differential oracle test**: `Execute(q)` (pushdown) must equal `ExecuteScan(q)` (scan) for a large battery of queries over multiple segments — typed ranges/equality/`!=`, lossy string ranges beyond 16 bytes, negative-int bounds, literals, labels, intersections, limits, directions, degrade-to-scan, cross-kind (refused by both), and config change. It does, for every one.
 
 ### What Phase 6a delivers (native label index)
 
