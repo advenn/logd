@@ -1,18 +1,25 @@
 package label
 
-import "sort"
+import (
+	"sort"
+	"sync"
+)
 
 // Cardinality caps the number of distinct VALUES indexed per label key within one segment
 // (design §6.2). When a key exceeds the cap, further new values are dropped from the
 // indexed label set — they remain in the record's Extra blob and are still found by scan —
 // and the breached key is reported so the query planner scans that key for the segment
-// (never an index false negative). A max <= 0 disables the cap. It is owned by the writer
-// goroutine (one per active segment; reset on rotate), not safe for concurrent use.
+// (never an index false negative). A max <= 0 disables the cap. One per active segment,
+// reset on rotate. Apply and Breaches are the writer goroutine's; CappedKeys may also be
+// called by a query planning against the active segment while the writer applies the cap.
 type Cardinality struct {
 	max      int
 	values   map[string]map[string]struct{} // key → distinct values kept (bounded by max)
-	capped   map[string]struct{}            // keys that breached the cap
 	breaches map[string]int                 // per-key count of dropped (over-cap) pairs
+	// capped is the one field a query reads, so it alone is locked. It changes only on a
+	// key's first breach, so the lock is off the per-record path.
+	mu     sync.Mutex
+	capped map[string]struct{} // keys that breached the cap
 }
 
 // NewCardinality creates a per-segment value-cardinality cap. max <= 0 disables it.
@@ -51,7 +58,11 @@ func (c *Cardinality) Apply(set Set) Set {
 			continue
 		}
 		// New value for a key already at its cap: drop from the index (stays in Extra).
-		c.capped[p.Key] = struct{}{}
+		if c.breaches[p.Key] == 0 {
+			c.mu.Lock()
+			c.capped[p.Key] = struct{}{}
+			c.mu.Unlock()
+		}
 		c.breaches[p.Key]++
 		dropped = true
 	}
@@ -64,7 +75,12 @@ func (c *Cardinality) Apply(set Set) Set {
 // CappedKeys returns the sorted keys that breached the cap in this segment (recorded in
 // the segment manifest so the planner scans them).
 func (c *Cardinality) CappedKeys() []string {
-	if c == nil || len(c.capped) == 0 {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.capped) == 0 {
 		return nil
 	}
 	out := make([]string, 0, len(c.capped))

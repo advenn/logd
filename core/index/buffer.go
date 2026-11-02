@@ -10,8 +10,15 @@ import (
 
 // Buffer accumulates a segment's (field, key, offset) triples in RAM while the
 // segment is active, and flushes one sorted .tidx per field when the segment seals
-// (design §7.4 step 4, §7.5). It is owned by the writer goroutine — not safe for
-// concurrent use.
+// (design §7.4 step 4, §7.5).
+//
+// One goroutine writes it, the segment's writer, and queries read it while it does, through
+// View: that is how the planner pushes predicates into the active segment (design §9.2).
+// Buffer takes no lock of its own. Every Add must be serialized with every View by the
+// caller's lock — storage.Writer's liveMu, which the writer already holds once per record
+// for the rest of the active segment's live state, so a lock in here would be a second one
+// per record on the hot path. Only the writer calls the other methods, and they read what
+// only the writer writes, so they need no lock.
 //
 // v1 holds everything in memory; the documented bound is
 // segment_size/avg_entry × matches × 24B (acceptable at ~64MB segments). The Add/Flush
@@ -65,6 +72,13 @@ func (b *Buffer) Add(field string, key [KeySize]byte, offset uint64) {
 	fe.entries = append(fe.entries, Entry{Key: key, Offset: offset})
 }
 
+// AddAll is Add for every value extracted from one record.
+func (b *Buffer) AddAll(keys []KeyedValue, offset uint64) {
+	for _, kv := range keys {
+		b.Add(kv.Field, kv.Key, offset)
+	}
+}
+
 // Flush writes one .tidx (at TidxPath) per field that accumulated any entries and
 // returns the set of fields it actually wrote — that becomes the segment's recorded
 // schema, so the planner only ever expects a .tidx that exists. segBase is the
@@ -78,7 +92,12 @@ func (b *Buffer) Flush(segBase string, segmentID uint64) ([]FieldType, error) {
 			continue
 		}
 		path := TidxPath(segBase, field)
-		if err := WriteTIDX(path, fe.kind, segmentID, fe.entries); err != nil {
+		// WriteTIDX sorts what it is given, in place, and a query may be reading these very
+		// entries through a FieldView taken before the seal (see View). Sorting them under
+		// it would hand that query reordered and torn entries, so the file is written from a
+		// copy and the buffer keeps its append order.
+		sorted := append([]Entry(nil), fe.entries...)
+		if err := WriteTIDX(path, fe.kind, segmentID, sorted); err != nil {
 			return written, fmt.Errorf("writing %s: %w", path, err)
 		}
 		written = append(written, FieldType{Name: field, Kind: fe.kind, Pattern: fe.pattern})

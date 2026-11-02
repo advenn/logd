@@ -22,11 +22,16 @@ const (
 
 var lidxCRC = crc32.MakeTable(crc32.IEEE)
 
-// Builder accumulates a segment's label streams while it is active (writer-owned, not
-// concurrency-safe). Each distinct label set is interned to a StreamID; each record's
-// offset is appended to its stream's posting list.
+// Builder accumulates a segment's label streams while it is active. Each distinct label set
+// is interned to a StreamID; each record's offset is appended to its stream's posting list.
+//
+// One goroutine writes it, the segment's writer, and queries read it while it does, through
+// Postings and HasKey (design §9.2). Like index.Buffer it takes no lock of its own: every
+// call that changes what those two read — InternCanonical when it adds a stream, and
+// AddPosting — must be serialized with them by the caller's lock (storage.Writer's liveMu).
+// Find and the dictionary map are the writer's alone and need none; so does Flush.
 type Builder struct {
-	byCanon map[string]uint32
+	byCanon map[string]uint32 // read and written by the writer only
 	streams []*streamData
 }
 
@@ -44,6 +49,14 @@ func NewBuilder() *Builder {
 // set is seen in this segment.
 func (b *Builder) Intern(s Set) uint32 {
 	return b.InternCanonical(s.Canonical(), s)
+}
+
+// Find returns the StreamID already interned for canonical label set c. It reads only the
+// writer's own dictionary, so the writer can call it without the lock and take the lock
+// only for the rare InternCanonical that adds a stream.
+func (b *Builder) Find(c string) (uint32, bool) {
+	id, ok := b.byCanon[c]
+	return id, ok
 }
 
 // InternCanonical is Intern for a caller that has already computed s.Canonical(). The
@@ -66,6 +79,52 @@ func (b *Builder) AddPosting(streamID uint32, offset uint64) {
 	if int(streamID) < len(b.streams) {
 		b.streams[streamID].offsets = append(b.streams[streamID].offsets, offset)
 	}
+}
+
+// Postings returns the posting list of every stream whose label set carries key=value, the
+// candidates of a label-equality pushdown into the active segment. The caller must hold the
+// lock (see Builder), and must read each list only below the bound it took before calling:
+// each is the stream's list as it stands, entries past that bound included. Elements are
+// never rewritten once appended, so the lists stay valid after the lock is released, while
+// the writer appends on (see index.FieldView). MergePostings turns them into a candidate set.
+func (b *Builder) Postings(key, value string) [][]uint64 {
+	var out [][]uint64
+	for _, s := range b.streams {
+		if v, ok := s.set.Get(key); ok && v == value {
+			out = append(out, s.offsets)
+		}
+	}
+	return out
+}
+
+// HasKey reports whether any stream interned so far carries key. The caller must hold the
+// lock (see Builder).
+func (b *Builder) HasKey(key string) bool {
+	for _, s := range b.streams {
+		if _, ok := s.set.Get(key); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// MergePostings returns the offsets below `below` from the lists Postings returned,
+// ascending: for the active segment, what Reader.LabelOffsets returns for a sealed one.
+func MergePostings(lists [][]uint64, below uint64) []uint64 {
+	var out []uint64
+	for _, l := range lists {
+		for _, o := range l {
+			if o < below {
+				out = append(out, o)
+			}
+		}
+	}
+	// Each list is ascending already (offsets are appended in write order); only several
+	// of them need merging. A record is in exactly one stream, so there are no duplicates.
+	if len(lists) > 1 {
+		sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	}
+	return out
 }
 
 // Flush writes the segment's label index to path atomically. It returns wrote=false
