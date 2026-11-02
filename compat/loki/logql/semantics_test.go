@@ -224,12 +224,16 @@ func TestStagesMatchReference(t *testing.T) {
 		q    string
 		keep func(string) bool
 	}{
-		// the native typed field, beside the stages.
+		// pattern equal to the template: the template's semantics, i.e. the native query's.
+		{`{app="checkout"} |= "took=" | pattern "<_>took=<latency_ms>ms<_>" | latency_ms > 200`,
+			func(m string) bool {
+				return templateAny(m, func(n *big.Int) bool { return n.Cmp(big.NewInt(200)) > 0 })
+			}},
 		{`{app="checkout"} | latency_ms > 200`,
 			func(m string) bool {
 				return templateAny(m, func(n *big.Int) bool { return n.Cmp(big.NewInt(200)) > 0 })
 			}},
-		// pattern: Loki's first-occurrence capture.
+		// a pattern that is not the template (renamed capture): Loki's first-occurrence capture.
 		{`{app="checkout"} | pattern "<_>took=<ms>ms<_>" | ms > 200`,
 			func(m string) bool { return numericFirst(refPattern, m, gt(200)) }},
 		{`{app="checkout"} | pattern "<_>took=<ms>ms<_>" | ms <= 12.5`,
@@ -274,8 +278,157 @@ func TestStagesMatchReference(t *testing.T) {
 	}
 }
 
+// The structural rule's two sides, line by line: on every conforming line the template's
+// answer equals Loki's for every bound, and they differ exactly on the non-conforming
+// lines, which structural.go lists. The query itself answers with the template's semantics.
+func TestStructuralMatchDiffersFromLokiOnlyOnNonConformingLines(t *testing.T) {
+	ex := testbedEngine(t)
+	lines := mixedCorpus()
+	eng := buildEngine(t, ex, lines)
+
+	// Loki's real behaviour for `| pattern "<_>took=<latency_ms>ms<_>" | latency_ms op b`:
+	// the first capture; a missing label drops the line; a value that does not convert
+	// KEEPS it, flagged __error__=LabelFilterErr (label_filter.go, NumericLabelFilter).
+	loki := func(msg string, cmp func(float64) bool) bool {
+		m := refPattern.FindStringSubmatch(msg)
+		if m == nil {
+			return false
+		}
+		f, err := strconv.ParseFloat(m[1], 64)
+		return err != nil || cmp(f)
+	}
+	// Conforming, as structural.go defines it, within the ±2^53 the argument assumes.
+	conforming := func(msg string) bool {
+		first := strings.Index(msg, "took=")
+		if first < 0 {
+			return true
+		}
+		ms := refTemplate.FindAllStringSubmatchIndex(msg, -1)
+		if len(ms) != 1 || ms[0][0] != first {
+			return false
+		}
+		n, _ := strconv.ParseInt(msg[ms[0][2]:ms[0][3]], 10, 64)
+		return n <= 1<<53 && n >= -(1<<53)
+	}
+	type bound struct {
+		op string
+		b  string
+		f  func(float64) bool
+		i  func(*big.Int) bool
+	}
+	big2e53 := new(big.Int).Lsh(big.NewInt(1), 53)
+	bounds := []bound{
+		{">", "200", func(f float64) bool { return f > 200 }, func(n *big.Int) bool { return n.Cmp(big.NewInt(200)) > 0 }},
+		{">", "10", func(f float64) bool { return f > 10 }, func(n *big.Int) bool { return n.Cmp(big.NewInt(10)) > 0 }},
+		{"<", "10", func(f float64) bool { return f < 10 }, func(n *big.Int) bool { return n.Cmp(big.NewInt(10)) < 0 }},
+		{"=", "247", func(f float64) bool { return f == 247 }, func(n *big.Int) bool { return n.Cmp(big.NewInt(247)) == 0 }},
+		{">", big2e53.String(), func(f float64) bool { return f > 9007199254740992 }, func(n *big.Int) bool { return n.Cmp(big2e53) > 0 }},
+	}
+
+	differs := map[string]bool{}
+	for _, b := range bounds {
+		q := fmt.Sprintf(`{app="checkout"} | pattern "<_>took=<latency_ms>ms<_>" | latency_ms %s %s`, b.op, b.b)
+		got := run(t, eng, ex, q, len(lines))
+		exp := want(lines, "checkout", func(m string) bool { return templateAny(m, b.i) })
+		if strings.Join(got, "\n") != strings.Join(exp, "\n") {
+			t.Fatalf("%s: the structural match must answer with the template's semantics\n got: %q\nwant: %q", q, got, exp)
+		}
+		for _, l := range lines {
+			if l.app != "checkout" {
+				continue
+			}
+			if templateAny(l.msg, b.i) != loki(l.msg, b.f) {
+				if conforming(l.msg) {
+					t.Errorf("conforming line %q: the template and Loki disagree on latency_ms %s %s", l.msg, b.op, b.b)
+				}
+				differs[l.msg] = true
+			}
+		}
+	}
+	// Every kind of non-conforming line shows up as a difference.
+	for _, prefix := range []string{
+		"took=12.5ms",             // not an int: Loki compares 12.5
+		"took=abcms",              // not a number: Loki keeps it, flagged
+		"took=7",                  // no "ms" after it: Loki's capture runs to the end of the line
+		"took=5 ms",               // displaced literal: Loki's capture is "5 ", which does not convert
+		"took=ms",                 // empty capture: Loki keeps it, flagged
+		"took=9007199254740993ms", // beyond 2^53: Loki rounds
+	} {
+		found := false
+		for m := range differs {
+			if m == prefix {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no bound separated the template from Loki on %q", prefix)
+		}
+	}
+	multi := 0
+	for m := range differs {
+		if strings.Contains(m, "first, then") {
+			multi++
+		}
+	}
+	if multi == 0 {
+		t.Error("no line with two occurrences separated the template from Loki")
+	}
+	for m := range differs {
+		if conforming(m) {
+			t.Errorf("the template and Loki differ on the conforming line %q", m)
+		}
+	}
+}
+
+// The structural match changes the access path, not the answer: the pattern form returns
+// exactly what the native form does, uses the index where the native form does, and the
+// unmatched forms scan.
+func TestStructuralMatchUsesIndex(t *testing.T) {
+	ex := testbedEngine(t)
+	lines := mixedCorpus()
+	eng := buildEngine(t, ex, lines)
+	indexed := func(q string) int {
+		n := 0
+		for _, p := range eng.Explain(fullRange(translate(t, q, ex), 1)) {
+			if p.Mode == "index" {
+				n++
+			}
+		}
+		return n
+	}
+	native := `{app="checkout"} | latency_ms > 1000`
+	pattern := `{app="checkout"} |= "took=" | pattern "<_>took=<latency_ms>ms<_>" | latency_ms > 1000`
+	if a, b := run(t, eng, ex, native, len(lines)), run(t, eng, ex, pattern, len(lines)); strings.Join(a, "\n") != strings.Join(b, "\n") {
+		t.Fatalf("pattern form %q\nnative form %q", b, a)
+	}
+	if indexed(native) == 0 || indexed(pattern) != indexed(native) {
+		t.Fatalf("index use: native %d segments, pattern %d", indexed(native), indexed(pattern))
+	}
+	for _, q := range []string{
+		`{app="checkout"} |= "took=" | regexp "took=(?P<latency_ms>[0-9]+)ms" | latency_ms > 1000`,
+		`{app="checkout"} | pattern "<_>took=<ms>ms<_>" | ms > 1000`,
+	} {
+		// Only the label index can be used (app="checkout"), never the typed one: per segment
+		// the plan is exactly that of the bare selector.
+		// (The open writer's flush tick may seal the active segment between two plans, so a
+		// difference is retried once.)
+		for attempt := 0; ; attempt++ {
+			a := fmt.Sprint(eng.Explain(fullRange(translate(t, q, ex), 1)))
+			b := fmt.Sprint(eng.Explain(fullRange(translate(t, `{app="checkout"}`, ex), 1)))
+			if a == b {
+				break
+			}
+			if attempt > 0 {
+				t.Fatalf("%s: plan %s\nthe selector alone: %s", q, a, b)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+}
+
 // Metric queries over parser stages: series split by extracted labels, an extracted unwrap,
-// and grouping by an extracted label — against the reference.
+// and grouping by an extracted label — against the reference, and equal to the same metric
+// over the template where the forms are equivalent.
 func TestMetricOverParserStages(t *testing.T) {
 	ex := testbedEngine(t)
 	lines := mixedCorpus()
@@ -305,6 +458,15 @@ func TestMetricOverParserStages(t *testing.T) {
 			t.Fatalf("%s: %+v", q, s)
 		}
 		return s[0].Points[0].Value
+	}
+
+	// count: pattern equal to the template, native, and the reference.
+	ref := len(want(lines, "checkout", func(m string) bool {
+		return templateAny(m, func(n *big.Int) bool { return n.Cmp(big.NewInt(200)) > 0 })
+	}))
+	if a, b := one(`sum(count_over_time({app="checkout"} | pattern "<_>took=<latency_ms>ms<_>" | latency_ms > 200 [5m]))`),
+		one(`sum(count_over_time({app="checkout"} | latency_ms > 200 [5m]))`); a != b || int(a) != ref {
+		t.Fatalf("count: pattern %v, native %v, reference %d", a, b, ref)
 	}
 
 	// sum of an unwrapped regexp label, against the reference.

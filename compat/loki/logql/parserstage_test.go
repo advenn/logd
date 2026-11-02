@@ -1,6 +1,7 @@
 package logql_test
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -186,8 +187,121 @@ func TestTranslateWithoutParserStageUnchanged(t *testing.T) {
 	}
 }
 
+// The structural matcher (design §9.3): a pattern equal to a template — literals byte for
+// byte, captures in the same places, named as the template's fields — makes filters on the
+// captures that template's TypedCompare. Every deviation is no match, and the filters are
+// dynamic.
+func TestStructuralMatcher(t *testing.T) {
+	ex := testbedEngine(t)
+	for _, c := range []struct {
+		name, pattern string
+		match         bool
+		reason        string // a fragment of the no-match reason
+	}{
+		{"exact, <_> at both ends", `<_>took=<latency_ms>ms<_>`, true, ""},
+		{"exact, no trailing <_>", `<_>took=<latency_ms>ms`, true, ""},
+		{"no leading <_>: anchored", `took=<latency_ms>ms<_>`, false, "anchors it at the start"},
+		{"whitespace deviation", `<_>took= <latency_ms>ms<_>`, false, "no template has exactly"},
+		{"whitespace deviation (space form)", `<_>took <latency_ms>ms<_>`, false, "no template has exactly"},
+		{"renamed capture", `<_>took=<ms>ms<_>`, false, "its captures are <latency_ms>, not <ms>"},
+		{"extra fragment", `<_>took=<latency_ms>ms total<_>`, false, "no template has exactly"},
+		{"extra capture", `<_>took=<latency_ms>ms <x>`, false, "ends with the capture <x>"},
+		{"missing fragment", `<_>took=<latency_ms><_>`, false, "consecutive"},
+		{"skip inside", `<_>took=<latency_ms>m<_>s`, false, "skips text"},
+		{"ends with a capture", `<_>took=<latency_ms>`, false, "ends with the capture <latency_ms>"},
+		{"a capture before", `<x> took=<latency_ms>ms<_>`, false, "does not start with <_>"},
+		{"the other template", `<_>status=<status_code> <_>`, true, ""},
+	} {
+		q := fmt.Sprintf(`{app="a"} | pattern %q | latency_ms > 200 | status_code >= 500`, c.pattern)
+		ast, err := logql.Parse(q)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		tr, err := logql.TranslateLog(ast, ex)
+		if err != nil {
+			if c.reason == "consecutive" && strings.Contains(err.Error(), "consecutive") {
+				continue // not even a valid pattern
+			}
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		m := tr.Mappings[0]
+		if got := m.Kind == "template"; got != c.match {
+			t.Errorf("%s: %s → %s (%s), want match=%v", c.name, c.pattern, m.Kind, m.Reason, c.match)
+			continue
+		}
+		if !c.match && !strings.Contains(m.Reason, c.reason) {
+			t.Errorf("%s: reason %q lacks %q", c.name, m.Reason, c.reason)
+		}
+		_, typed := tr.Preds[1].(query.TypedCompare)
+		if c.match && m.Template == "latency" && !typed {
+			t.Errorf("%s: matched, yet latency_ms > 200 is %T", c.name, tr.Preds[1])
+		}
+		if !c.match {
+			if _, dyn := tr.Preds[1].(query.DynamicCompare); !dyn && strings.Contains(c.pattern, "latency_ms") {
+				t.Errorf("%s: no match, yet latency_ms > 200 is %T", c.name, tr.Preds[1])
+			}
+		}
+	}
+}
+
+// A match is given up, for the whole query, when one filter on the template's fields is not
+// a comparison the agreement argument covers; and only a lone pattern stage can match.
+func TestStructuralMatchGivenUp(t *testing.T) {
+	ex := testbedEngine(t)
+	const pat = `{app="a"} | pattern "<_>took=<latency_ms>ms<_>"`
+	for _, c := range []struct{ rest, reason string }{
+		{`| latency_ms > 200.5`, "not an int"},
+		{`| latency_ms != 200`, "!= is never answered from an index"},
+		{`| latency_ms =~ "2.."`, "regex"},
+		{`| latency_ms = "200"`, "string comparison"},
+		{`| latency_ms > 100 | latency_ms != 300`, "!="},
+		{`| json | latency_ms > 200`, "2 parser stages"},
+	} {
+		tr := translateLog(t, pat+" "+c.rest, ex)
+		if m := tr.Mappings[0]; m.Kind != "dynamic" || !strings.Contains(m.Reason, c.reason) {
+			t.Errorf("%s: %+v, want a dynamic mapping because of %q", c.rest, m, c.reason)
+		}
+		for _, p := range tr.Preds {
+			if _, ok := p.(query.TypedCompare); ok {
+				t.Errorf("%s: a TypedCompare survived a given-up match", c.rest)
+			}
+		}
+	}
+	// The filters the argument does cover all map.
+	tr := translateLog(t, pat+` | latency_ms > 200 | latency_ms <= 900 | latency_ms = 250 | latency_ms >= "100"`, ex)
+	for i, p := range tr.Preds[1:] {
+		if _, ok := p.(query.TypedCompare); !ok {
+			t.Errorf("filter %d: %T", i, p)
+		}
+	}
+	// A filter on a field of another template is not a filter on this pattern's captures.
+	tr = translateLog(t, pat+` | latency_ms > 200 | status_code >= 500`, ex)
+	if _, ok := tr.Preds[2].(query.TypedCompare); !ok || tr.Mappings[2].Kind != "typed" {
+		t.Errorf("status_code after the pattern: %T %+v", tr.Preds[2], tr.Mappings[2])
+	}
+	// No extractor: nothing can match.
+	if m := translateLog(t, pat+` | latency_ms > 200`, nil).Mappings[0]; m.Kind != "dynamic" {
+		t.Errorf("without templates: %+v", m)
+	}
+}
+
+// The matcher's literal condition: after an int capture, a literal starting with '-' can
+// begin inside a signed value, so Loki's capture would end early. Such a template never
+// matches.
+func TestStructuralMatchRefusesLiteralInsideValue(t *testing.T) {
+	ex, err := extract.Compile(config.IndexConfig{Templates: []config.Template{{Name: "rng", Pattern: "range={lo:int}-{hi:int} "}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := translateLog(t, `{a="b"} | pattern "<_>range=<rng_lo>-<rng_hi> <_>" | rng_lo > 1`, ex)
+	if m := tr.Mappings[0]; m.Kind != "dynamic" || !strings.Contains(m.Reason, `starts with "-"`) {
+		t.Fatalf("%+v", m)
+	}
+}
+
 // TranslateMetric wires the stage into the metric query: series labels include extracted
-// labels (but not the unwrapped one), and an extracted unwrap is read dynamically.
+// labels (but not the unwrapped one), and an extracted unwrap is read dynamically; a
+// template-mapped unwrap keeps the native typed path.
 func TestTranslateMetricWithParserStage(t *testing.T) {
 	ex := testbedEngine(t)
 	ast, err := logql.ParseExpr(`sum by (method) (avg_over_time({app="a"} | regexp "(?P<method>[A-Z]+) took=(?P<latency_ms>[0-9]+)ms" | unwrap latency_ms [5m]))`)
@@ -200,6 +314,14 @@ func TestTranslateMetricWithParserStage(t *testing.T) {
 	}
 	if mq.SeriesLabels == nil || mq.UnwrapValue == nil || mq.Unwrap != "latency_ms" {
 		t.Fatalf("hooks not set: %+v", mq)
+	}
+	ast, _ = logql.ParseExpr(`avg_over_time({app="a"} | pattern "<_>took=<latency_ms>ms<_>" | unwrap latency_ms [5m])`)
+	mq, err = logql.TranslateMetric(ast.(*logql.MetricExpr), ex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mq.UnwrapValue != nil || mq.SeriesLabels == nil {
+		t.Fatalf("a template-mapped unwrap reads the typed field natively: %+v", mq)
 	}
 	ast, _ = logql.ParseExpr(`avg_over_time({app="a"} | unwrap latency_ms [5m])`)
 	mq, _ = logql.TranslateMetric(ast.(*logql.MetricExpr), ex)

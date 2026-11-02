@@ -29,8 +29,9 @@ func Translate(q *Query, ex *extract.Engine) ([]query.Predicate, error) {
 type Translation struct {
 	// Preds are the native predicates, ANDed.
 	Preds []query.Predicate
-	// Mappings say how each parser stage, and each label filter after one, was translated,
-	// and why.
+	// Mappings say how each parser stage, and each label filter after one, was translated:
+	// to a template's index or to a dynamic, per-line comparison, and why. Explain reports
+	// them (design §9.3's upgrade path: a user can see why a query scanned).
 	Mappings []Mapping
 
 	prog   *program // the parser and drop __error__ stages; nil when the query has no parser
@@ -40,13 +41,15 @@ type Translation struct {
 // Mapping is how one pipeline stage was translated.
 type Mapping struct {
 	Stage string `json:"stage"`
-	// Kind is, for a parser stage, "dynamic": its labels are extracted per line at query
-	// time, and filters on them scan. For a label filter it is "typed" (a TypedCompare on a
-	// declared template field, which the planner pushes into the index), "dynamic" (a
-	// DynamicCompare, evaluated on scan and on re-verify), or "label" (a filter on the
-	// record's own labels, as without a parser stage).
-	Kind   string `json:"kind"`
-	Reason string `json:"reason"`
+	// Kind is, for a parser stage, "template" (a pattern equal to a declared template: the
+	// filters on its captures are typed and use the template's index) or "dynamic" (its
+	// labels are extracted per line at query time, and filters on them scan). For a label
+	// filter it is "typed" (a TypedCompare, which the planner pushes into the index),
+	// "dynamic" (a DynamicCompare, evaluated on scan and on re-verify), or "label" (a filter
+	// on the record's own labels, as without a parser stage).
+	Kind     string `json:"kind"`
+	Template string `json:"template,omitempty"`
+	Reason   string `json:"reason"`
 }
 
 // Parses reports whether the query has a parser stage, so that a result's labels depend on
@@ -78,8 +81,10 @@ func (t *Translation) Labels(e model.LogEntry) map[string]string {
 //
 // After a parser stage, a filter on a name the stages may extract becomes a
 // query.DynamicCompare that re-extracts it per line and converts as Loki does (§9.3: the
-// Loki layer maps comparisons on untyped fields to the dynamic predicate). A filter on a
-// name no preceding stage can extract translates as if there were no parser stage. Line filters
+// Loki layer maps comparisons on untyped fields to the dynamic predicate). The exception is
+// a `| pattern` that structurally equals a declared template (structural.go): filters on its
+// captures become that template's TypedCompare, and use its index. A filter on a name no
+// preceding stage can extract translates as if there were no parser stage. Line filters
 // never depend on the stages (logd has no line_format), so they stay native wherever they
 // are.
 func TranslateLog(q *Query, ex *extract.Engine) (*Translation, error) {
@@ -92,7 +97,10 @@ func TranslateLog(q *Query, ex *extract.Engine) (*Translation, error) {
 		t.Preds = append(t.Preds, p)
 	}
 
+	// Compile the parser stages first: whether a pattern may use a template depends on the
+	// whole pipeline (the other stages, and every filter on the template's fields).
 	parsers := map[int]stageParser{}
+	var patternAt []int
 	for i, stage := range q.Pipeline {
 		ps, ok := stage.(*ParserStage)
 		if !ok {
@@ -103,7 +111,11 @@ func TranslateLog(q *Query, ex *extract.Engine) (*Translation, error) {
 			return nil, err
 		}
 		parsers[i] = sp
+		if ps.Parser == "pattern" {
+			patternAt = append(patternAt, i)
+		}
 	}
+	match, matchReason := decideTemplate(q, parsers, patternAt, ex)
 
 	for i, stage := range q.Pipeline {
 		switch s := stage.(type) {
@@ -115,10 +127,16 @@ func TranslateLog(q *Query, ex *extract.Engine) (*Translation, error) {
 			t.Preds = append(t.Preds, p)
 		case *ParserStage:
 			t.prog.steps = append(t.prog.steps, step{parser: parsers[i]})
-			m := Mapping{Stage: stageString(s), Kind: "dynamic", Reason: "its labels are extracted from each line at query time"}
+			m := Mapping{Stage: stageString(s), Kind: "dynamic", Reason: matchReason}
+			if s.Parser != "pattern" {
+				m.Reason = "only a `| pattern` can equal a template; this stage's labels are extracted from each line at query time"
+			} else if match != nil {
+				m.Kind, m.Template = "template", match.shape.Name
+				m.Reason = fmt.Sprintf("the pattern equals template %q (%s): filters on its fields are typed and use the index", match.shape.Name, match.shape.Pattern)
+			}
 			t.Mappings = append(t.Mappings, m)
 		case *LabelFilter:
-			p, m, err := t.labelFilter(s, ex)
+			p, m, err := t.labelFilter(s, ex, match)
 			if err != nil {
 				return nil, err
 			}
@@ -130,7 +148,7 @@ func TranslateLog(q *Query, ex *extract.Engine) (*Translation, error) {
 			// unwrap is a metric-only annotation (consumed by the range aggregation), not a
 			// log-filter predicate. Its value is read where the stage stands in the pipeline.
 			n := len(t.prog.steps)
-			if t.prog.hasParser(n) && t.prog.mayProduce(n, s.Field) {
+			if t.prog.hasParser(n) && (match == nil || !match.has(s.Field)) && t.prog.mayProduce(n, s.Field) {
 				t.unwrap = t.prog.unwrapValue(n, s.Field)
 			}
 		case *LabelsStage:
@@ -158,7 +176,7 @@ func TranslateLog(q *Query, ex *extract.Engine) (*Translation, error) {
 
 // labelFilter translates one `| name op value` stage, returning the Mapping Explain shows
 // for it when it follows a parser stage.
-func (t *Translation) labelFilter(s *LabelFilter, ex *extract.Engine) (query.Predicate, *Mapping, error) {
+func (t *Translation) labelFilter(s *LabelFilter, ex *extract.Engine, match *templateMatch) (query.Predicate, *Mapping, error) {
 	n := len(t.prog.steps)
 	if !t.prog.hasParser(n) {
 		p, err := labelFilterPredicate(s, ex)
@@ -166,6 +184,14 @@ func (t *Translation) labelFilter(s *LabelFilter, ex *extract.Engine) (query.Pre
 	}
 	m := &Mapping{Stage: stageString(s)}
 	switch {
+	case match != nil && match.has(s.Label):
+		p, err := typedPredicate(s.Label, s.Op, s.Value, match.fields[s.Label])
+		if err != nil {
+			return nil, nil, err
+		}
+		m.Kind, m.Template = "typed", match.shape.Name
+		m.Reason = fmt.Sprintf("%s is a field of template %q, which the pattern equals: a TypedCompare, answered from the index where the segment has one", s.Label, match.shape.Name)
+		return p, m, nil
 	case t.prog.mayProduce(n, s.Label):
 		p, err := t.prog.dynamicCompare(n, s)
 		if err != nil {
@@ -187,6 +213,45 @@ func (t *Translation) labelFilter(s *LabelFilter, ex *extract.Engine) (query.Pre
 		}
 		return p, m, nil
 	}
+}
+
+// has reports whether name is one of the matched template's fields.
+func (m *templateMatch) has(name string) bool {
+	_, ok := m.fields[name]
+	return ok
+}
+
+// decideTemplate applies the structural matcher (structural.go) to the query's pattern
+// stage, if it has one, and returns the template it may use or, in words, why not. A match
+// requires the pattern to be the query's only parser stage — another stage could extract the
+// same names first — and every filter after it on the template's fields to be one the
+// argument in structural.go covers: one such filter that is not gives up the match for the
+// whole query, so one query never mixes the template's semantics with Loki's.
+func decideTemplate(q *Query, parsers map[int]stageParser, patternAt []int, ex *extract.Engine) (*templateMatch, string) {
+	if len(patternAt) == 0 {
+		return nil, ""
+	}
+	if len(parsers) > 1 {
+		return nil, fmt.Sprintf("the query has %d parser stages; a pattern uses a template only when it is the only one", len(parsers))
+	}
+	if ex == nil {
+		return nil, "no templates are configured"
+	}
+	at := patternAt[0]
+	match, reason := matchTemplate(parsers[at].(*patternStage).nodes, ex.Shapes())
+	if match == nil {
+		return nil, "no template match: " + reason
+	}
+	for _, stage := range q.Pipeline[at+1:] {
+		f, ok := stage.(*LabelFilter)
+		if !ok || !match.has(f.Label) {
+			continue
+		}
+		if why := mappableFilter(f, match.fields[f.Label]); why != "" {
+			return nil, fmt.Sprintf("the pattern equals template %q, but `%s` cannot use it: %s", match.shape.Name, stageString(f), why)
+		}
+	}
+	return match, ""
 }
 
 // compileParser builds a parser stage.
