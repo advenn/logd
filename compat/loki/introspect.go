@@ -106,7 +106,11 @@ func (s *Server) handleIndexStats(w http.ResponseWriter, r *http.Request) {
 }
 
 type explainResponse struct {
-	Query    string             `json:"query"`
+	Query string `json:"query"`
+	// Pipeline says how each parser stage, and each label filter after one, was translated:
+	// a pattern mapped to a template's index, or labels extracted per line and compared by a
+	// dynamic predicate (scan) — and why. Empty for a query without parser stages.
+	Pipeline []logql.Mapping    `json:"pipeline"`
 	Segments []explainSegment   `json:"segments"`
 	Summary  explainSummaryJSON `json:"summary"`
 }
@@ -132,7 +136,10 @@ type explainSummaryJSON struct {
 // handleExplain reports, per time-pruned segment, whether this query would be answered
 // from the typed/label index or by scanning. This is what makes the differentiator
 // observable instead of merely fast: it distinguishes "the index worked" from "the data
-// happened to be small".
+// happened to be small". For a query with parser stages it also reports how each stage and
+// each filter after it was translated — a `| pattern` mapped to a declared template's index,
+// or labels extracted per line and compared by scan — and why: the upgrade path of design
+// §9.3, so a user can see what to declare, or what to change in the query, to stop scanning.
 //
 // Note it re-runs planning rather than reporting what an execution did, so it costs a
 // second planning pass. That is acceptable for a debug route and is why it is not on the
@@ -148,12 +155,15 @@ func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "explain accepts a log query, not a metric query")
 		return
 	}
-	q, err := s.logQuery(r, lq)
+	q, tr, err := s.logQuery(r, lq)
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	resp := explainResponse{Query: r.FormValue("query"), Segments: []explainSegment{}}
+	resp := explainResponse{Query: r.FormValue("query"), Pipeline: tr.Mappings, Segments: []explainSegment{}}
+	if resp.Pipeline == nil {
+		resp.Pipeline = []logql.Mapping{}
+	}
 	for _, p := range s.qe.Explain(q) {
 		resp.Segments = append(resp.Segments, explainSegment{
 			SegmentID:  p.SegmentID,

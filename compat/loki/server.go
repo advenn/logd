@@ -170,7 +170,7 @@ func (s *Server) queryRangeWith(w http.ResponseWriter, r *http.Request, exec fun
 	}
 	switch e := ast.(type) {
 	case *logql.Query:
-		q, err := s.logQuery(r, e)
+		q, tr, err := s.logQuery(r, e)
 		if err != nil {
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
@@ -180,7 +180,7 @@ func (s *Server) queryRangeWith(w http.ResponseWriter, r *http.Request, exec fun
 			s.writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeJSON(w, newQueryRangeResponse(s.streamsFor(results)))
+		writeJSON(w, newQueryRangeResponse(s.streamsFor(results, tr)))
 	case *logql.MetricExpr:
 		mq, err := s.metricQuery(r, e)
 		if err != nil {
@@ -223,7 +223,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	switch e := ast.(type) {
 	case *logql.Query:
-		q, err := s.logQuery(r, e)
+		q, tr, err := s.logQuery(r, e)
 		if err != nil {
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
@@ -233,7 +233,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeJSON(w, newQueryRangeResponse(s.streamsFor(results)))
+		writeJSON(w, newQueryRangeResponse(s.streamsFor(results, tr)))
 	case *logql.MetricExpr:
 		mq, err := s.metricQuery(r, e)
 		if err != nil {
@@ -272,12 +272,12 @@ func (s *Server) handleTail(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "tail supports log queries only")
 		return
 	}
-	preds, err := logql.Translate(logAST, s.ex)
+	tr, err := logql.TranslateLog(logAST, s.ex)
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	preds = s.scopedPreds(r, preds)
+	preds := s.scopedPreds(r, tr.Preds)
 
 	ws, err := wsUpgrade(w, r)
 	if err != nil {
@@ -310,7 +310,7 @@ func (s *Server) handleTail(w http.ResponseWriter, r *http.Request) {
 				ws.writeClose(wsCloseGoingAway)
 				return
 			}
-			msg, err := json.Marshal(tailResponse{Streams: s.streamsFor(drainTail(ch, e)), DroppedEntries: []any{}})
+			msg, err := json.Marshal(tailResponse{Streams: s.streamsFor(drainTail(ch, e), tr), DroppedEntries: []any{}})
 			if err != nil {
 				return
 			}
@@ -403,9 +403,11 @@ func (s *Server) series(r *http.Request) []map[string]string {
 
 // streamsFor groups results into Loki streams, stripping the internal tenant label from
 // the response so it never surfaces in query or tail stream labels (Grafana would show
-// it). It is stripped even with multitenancy off, for data stored while it was on.
-func (s *Server) streamsFor(results []model.LogEntry) []streamResult {
-	streams := groupStreams(results)
+// it). It is stripped even with multitenancy off, for data stored while it was on. The
+// query's translation gives each entry's labels: with parser stages, the labels they
+// extract from its line are added, as Loki adds them.
+func (s *Server) streamsFor(results []model.LogEntry, tr *logql.Translation) []streamResult {
+	streams := groupStreams(results, tr.Labels)
 	for i := range streams {
 		delete(streams[i].Stream, model.TenantLabel)
 	}
@@ -448,26 +450,27 @@ func sortedSetKeys(m map[string]struct{}) []string {
 	return out
 }
 
-// logQuery builds a native log Query from a parsed selector + the HTTP time/limit params.
-func (s *Server) logQuery(r *http.Request, ast *logql.Query) (query.Query, error) {
-	preds, err := logql.Translate(ast, s.ex)
+// logQuery builds a native log Query from a parsed selector + the HTTP time/limit params,
+// and returns the translation too: responses need it for the labels of each entry.
+func (s *Server) logQuery(r *http.Request, ast *logql.Query) (query.Query, *logql.Translation, error) {
+	tr, err := logql.TranslateLog(ast, s.ex)
 	if err != nil {
-		return query.Query{}, err
+		return query.Query{}, nil, err
 	}
-	preds = s.scopedPreds(r, preds)
+	preds := s.scopedPreds(r, tr.Preds)
 	start, end, err := s.timeRange(r)
 	if err != nil {
-		return query.Query{}, err
+		return query.Query{}, nil, err
 	}
 	limit, err := parseLimit(r.FormValue("limit"))
 	if err != nil {
-		return query.Query{}, err
+		return query.Query{}, nil, err
 	}
 	dir, err := parseDirection(r.FormValue("direction"))
 	if err != nil {
-		return query.Query{}, err
+		return query.Query{}, nil, err
 	}
-	return query.Query{Start: start, End: end, Preds: preds, Limit: limit, Direction: dir}, nil
+	return query.Query{Start: start, End: end, Preds: preds, Limit: limit, Direction: dir}, tr, nil
 }
 
 // metricQuery builds a native MetricQuery from a parsed metric expr + the HTTP time/step.
@@ -486,9 +489,9 @@ func (s *Server) metricQuery(r *http.Request, ast *logql.MetricExpr) (query.Metr
 	return mq, nil
 }
 
-// groupStreams groups result entries into Loki streams keyed by their label set (Extra
-// labels plus the first-class level). Values are [unix-nano-string, line].
-func groupStreams(entries []model.LogEntry) []streamResult {
+// groupStreams groups result entries into Loki streams keyed by their label set, as labelsOf
+// gives it. Values are [unix-nano-string, line].
+func groupStreams(entries []model.LogEntry, labelsOf func(model.LogEntry) map[string]string) []streamResult {
 	type group struct {
 		labels map[string]string
 		values [][2]string
@@ -498,11 +501,9 @@ func groupStreams(entries []model.LogEntry) []streamResult {
 	for _, e := range entries {
 		// Use the record's own labels verbatim (from Extra) as the stream identity — do
 		// NOT synthesize a "level" label, which would overwrite a pushed level value
-		// (e.g. "warning"→"WARN") and split one logical stream by level.
-		labels := model.ParseExtraLabels(e.Extra)
-		if labels == nil {
-			labels = map[string]string{}
-		}
+		// (e.g. "warning"→"WARN") and split one logical stream by level. Labels a parser
+		// stage extracts are added by labelsOf.
+		labels := labelsOf(e)
 		key := canonicalKey(labels)
 		g := groups[key]
 		if g == nil {

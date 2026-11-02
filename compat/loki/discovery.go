@@ -82,7 +82,7 @@ func (s *Server) estimate(r *http.Request) indexStatsResponseLoki {
 	if !ok {
 		return out
 	}
-	q, err := s.logQuery(r, lq)
+	q, _, err := s.logQuery(r, lq)
 	if err != nil {
 		return out
 	}
