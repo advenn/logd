@@ -18,11 +18,16 @@ import (
 // data_root/<shard_id>/ folder with its own manifest, service dictionary, and live
 // labels. *storage.Writer satisfies it, so the daemon fans in over its own writers
 // (design §10: run §9 per shard, merge). A read-only shard handle could satisfy it too.
+//
+// ActiveIndex exposes the active segment's in-memory index, so the planner can push
+// predicates into the unsealed segment instead of scanning it (design §9.2). A shard that
+// keeps none — a read-only handle — returns false, and its active segment is scanned.
 type Shard interface {
 	Manifest() *storage.Manifest
 	ServiceLookup() *storage.LookupTable
 	LiveStreams() []label.Set
 	Subscribe(match func(model.LogEntry) bool, buffer int) (<-chan model.LogEntry, func())
+	ActiveIndex(segID string) (*storage.ActiveIndex, bool)
 }
 
 // Engine executes native queries across one or more shards, merging results. It reads
@@ -271,7 +276,7 @@ func (e *Engine) collectShardInto(acc collector, sh Shard, preds []Predicate, st
 			// it can beat the cutoff either.
 			break
 		}
-		if err := e.querySegment(acc, seg, q, start, end, r, forceScan); err != nil {
+		if err := e.querySegment(acc, sh, seg, q, start, end, r, forceScan); err != nil {
 			return err
 		}
 	}
@@ -279,10 +284,11 @@ func (e *Engine) collectShardInto(acc collector, sh Shard, preds []Predicate, st
 }
 
 // querySegment returns the records in one segment matching the query. It uses index
-// pushdown when the planner finds pushable predicates and the segment is indexed;
-// otherwise (or on any .tidx error) it scans. Either way the survivors are re-verified
-// against the FULL predicate set, so the two paths return identical results.
-func (e *Engine) querySegment(acc collector, seg *storage.SegmentMeta, q Query, start, end int64, r *engineResolver, forceScan bool) error {
+// pushdown when the planner finds pushable predicates and the segment is indexed — sealed,
+// or active with an in-memory index; otherwise (or on any index error) it scans. Either way
+// the survivors are re-verified against every predicate the index has not proven, so the
+// two paths return identical results.
+func (e *Engine) querySegment(acc collector, sh Shard, seg *storage.SegmentMeta, q Query, start, end int64, r *engineResolver, forceScan bool) error {
 	scan := func() error {
 		// Walk pages in the query's direction so a bounded accumulator fills from the pages
 		// it will actually keep, and prune pages that cannot beat what it already holds.
@@ -310,35 +316,62 @@ func (e *Engine) querySegment(acc collector, seg *storage.SegmentMeta, q Query, 
 	if forceScan {
 		return scan()
 	}
-	lookups, residuals := e.plan(seg, q.Preds)
-	if lookups == nil {
-		return scan() // nothing pushable, or non-indexed segment
-	}
-	segBase := strings.TrimSuffix(seg.Path, ".log")
 	// The guard is priced by how many rows acc keeps: a collector that keeps every match
 	// (the metric path) has no limit to over-fetch, and never scans for the guard's sake.
-	offsets, guardTripped, ok := intersectLookups(segBase, lookups, e.costGuard(seg, rowBound(acc)))
-	if !ok {
-		return scan() // a .tidx was missing/corrupt → degrade to scan
-	}
-	if guardTripped {
-		return scan()
+	a := e.access(sh, seg, q.Preds, rowBound(acc))
+	if !a.fetch {
+		return scan() // nothing pushable, no complete index, an unreadable sidecar, or the guard
 	}
 	// Materialize candidates and re-verify the RESIDUAL predicates — those the index has
 	// not already proven. A predicate settled by an exact (lossless-kind) lookup is
 	// skipped here, which is what removes the per-candidate re-extraction; everything else
 	// is still checked exactly, so a lossy key's false positives are filtered as before.
 	// The per-record time filter is applied here because .tidx offsets are not time-pruned.
-	err := storage.FetchRecords(seg.Path, offsets, func(rec model.LogEntry) bool {
+	err := storage.FetchRecords(a.seg.Path, a.offsets, func(rec model.LogEntry) bool {
 		if ts := rec.TS.UnixNano(); ts < start || ts > end {
 			return true
 		}
-		if matchAll(residuals, rec, r) {
+		if matchAll(a.residuals, rec, r) {
 			acc.add(rec, r)
 		}
 		return !acc.done()
 	})
 	return skipIfGone(err)
+}
+
+// segmentAccess is the access path chosen for one segment of one query.
+type segmentAccess struct {
+	seg       *storage.SegmentMeta // the segment as planned (see indexFor)
+	fetch     bool                 // fetch offsets by index; false means scan the segment
+	reason    string               // why: one of the Reason* constants
+	offsets   []uint64             // the candidates, when fetch
+	residuals []Predicate          // the predicates the index has not proven, when fetch
+}
+
+// access decides how one segment is read: Execute and Explain both go through it, so the
+// path Explain reports is the path Execute takes. limit is the number of rows the query
+// keeps (0 = all), which prices the cost guard.
+func (e *Engine) access(sh Shard, seg *storage.SegmentMeta, preds []Predicate, limit int) segmentAccess {
+	meta, src, inMemory := e.indexFor(sh, seg)
+	lookups, residuals := e.plan(meta, src, preds)
+	if lookups == nil {
+		if !meta.Indexed {
+			return segmentAccess{seg: meta, reason: ReasonNotIndexed}
+		}
+		return segmentAccess{seg: meta, reason: ReasonNoPushdown}
+	}
+	offsets, tripped, ok := intersectLookups(lookups, e.costGuard(meta, limit))
+	switch {
+	case !ok:
+		return segmentAccess{seg: meta, reason: ReasonIndexMissing} // degrade to scan
+	case tripped:
+		return segmentAccess{seg: meta, reason: ReasonCostGuard}
+	}
+	reason := ReasonIndexed
+	if inMemory {
+		reason = ReasonIndexedInMemory
+	}
+	return segmentAccess{seg: meta, fetch: true, reason: reason, offsets: offsets, residuals: residuals}
 }
 
 // skipIfGone turns a "segment file no longer exists" error into a clean empty result:

@@ -55,7 +55,7 @@ time index.
 ### What Phase 3 delivers (the differentiator)
 
 - **Order-preserving key encoding** (`core/index/key.go`): 16-byte keys where byte order equals value order — sign-flipped int, IEEE-754 total-order float (−0 normalized), longest valid-UTF-8 str prefix, raw uuid. Property-tested across thousands of pairs.
-- **Typed-range `.tidx`** (`core/index`): per-(segment, field) sorted flat file (16-byte key + 8-byte segment-relative offset), CRC-headered, written atomically at seal. `Reader` does O(log n) equality and range lookups; an in-RAM `Buffer` accumulates keys per active segment and flushes them at seal.
+- **Typed-range `.tidx`** (`core/index`): per-(segment, field) sorted flat file (16-byte key + 8-byte segment-relative offset), CRC-headered, written atomically at seal. `Reader` does O(log n) equality and range lookups; an in-RAM `Buffer` accumulates keys per active segment, answers queries while it does (`View`), and flushes them at seal.
 - **Extraction engine** (`core/extract`): config templates like `took {ms:int}ms` compile to literal fragments + typed captures; one Aho-Corasick automaton finds all literal positions in a single pass; hand-written byte scanners parse int/float/str/uuid (rejecting NaN/±Inf); the §7.2 rules (≥3-byte anchor, no adjacent captures, no leading capture, no identical-pattern overlap) are enforced at compile; a per-template failure counter records anchor-matched-but-unparseable values.
 - **Native ingest** (`core/ingest`): runs extraction off the write path and hands the writer pre-encoded `(field, key)` pairs, which it pairs with each record's on-disk offset (the reserved §7.4 seam).
 - **No-false-negative recovery**: a crash-recovered segment (whose in-RAM index was never rebuilt) is sealed with an **empty schema** so the planner scans it, rather than getting a partial `.tidx`.
@@ -74,7 +74,7 @@ Query-side index pushdown is Phase 5; Phase 3 builds and verifies the index.
 
 - **Query planner + index pushdown** (`core/query/plan.go`): per time-pruned, indexed segment, a `TypedCompare` (`= < <= > >=`, kind-matched) or a `LineContains` on a configured literal is pushed into the field's `.tidx` — binary-search equality or a range-walk with **inclusive-widened bounds** (so a lossy string key equal to the bound is never dropped). Candidate offset sets are intersected across predicates.
 - **Materialize + re-verify** (`storage.FetchRecords`): only candidate records are read (each page once, in offset order), then the **full predicate set is re-applied exactly** — so lossy-key false positives are filtered and the result is identical to a scan.
-- **Always-correct fallbacks**: a non-indexed (active/recovered) segment, a `!=`, a field absent from a segment's schema, a cross-kind predicate, or a missing/corrupt `.tidx` all degrade to scan (never a wrong answer).
+- **Always-correct fallbacks**: a non-indexed (crash-recovered, never re-indexed) segment, a `!=`, a field absent from a segment's schema, a cross-kind predicate, or a missing/corrupt `.tidx` all degrade to scan (never a wrong answer).
 - **`Explain`** reports index-vs-scan per segment; **`ExecuteScan`** forces the scan path.
 
 The contract is enforced by a **differential oracle test**: `Execute(q)` (pushdown) must equal `ExecuteScan(q)` (scan) for a large battery of queries over multiple segments — typed ranges/equality/`!=`, lossy string ranges beyond 16 bytes, negative-int bounds, literals, labels, intersections, limits, directions, degrade-to-scan, cross-kind, and config change. It does, for every one.
@@ -120,6 +120,25 @@ Verified live: `sum by(region)(sum_over_time({region="eu"} | unwrap latency_ms [
 - **RAM budget** (`index_mem_budget_mb`): the writer estimates the active segment's in-memory index footprint and seals early when it exceeds the budget — bounding index RAM by making segments smaller, *without* reintroducing the global merge/compaction the per-segment design deliberately avoids. It reuses the same seal path (valid `.tidx`/`.lidx`/manifest), so a budget-sealed segment is indistinguishable from a size-sealed one.
 
 With Phases 1–9 done, logd is a complete Loki-compatible daemon: durable ingest, typed-range + label pushdown, Loki push/LogQL (log **and** metric queries), Grafana discovery, live tail, retention, and a RAM bound.
+
+### Querying the active segment (design §9.2)
+
+The unsealed segment used to be scanned on every query. With a quarter of the corpus unsealed, that cost logd 2.2–6.4× in the evaluation (T4) and put it behind Loki — and a live deployment always has an active segment. It is now answered from the writer's own in-memory index, the typed-range buffer and label postings it keeps for the seal anyway:
+
+- **Same planner, same rules.** Typed, literal and allowlisted label-equality predicates are pushed into the active segment through the same lookup interface the sealed `.tidx`/`.lidx` readers implement (a linear pass over the buffered entries instead of a binary search), with the same bound widening, settled/residual split, template-pattern check (F-03), recorded-allowlist check (F-02) and label-cap check.
+- **Readable while the writer appends.** The writer appends under the per-record lock it already took for live label discovery; a query copies slice headers under that lock and reads the entries without it. Entries are never rewritten once appended, and the seal now sorts a copy for the `.tidx`.
+- **Only what is on disk.** The writer publishes how many pages are written after each page write; a query reads that boundary first and drops candidates past it, so the index never offers a record the file — or the scan — cannot yet read.
+- **Seals mid-query are safe.** A view is tied to its segment ID; a query whose segment sealed meanwhile re-reads the manifest and uses the new sidecars.
+- **Recovery.** A crash-recovered segment rebuilt by the reindex hook is queryable from memory; without the hook it is scanned.
+- **`Explain`** reports `"state": "active"` with reason `indexed_in_memory` (or the scan reason).
+
+Measured in-process on a 200k-record active segment with scattered matches (`BenchmarkActiveSegment`, `{app="bench"} | latency_ms > T`); before this change both columns were the scan:
+
+| selectivity | every row: index / scan | limit 100: index / scan |
+|---|---|---|
+| 5% | 25 ms / 471 ms | cost guard picks the scan (9 ms) |
+| 1% | 35 ms / 415 ms | 15 ms / 43 ms |
+| 0.1% | 12 ms / 336 ms | 10 ms / 222 ms |
 
 ### Multi-writer shard fan-in (design §10)
 

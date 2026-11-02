@@ -117,7 +117,10 @@ type explainResponse struct {
 
 type explainSegment struct {
 	SegmentID string `json:"segment_id"`
-	Mode      string `json:"mode"`
+	// State is "active" for the unsealed segment, answered from the writer's in-memory index
+	// (reason "indexed_in_memory") or scanned, and "sealed" otherwise.
+	State string `json:"state"`
+	Mode  string `json:"mode"`
 	// Reason distinguishes the several ways a segment ends up scanning — no index, nothing
 	// pushable, a missing sidecar, or the cost guard deciding a sequential read is cheaper.
 	// Without it they are indistinguishable, and "my query stopped using the index" has no
@@ -167,6 +170,7 @@ func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
 	for _, p := range s.qe.Explain(q) {
 		resp.Segments = append(resp.Segments, explainSegment{
 			SegmentID:  p.SegmentID,
+			State:      p.State,
 			Mode:       p.Mode,
 			Reason:     p.Reason,
 			Candidates: p.Candidates,

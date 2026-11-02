@@ -1,10 +1,7 @@
 package query
 
 import (
-	"strings"
-
 	"github.com/advenn/logd/core/index"
-	"github.com/advenn/logd/core/label"
 	"github.com/advenn/logd/core/model"
 	"github.com/advenn/logd/core/storage"
 )
@@ -21,16 +18,17 @@ var (
 	}()
 )
 
-// plannedLookup is one pushable predicate. run resolves it against a segment (opening the
-// appropriate typed or label index for that segment's base path) and returns the
-// candidate offsets, or ok=false if the index can't be opened — in which case the caller
+// plannedLookup is one pushable predicate. run resolves it against the segment's index (a
+// sealed segment's sidecar, or the active segment's in-memory index) and returns the
+// candidate offsets, or ok=false if the index can't be read — in which case the caller
 // degrades the whole segment to a scan (design §9.1).
 type plannedLookup struct {
-	run func(segBase string) (offsets []uint64, ok bool)
+	run func() (offsets []uint64, ok bool)
 }
 
-// plan decides which predicates can be pushed into this segment's indexes. A non-indexed
-// segment (active or crash-recovered) pushes nothing. A predicate whose field/key isn't
+// plan decides which predicates can be pushed into this segment's indexes, read through
+// src. A non-indexed segment (crash-recovered and never re-indexed, or an active segment
+// without an in-memory index) pushes nothing. A predicate whose field/key isn't
 // indexed here is left as a residual (handled by the full re-verify), which keeps
 // pushdown results identical to scan. Returns nil to mean "scan this segment".
 // It also returns the RESIDUAL predicates: those the index has not already proven. A
@@ -38,7 +36,7 @@ type plannedLookup struct {
 // exact — see losslessKind. Settled predicates are skipped during re-verify on the
 // index-fetch path, which is where the Aho-Corasick re-extraction cost lived; they are
 // never skipped on any scan fallback, where nothing has been proven.
-func (e *Engine) plan(seg *storage.SegmentMeta, preds []Predicate) ([]plannedLookup, []Predicate) {
+func (e *Engine) plan(seg *storage.SegmentMeta, src segmentIndex, preds []Predicate) ([]plannedLookup, []Predicate) {
 	if !seg.Indexed {
 		return nil, preds
 	}
@@ -67,13 +65,12 @@ func (e *Engine) plan(seg *storage.SegmentMeta, preds []Predicate) ([]plannedLoo
 				keepResidual(p)
 			}
 			field, run := pred.Field, typedRun(pred, losslessKind(kind))
-			cache := e.cache
-			lookups = append(lookups, plannedLookup{run: func(segBase string) ([]uint64, bool) {
-				r, err := cache.tidx(index.TidxPath(segBase, field))
-				if err != nil {
+			lookups = append(lookups, plannedLookup{run: func() ([]uint64, bool) {
+				l, ok := src.typed(field)
+				if !ok {
 					return nil, false
 				}
-				return run(r), true
+				return run(l), true
 			}})
 		case LineContains:
 			// Always a residual. The existence index would very likely settle it, but
@@ -87,13 +84,12 @@ func (e *Engine) plan(seg *storage.SegmentMeta, preds []Predicate) ([]plannedLoo
 			if !ok || !schemaHas(seg, field) {
 				continue
 			}
-			cache := e.cache
-			lookups = append(lookups, plannedLookup{run: func(segBase string) ([]uint64, bool) {
-				r, err := cache.tidx(index.TidxPath(segBase, field))
-				if err != nil {
+			lookups = append(lookups, plannedLookup{run: func() ([]uint64, bool) {
+				l, ok := src.typed(field)
+				if !ok {
 					return nil, false
 				}
-				return r.LookupEqual(zeroKey), true // existence: offsets that contain the literal
+				return l.LookupEqual(zeroKey), true // existence: offsets that contain the literal
 			}})
 		case LabelEqual:
 			// Only allowlisted, non-reserved keys are pushed. A non-allowlisted key
@@ -117,17 +113,16 @@ func (e *Engine) plan(seg *storage.SegmentMeta, preds []Predicate) ([]plannedLoo
 			// complete only for the keys allowlisted when it was written. A key added since
 			// is simply absent from it, and pushing it would return no rows for a segment
 			// full of matches.
-			if !e.segmentIndexesLabel(seg, pred.Key) {
+			if !e.segmentIndexesLabel(seg, src, pred.Key) {
 				continue
 			}
 			key, value := pred.Key, pred.Value
-			cache := e.cache
-			lookups = append(lookups, plannedLookup{run: func(segBase string) ([]uint64, bool) {
-				r, err := cache.lidx(label.IndexPath(segBase))
-				if err != nil {
+			lookups = append(lookups, plannedLookup{run: func() ([]uint64, bool) {
+				l, ok := src.labels()
+				if !ok {
 					return nil, false
 				}
-				return r.LabelOffsets(key, value), true
+				return l.LabelOffsets(key, value), true
 			}})
 		default:
 			keepResidual(p) // no pushdown case for this type: always re-verified
@@ -149,29 +144,31 @@ func losslessKind(k index.ValueKind) bool {
 	return k == index.KindInt || k == index.KindFloat || k == index.KindUUID
 }
 
-// typedRun builds the reader-level lookup for a typed comparison.
+// typedRun builds the index-level lookup for a typed comparison. The same lookup runs
+// against a sealed segment's .tidx (binary search) and the active segment's buffer (linear
+// pass), so both get exactly these bounds.
 //
 // For a LOSSY (str) kind the bounds are widened inclusively so a truncated key equal to the
 // bound is never dropped, and re-verify then filters > from >=. For a LOSSLESS kind the key
 // is the exact value, so the strict bound can be used directly — the lookup returns
 // precisely the matching records and no re-verification is needed.
-func typedRun(pred TypedCompare, lossless bool) func(r *index.Reader) []uint64 {
+func typedRun(pred TypedCompare, lossless bool) func(r index.Lookup) []uint64 {
 	key := index.EncodeKey(pred.Value)
 	switch pred.Op {
 	case OpEq:
-		return func(r *index.Reader) []uint64 { return r.LookupEqual(key) }
+		return func(r index.Lookup) []uint64 { return r.LookupEqual(key) }
 	case OpGt:
 		incLo := !lossless // lossy: keep the bound, re-verify drops equals
-		return func(r *index.Reader) []uint64 { return r.LookupRange(key, maxKey, incLo, true) }
+		return func(r index.Lookup) []uint64 { return r.LookupRange(key, maxKey, incLo, true) }
 	case OpGe:
-		return func(r *index.Reader) []uint64 { return r.LookupRange(key, maxKey, true, true) }
+		return func(r index.Lookup) []uint64 { return r.LookupRange(key, maxKey, true, true) }
 	case OpLt:
 		incHi := !lossless
-		return func(r *index.Reader) []uint64 { return r.LookupRange(zeroKey, key, true, incHi) }
+		return func(r index.Lookup) []uint64 { return r.LookupRange(zeroKey, key, true, incHi) }
 	case OpLe:
-		return func(r *index.Reader) []uint64 { return r.LookupRange(zeroKey, key, true, true) }
+		return func(r index.Lookup) []uint64 { return r.LookupRange(zeroKey, key, true, true) }
 	default:
-		return func(*index.Reader) []uint64 { return nil }
+		return func(index.Lookup) []uint64 { return nil }
 	}
 }
 
@@ -194,8 +191,9 @@ func (e *Engine) patternMatches(field, segPattern string) bool {
 // segment (the allowlist cannot change while a segment is being written, and a crash-recovered
 // segment is re-indexed from scratch), so the index is complete for it. A key that does not
 // appear stays a residual — scanned, never wrongly pruned. If the index cannot be opened the
-// lookup is still planned; it then fails and degrades the segment to a scan as before.
-func (e *Engine) segmentIndexesLabel(seg *storage.SegmentMeta, key string) bool {
+// lookup is still planned; it then fails and degrades the segment to a scan as before. The
+// active segment answers the same way, from the allowlist its writer derives label sets with.
+func (e *Engine) segmentIndexesLabel(seg *storage.SegmentMeta, src segmentIndex, key string) bool {
 	if seg.LabelKeysRecorded {
 		for _, k := range seg.LabelKeys {
 			if k == key {
@@ -204,11 +202,11 @@ func (e *Engine) segmentIndexesLabel(seg *storage.SegmentMeta, key string) bool 
 		}
 		return false
 	}
-	r, err := e.cache.lidx(label.IndexPath(strings.TrimSuffix(seg.Path, ".log")))
-	if err != nil {
+	l, ok := src.labels()
+	if !ok {
 		return true
 	}
-	return r.HasKey(key)
+	return l.HasKey(key)
 }
 
 func (e *Engine) labelAllowed(key string) bool {
@@ -222,10 +220,10 @@ func (e *Engine) labelAllowed(key string) bool {
 // Returns ok=false if any lookup's index can't be opened, so the caller degrades to a full
 // scan rather than a partial set. Returns guardTripped=true when the cost guard sends the
 // segment to the scan instead (see costguard.go).
-func intersectLookups(segBase string, lookups []plannedLookup, g costGuard) (offsets []uint64, guardTripped, ok bool) {
+func intersectLookups(lookups []plannedLookup, g costGuard) (offsets []uint64, guardTripped, ok bool) {
 	var result map[uint64]struct{}
 	for _, l := range lookups {
-		offs, lookupOK := l.run(segBase)
+		offs, lookupOK := l.run()
 		if !lookupOK {
 			return nil, false, false
 		}
@@ -276,11 +274,12 @@ func intersectLookups(segBase string, lookups []plannedLookup, g costGuard) (off
 
 // SegmentPlanReason explains why a segment took the path it did.
 const (
-	ReasonNotIndexed   = "not_indexed"   // active or crash-recovered segment
-	ReasonNoPushdown   = "no_pushdown"   // no predicate could be pushed here
-	ReasonIndexMissing = "index_missing" // a sidecar was absent or corrupt
-	ReasonCostGuard    = "cost_guard"    // candidates over-fetch the limit and cover the segment; a scan is cheaper
-	ReasonIndexed      = "indexed"       // pushdown used
+	ReasonNotIndexed      = "not_indexed"       // no complete index: a crash-recovered segment never re-indexed
+	ReasonNoPushdown      = "no_pushdown"       // no predicate could be pushed here
+	ReasonIndexMissing    = "index_missing"     // a sidecar was absent or corrupt
+	ReasonCostGuard       = "cost_guard"        // candidates over-fetch the limit and cover the segment; a scan is cheaper
+	ReasonIndexed         = "indexed"           // pushdown used, into the sealed segment's sidecars
+	ReasonIndexedInMemory = "indexed_in_memory" // pushdown used, into the active segment's in-memory index
 )
 
 // segCapped reports whether a label key's value cap was breached in this segment (so its
@@ -330,7 +329,11 @@ func schemaField(seg *storage.SegmentMeta, field string) (kind index.ValueKind, 
 // SegmentPlan is how Explain reports the chosen access path per segment.
 type SegmentPlan struct {
 	SegmentID string
-	Mode      string // "index" or "scan"
+	// State is the segment's state as planned: "active" when it was answered — or scanned —
+	// as the unsealed segment, "sealed" otherwise, including a segment that sealed while the
+	// query was being planned.
+	State string
+	Mode  string // "index" or "scan"
 	// Reason names WHY this mode was chosen. Previously a cost-guard trip and a missing
 	// index both reported Mode:"scan" with Candidates:0, indistinguishably — so a query
 	// that silently stopped using the index looked identical to one that never could.
@@ -340,7 +343,8 @@ type SegmentPlan struct {
 
 // Explain reports, per time-pruned segment, whether the query would use the index or
 // scan, and how many candidates the index yields (design §9.3's index-vs-scan
-// explainability). It runs the index lookups but not the fetch/re-verify.
+// explainability). It runs the index lookups but not the fetch/re-verify, through the same
+// access-path decision Execute makes.
 func (e *Engine) Explain(q Query) []SegmentPlan {
 	end := q.End
 	if end <= 0 {
@@ -349,26 +353,12 @@ func (e *Engine) Explain(q Query) []SegmentPlan {
 	var plans []SegmentPlan
 	for _, sh := range e.shards {
 		for _, seg := range sh.Manifest().Filter(q.Start, end) {
-			lookups, _ := e.plan(seg, q.Preds)
-			if lookups == nil {
-				reason := ReasonNoPushdown
-				if !seg.Indexed {
-					reason = ReasonNotIndexed
-				}
-				plans = append(plans, SegmentPlan{SegmentID: seg.ID, Mode: "scan", Reason: reason})
-				continue
+			a := e.access(sh, seg, q.Preds, effectiveLimit(q.Limit))
+			p := SegmentPlan{SegmentID: seg.ID, State: string(a.seg.State), Mode: "scan", Reason: a.reason}
+			if a.fetch {
+				p.Mode, p.Candidates = "index", len(a.offsets)
 			}
-			segBase := strings.TrimSuffix(seg.Path, ".log")
-			offsets, tripped, ok := intersectLookups(segBase, lookups, e.costGuard(seg, effectiveLimit(q.Limit)))
-			if !ok {
-				plans = append(plans, SegmentPlan{SegmentID: seg.ID, Mode: "scan", Reason: ReasonIndexMissing})
-				continue
-			}
-			if tripped {
-				plans = append(plans, SegmentPlan{SegmentID: seg.ID, Mode: "scan", Reason: ReasonCostGuard})
-				continue
-			}
-			plans = append(plans, SegmentPlan{SegmentID: seg.ID, Mode: "index", Reason: ReasonIndexed, Candidates: len(offsets)})
+			plans = append(plans, p)
 		}
 	}
 	return plans

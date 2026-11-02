@@ -104,7 +104,7 @@ Posting-list encoding ⚙️: delta + varint over sorted ascending offsets (stan
 Cardinality guard ⚙️: label keys are an explicit config allowlist; undeclared keys → `Extra`. Per declared key, max distinct values per segment (default 1000). On breach: new values stop creating streams, the key=value routes to `Extra` for those records, a counter increments. Never an ingest error, never a silent drop.
 
 ### 6.3 Typed-range index `.tidx` ✅
-Range questions. Per (segment, indexed field), one file. Record: `[16 B order-preserving key][8 B segment-relative record offset]`, sorted by key. Active segment accumulates unsorted pairs in RAM; sorted and flushed on seal. Record-level pointers (precision serves the differentiator; re-verify handles lossy keys; page-level is the fallback lever if disk size becomes a problem).
+Range questions. Per (segment, indexed field), one file. Record: `[16 B order-preserving key][8 B segment-relative record offset]`, sorted by key. Active segment accumulates unsorted pairs in RAM, queryable in place while it is active (§9.2); sorted and flushed on seal. Record-level pointers (precision serves the differentiator; re-verify handles lossy keys; page-level is the fallback lever if disk size becomes a problem).
 
 Key encodings (BigEndian is load-bearing — byte order = value order):
 - **int** → flip sign bit (add 2^63), BigEndian, left-pad to 16 B.
@@ -188,7 +188,7 @@ Query = time range + predicate set: label-equality, line-contains (substring/reg
 Execution per shard:
 1. Time: manifest prunes segments.
 2. Label: resolve equality → StreamIDs → union posting lists → candidates.
-3. Typed value: **check the segment's schema (§7.3)** → if indexed, binary-search `.tidx` for bounds, collect offsets, intersect with candidates; else mark segment for scan.
+3. Typed value: **check the segment's schema (§7.3)** → if indexed, binary-search `.tidx` for bounds (the active segment: one pass over its in-RAM buffer, §9.2), collect offsets, intersect with candidates; else mark segment for scan.
 4. Decode survivors; apply line filters; **re-verify typed predicates** (lossy keys).
 5. Merge across segments and shards, time-order, apply limit/direction.
 
@@ -198,8 +198,20 @@ Execution per shard:
 - **Fast ranges require a declared template.** Honest limit; document it.
 - Missing/corrupt/version-mismatched `.tidx`: silently degrade to scan for that segment.
 
-### 9.2 Active-segment queries ⚙️ resolved: scan
-The unsealed segment is always scanned (no `.tidx` yet; in-RAM buffer stays unsorted). Rationale: segment size is bounded (~64 MB), scan cost predictable; any insert-time query structure taxes the write path; sort-on-query repeats work. Escape hatch if profiling demands: background incremental sort — not built until measured.
+### 9.2 Active-segment queries ⚙️ revised: in-memory index (was: scan)
+
+**Decision changed, because it was measured.** The first resolution was to always scan the unsealed segment — bounded size, predictable cost, no insert-time structure — with "background incremental sort" as the escape hatch if profiling demanded. The evaluation demanded it: with ~24% of a 500k-line corpus in the active segment (T4), logd's latency rose 2.2–6.4× over the all-sealed layout and fell behind Loki at every selectivity. A live deployment always has an active segment, so that is the steady state, not an edge case. No sort was needed: the writer already holds the segment's typed-range buffer and label postings in RAM for the seal, and a linear pass over them is cheap next to a scan that decodes and re-extracts every record.
+
+**Mechanism.** The planner pushes typed, literal and allowlisted label-equality predicates into the active segment exactly as into a sealed one; only where the offsets come from differs.
+- *Concurrent reads.* One writer appends; queries read while it does. The writer appends a record's keys and posting under the lock it already takes once per record (for live label discovery), so the hot path gains no lock for labelled records. A query copies the slices' headers under that lock and reads the elements without it: an appended element is never written again (an append writes past the copied length or moves to a new array, leaving the old one intact), and the seal now sorts a *copy* for the `.tidx` instead of the buffer in place.
+- *Readability boundary.* Buffered offsets run ahead of the file: a record's keys are buffered when it enters the page in RAM. After each successful page write the writer publishes the next page number; a query reads that boundary **first**, then copies the buffers, and keeps only offsets below it. Every page below a boundary it observed was written after its records were buffered, so the copy holds all of them (reading the other way round could put a page inside the boundary with its records missing — a false negative). The scan path reads the same thing — the pages in the file — so both paths see the pages written so far, and neither sees the page in RAM.
+- *Segment identity.* The view is tied to a segment ID. The writer publishes it before the manifest names the segment and withdraws it once the seal is committed. A query that listed the segment as active before it sealed finds no view, re-reads the manifest, and plans against the now-sealed segment's sidecars; a view already taken stays valid for its segment, sealed or not.
+- *Lookups.* Equality and ranges are one linear pass over the field's entries comparing 16-byte keys; label equality unions the matching streams' posting lists. Both implement the same lookup interface as the `.tidx`/`.lidx` readers, so the planner builds one lookup with one set of bound-widening and settled/residual rules for either.
+- *Identity rules unchanged.* The view stands in for the facts a seal would record — every indexed field with its pattern, the label allowlist the writer derives label sets with, the keys capped so far — and the planner applies the same F-02/F-03 checks to them. Unlike a sealed schema it lists fields with no entries yet, which is sound because the buffer holds every value of every record: an active segment can prune to zero.
+- *Recovery.* A crash-recovered active segment re-indexed by the reindex hook is complete and gets a view; without the hook its index misses the pre-crash records, so none is offered and it is scanned (`not_indexed`).
+- *Explain* reports `state: active` with reason `indexed_in_memory`, or the scan reason.
+
+**Cost.** Write path: one lock per indexed record, which labelled records already took; the writer's per-record CPU measured within noise (±10%) of the old code, interleaved on one machine. Read path: a lookup is one linear pass over the field's entries (~1 ms per 200k), against a scan that decodes and re-extracts every record. On a 200k-record active segment (`BenchmarkActiveSegment`) a range matching 5% / 1% / 0.1% returns every row in 25 / 35 / 12 ms against the scan's 470 / 415 / 335 ms; at limit 100 it takes 15 vs 43 ms (1%) and 10 vs 222 ms (0.1%), while at 5% the cost guard (§9.3) hands the segment to the scan. Memory: nothing is copied but slice headers; a view pins the buffers it read until its query ends, so a sealed segment's buffers can outlive the seal by one query.
 
 ### 9.3 Query decisions ⚙️ resolved
 
