@@ -44,6 +44,7 @@ CORPUS="${CORPUS:-corpus/app-500000.jsonl}"
 COMPOSE=(docker compose -f docker-compose.yml -f docker-compose.v1.yml)
 ENGINES=(tb-logd tb-logd-v1 tb-loki tb-victorialogs tb-postgres tb-pgshim)
 mkdir -p "$R"
+R=$(cd "$R" && pwd) # absolute: several phases cd elsewhere and pass paths into tests
 
 has() { [[ " $PHASES " == *" $1 "* ]]; }
 pause() { timeout "$1" tail -f /dev/null || true; }
@@ -289,7 +290,7 @@ if has inproc; then
   export LOGD_BENCH_DIR="${LOGD_BENCH_DIR:-$HOME/.cache/logd-bench}"
   (COUNT=5 LINES=1000000 ./scripts/rq3-templates.sh "$R/rq3") 2>&1 | tail -40 | tee "$R/rq3.log"
   (cd .. && LOGD_SWEEP=1 LOGD_BENCH_DIR="$LOGD_BENCH_DIR" go test ./core/query/ -run TestCostGuardSelectivitySweep -v -count=1 -timeout 60m) > "$R/costguard-sweep.txt" 2>&1 || true
-  (cd .. && LOGD_FAULTMATRIX=1 LOGD_FAULTMATRIX_OUT="$(cd "$R" && pwd)/faultmatrix.md" go test ./core/query/ -run TestFaultMatrix -v -count=1) > "$R/faultmatrix.log" 2>&1 || true
+  (cd .. && LOGD_FAULTMATRIX=1 LOGD_FAULTMATRIX_OUT="$R/faultmatrix.md" go test ./core/query/ -run TestFaultMatrix -v -count=1) > "$R/faultmatrix.log" 2>&1 || true
   (RATES="10000 200" ./scripts/e8-crashloss.sh "$R/e8") > "$R/e8.log" 2>&1 || true
   (cd .. && LOGD_MACHINECRASH=1 go test ./core/storage/ -run TestMachineCrashLossApproximation -v -count=1) > "$R/e8-powercut.txt" 2>&1 || true
 fi
