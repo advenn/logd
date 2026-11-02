@@ -103,8 +103,16 @@ func TestRecoveredSegmentKeepsItsAge(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			time.Sleep(50 * time.Millisecond) // let the tick write the page
-			w.stop()                          // crash: no seal
+			// Let the tick write the page: a crash keeps only what is on disk.
+			path := w.manifest.Active().Path
+			for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(2 * time.Millisecond) {
+				if got, _ := readSegmentEntries(path); len(got) == 10 {
+					break
+				} else if time.Now().After(deadline) {
+					t.Fatalf("only %d of 10 records reached the disk", len(got))
+				}
+			}
+			w.stop() // crash: no seal
 
 			w2, err := NewWriter(dir, Options{SegmentSizeBytes: 1 << 40, FlushInterval: 2 * time.Millisecond, BlockPages: -1, MaxSegmentAge: time.Hour})
 			if err != nil {
