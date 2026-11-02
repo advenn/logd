@@ -136,9 +136,9 @@ Measured in-process on a 200k-record active segment with scattered matches (`Ben
 
 | selectivity | every row: index / scan | limit 100: index / scan |
 |---|---|---|
-| 5% | 25 ms / 471 ms | cost guard picks the scan (9 ms) |
-| 1% | 35 ms / 415 ms | 15 ms / 43 ms |
-| 0.1% | 12 ms / 336 ms | 10 ms / 222 ms |
+| 5% | 21 ms / 461 ms | 18 ms / 11 ms (the cost guard scans, after the lookups) |
+| 1% | 10 ms / 494 ms | 9.5 ms / 33 ms |
+| 0.1% | 9 ms / 447 ms | 7 ms / 196 ms |
 
 ### Multi-writer shard fan-in (design §10)
 

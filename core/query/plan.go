@@ -1,6 +1,8 @@
 package query
 
 import (
+	"sort"
+
 	"github.com/advenn/logd/core/index"
 	"github.com/advenn/logd/core/model"
 	"github.com/advenn/logd/core/storage"
@@ -221,35 +223,39 @@ func (e *Engine) labelAllowed(key string) bool {
 // scan rather than a partial set. Returns guardTripped=true when the cost guard sends the
 // segment to the scan instead (see costguard.go).
 func intersectLookups(lookups []plannedLookup, g costGuard) (offsets []uint64, guardTripped, ok bool) {
-	var result map[uint64]struct{}
+	sets := make([][]uint64, 0, len(lookups))
 	for _, l := range lookups {
 		offs, lookupOK := l.run()
 		if !lookupOK {
 			return nil, false, false
 		}
-		if result == nil {
-			// With a single lookup its result IS the candidate set, so the guard is decided
-			// before paying for the dedup map, which on a set the guard rejects is pure waste.
-			// With several it is decided only after intersecting: the intersection can only
-			// shrink, so a large first set says nothing about the final candidate count —
-			// TestExplainReportsAccessPath, where `{region="eu"} | latency_ms > 200`
-			// intersects 3 typed hits down to 2, caught a guard that bailed on the first set.
-			if len(lookups) == 1 && g.trips(offs) {
-				return nil, true, true
-			}
-			result = make(map[uint64]struct{}, len(offs))
-			for _, o := range offs {
-				result[o] = struct{}{}
-			}
-			// A first lookup that matched nothing means the intersection is empty. The old
-			// code only checked this from the SECOND lookup onward, so a zero-candidate
-			// first predicate still ran every remaining lookup in full.
-			if len(result) == 0 {
-				return nil, false, true
-			}
-			continue
+		// A lookup that matched nothing empties the intersection: the rest need not run.
+		if len(offs) == 0 {
+			return nil, false, true
 		}
-		next := make(map[uint64]struct{})
+		sets = append(sets, offs)
+	}
+	// With a single lookup its result IS the candidate set, so the guard is decided before
+	// paying for the dedup map, which on a set the guard rejects is pure waste. With several
+	// it is decided only after intersecting: the intersection can only shrink, so a large set
+	// says nothing about the final candidate count — TestExplainReportsAccessPath, where
+	// `{region="eu"} | latency_ms > 200` intersects 3 typed hits down to 2, caught a guard
+	// that bailed on the first set.
+	if len(sets) == 1 && g.trips(sets[0]) {
+		return nil, true, true
+	}
+	// Smallest set first: the map is built from it and every larger set only probes it. In
+	// predicate order, `{app="checkout"} | latency_ms > 1000` built a map of every record in
+	// the segment — the label matches all of them — to keep the 1% the range matched; the
+	// map, not the lookups, was most of the index path's time, and it was paid even when the
+	// cost guard then chose the scan.
+	sort.Slice(sets, func(i, j int) bool { return len(sets[i]) < len(sets[j]) })
+	result := make(map[uint64]struct{}, len(sets[0]))
+	for _, o := range sets[0] {
+		result[o] = struct{}{}
+	}
+	for _, offs := range sets[1:] {
+		next := make(map[uint64]struct{}, len(result))
 		for _, o := range offs {
 			if _, in := result[o]; in {
 				next[o] = struct{}{}
@@ -266,7 +272,7 @@ func intersectLookups(lookups []plannedLookup, g costGuard) (offsets []uint64, g
 	for o := range result {
 		out = append(out, o)
 	}
-	if len(lookups) > 1 && g.trips(out) {
+	if len(sets) > 1 && g.trips(out) {
 		return nil, true, true
 	}
 	return out, false, true
