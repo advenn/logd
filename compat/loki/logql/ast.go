@@ -132,9 +132,12 @@ type LineFilter struct {
 
 func (*LineFilter) pipelineStage() {}
 
-// ParserStage parses the log line to extract labels (| json or | logfmt).
+// ParserStage parses the log line to extract labels: `| json`, `| logfmt`,
+// `| pattern "<expr>"` or `| regexp "<re>"`. Only the plain, parameterless forms of json and
+// logfmt exist here; the parser refuses the others.
 type ParserStage struct {
-	Parser string // "json" or "logfmt"
+	Parser string // "json", "logfmt", "pattern" or "regexp"
+	Expr   string // the pattern expression or regex (pattern and regexp only)
 }
 
 func (*ParserStage) pipelineStage() {}
@@ -154,6 +157,10 @@ type LabelFilter struct {
 	Label string
 	Op    Op // OpEq, OpNotEq, OpRe, OpNotRe, OpGT, OpGTE, OpLT, OpLTE
 	Value string
+	// Numeric is true when Value was written as a number (`| x = 200`) rather than a string
+	// (`| x = "200"`). Loki's grammar makes the first a numeric filter and the second a string
+	// one; the difference matters for labels extracted at query time.
+	Numeric bool
 }
 
 func (*LabelFilter) pipelineStage() {}
@@ -189,9 +196,17 @@ func stageString(s PipelineStage) string {
 	case *LineFilter:
 		return s.Op.String() + " " + fmt.Sprintf("%q", s.Value)
 	case *ParserStage:
+		if s.Parser == "pattern" || s.Parser == "regexp" {
+			return "| " + s.Parser + " " + fmt.Sprintf("%q", s.Expr)
+		}
 		return "| " + s.Parser
 	case *LabelFilter:
+		if s.Numeric {
+			return "| " + s.Label + " " + s.Op.String() + " " + s.Value
+		}
 		return "| " + s.Label + " " + s.Op.String() + " " + fmt.Sprintf("%q", s.Value)
+	case *UnwrapStage:
+		return "| unwrap " + s.Field
 	case *LabelsStage:
 		str := "| drop "
 		if s.Keep {

@@ -342,8 +342,10 @@ func (p *Parser) parsePipelineStage() (PipelineStage, error) {
 		return p.parseLineFilter()
 	case p.tok.Kind == TokIDENT && p.tok.Value == "unwrap":
 		return p.parseUnwrap()
-	case p.tok.Kind == TokIDENT && isParserKeyword(p.tok.Value):
+	case p.tok.Kind == TokIDENT && isParserKeyword(p.tok.Value) && !IsLabelOp(p.lex.Peek().Kind):
 		return p.parseParserStage()
+	case p.tok.Kind == TokIDENT && unsupportedStages[p.tok.Value] && !IsLabelOp(p.lex.Peek().Kind):
+		return nil, p.parseError("`| %s` is not supported", p.tok.Value)
 	case p.tok.Kind == TokIDENT && (p.tok.Value == "drop" || p.tok.Value == "keep"):
 		return p.parseLabelsStage()
 	case p.tok.Kind == TokIDENT:
@@ -363,8 +365,17 @@ func (p *Parser) parseUnwrap() (*UnwrapStage, error) {
 	return &UnwrapStage{Field: field}, nil
 }
 
+// isParserKeyword reports the parser stages logd implements. A keyword followed by a label
+// operator is a label of that name instead (`| pattern = "x"`).
 func isParserKeyword(s string) bool {
-	return s == "json" || s == "logfmt"
+	return s == "json" || s == "logfmt" || s == "pattern" || s == "regexp"
+}
+
+// unsupportedStages are Loki pipeline stages logd does not implement. Naming them gives a
+// clear error instead of "expected label operator", which is what a stage read as a label
+// filter produced.
+var unsupportedStages = map[string]bool{
+	"line_format": true, "label_format": true, "unpack": true, "decolorize": true, "distinct": true,
 }
 
 func (p *Parser) parseLineFilter() (*LineFilter, error) {
@@ -383,10 +394,28 @@ func (p *Parser) parseLineFilter() (*LineFilter, error) {
 	return &LineFilter{Op: op, Value: value}, nil
 }
 
+// parseParserStage parses `pattern "<expr>"`, `regexp "<re>"`, `json` or `logfmt`. Loki's
+// parameterised forms — `json a="x.y"`, `logfmt a, b`, `logfmt --strict` — are refused by
+// name: silently reading them as the plain stage would extract other labels than asked.
 func (p *Parser) parseParserStage() (*ParserStage, error) {
-	parser := p.tok.Value
+	st := &ParserStage{Parser: p.tok.Value}
 	p.advance()
-	return &ParserStage{Parser: parser}, nil
+	switch st.Parser {
+	case "pattern", "regexp":
+		if p.tok.Kind != TokSTRING {
+			return nil, p.parseError("expected a quoted expression after %s, got %s", st.Parser, p.tok.Kind)
+		}
+		st.Expr = p.tok.Value
+		p.advance()
+	default:
+		switch {
+		case p.tok.Kind == TokIDENT || p.tok.Kind == TokCOMMA:
+			return nil, p.parseError("`| %s` with parameters is not supported: only the plain `| %s`, which extracts every field", st.Parser, st.Parser)
+		case p.tok.Kind == TokILLEGAL && p.tok.Value == "-":
+			return nil, p.parseError("`| %s` flags (--strict, --keep-empty) are not supported: only the plain `| %s`", st.Parser, st.Parser)
+		}
+	}
+	return st, nil
 }
 
 // parseLabelsStage parses `drop`/`keep` followed by a comma-separated list of label names
@@ -445,7 +474,7 @@ func (p *Parser) parseLabelFilter() (*LabelFilter, error) {
 		return nil, p.parseError("duration and byte-size values (%s%s) are not supported in label filters; compare a plain number", number.Value, p.tok.Value)
 	}
 
-	return &LabelFilter{Label: label, Op: op, Value: value}, nil
+	return &LabelFilter{Label: label, Op: op, Value: value, Numeric: number.Kind == TokNUMBER}, nil
 }
 
 // ---- helpers ----

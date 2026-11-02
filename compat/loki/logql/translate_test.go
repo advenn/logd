@@ -101,10 +101,19 @@ func TestTranslateRejectsNonFiniteFloat(t *testing.T) {
 	}
 }
 
-func TestTranslateParserStageUnsupported(t *testing.T) {
-	ast, _ := logql.Parse(`{a="b"} | json`)
-	if _, err := logql.Translate(ast, nil); err == nil {
-		t.Fatal("expected an error for the unsupported | json stage")
+// The plain parser stages translate; their parameterised forms still do not parse.
+func TestTranslateParserStageSupportedOnlyPlain(t *testing.T) {
+	for _, q := range []string{`{a="b"} | json`, `{a="b"} | logfmt`, `{a="b"} | pattern "<_> <x>"`, `{a="b"} | regexp "(?P<x>.)"`} {
+		ast, err := logql.Parse(q)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		if _, err := logql.Translate(ast, nil); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	if _, err := logql.Parse(`{a="b"} | json a="b.c"`); err == nil {
+		t.Fatal("expected an error for the unsupported `| json a=\"b.c\"`")
 	}
 }
 

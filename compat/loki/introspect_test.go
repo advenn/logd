@@ -298,7 +298,7 @@ func sortStrings(s []string) {
 func TestQueryRangeRejectsUnsupportedExpr(t *testing.T) {
 	srv, _ := setup(t)
 	h := srv.Handler()
-	rr := do(t, h, "GET", "/loki/api/v1/query_range?"+queryRangeParams(`{region="eu"} | logfmt`), "", "")
+	rr := do(t, h, "GET", "/loki/api/v1/query_range?"+queryRangeParams(`{region="eu"} | line_format "{{.x}}"`), "", "")
 	if rr.Code == http.StatusOK {
 		t.Fatalf("unsupported pipeline stage returned 200: %s", rr.Body.String())
 	}
