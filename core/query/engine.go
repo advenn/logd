@@ -36,6 +36,29 @@ type Engine struct {
 	ex        *extract.Engine     // may be nil (no typed predicates possible)
 	labelKeys map[string]struct{} // allowlisted label keys eligible for index pushdown; nil → none
 	cache     *readerCache        // opened index sidecars, reused across queries
+	// noCostGuard fetches every candidate set by offset, however large. Set only by tests
+	// (DisableCostGuard), to time the index path where the guard would have scanned.
+	noCostGuard bool
+}
+
+// defaultLimit is the row limit of a log query that does not set one.
+const defaultLimit = 100
+
+// effectiveLimit is the row limit a log query runs under. Explain uses it too, so it reports
+// the access path Execute takes rather than one planned for an unset limit.
+func effectiveLimit(limit int) int {
+	if limit <= 0 {
+		return defaultLimit
+	}
+	return limit
+}
+
+// costGuard returns the cost guard for one segment of a query that keeps limit rows.
+func (e *Engine) costGuard(seg *storage.SegmentMeta, limit int) costGuard {
+	if e.noCostGuard {
+		limit = 0
+	}
+	return newCostGuard(seg, limit)
 }
 
 // NewEngine builds a single-shard query engine with typed pushdown but no label pushdown
@@ -186,10 +209,7 @@ func (e *Engine) execute(q Query, forceScan bool) ([]model.LogEntry, error) {
 	if end <= 0 {
 		end = math.MaxInt64
 	}
-	limit := q.Limit
-	if limit <= 0 {
-		limit = 100
-	}
+	limit := effectiveLimit(q.Limit)
 
 	// A bounded top-K accumulator rather than collect-everything-then-sort. Append order
 	// within a page is NOT time order (out-of-order arrivals), so the result still has to
@@ -295,16 +315,13 @@ func (e *Engine) querySegment(acc collector, seg *storage.SegmentMeta, q Query, 
 		return scan() // nothing pushable, or non-indexed segment
 	}
 	segBase := strings.TrimSuffix(seg.Path, ".log")
-	// The cost guard limit is passed IN so it can fire while the candidate set is being
-	// built rather than after: a candidate set covering too much of the segment is cheaper
-	// to read sequentially than to fetch by random offset (a DB planner choosing seq-scan
-	// over index-scan), and materializing it first was work spent only to throw away.
-	// Correctness-neutral either way — scan and pushdown return identical results.
-	offsets, guardTripped, ok := intersectLookups(segBase, lookups, costGuardLimit(seg))
+	// The guard is priced by how many rows acc keeps: a collector that keeps every match
+	// (the metric path) has no limit to over-fetch, and never scans for the guard's sake.
+	offsets, guardTripped, ok := intersectLookups(segBase, lookups, e.costGuard(seg, rowBound(acc)))
 	if !ok {
 		return scan() // a .tidx was missing/corrupt → degrade to scan
 	}
-	if guardTripped || costGuardTrips(seg, len(offsets)) {
+	if guardTripped {
 		return scan()
 	}
 	// Materialize candidates and re-verify the RESIDUAL predicates — those the index has

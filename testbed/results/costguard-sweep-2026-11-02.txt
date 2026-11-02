@@ -1,0 +1,361 @@
+Cost-guard selectivity sweep, 2026-11-02
+========================================
+
+What: core/query TestCostGuardSelectivitySweep (LOGD_SWEEP=1), which sets the cost guard's
+thresholds (core/query/costguard.go). Per corpus and selectivity: the share of pages and of
+I/O units (8-page compressed blocks, or pages when uncompressed) the candidates touch, the
+guard's decision, and the median of 5 timed runs (after 1 warm-up) of the index path with
+the guard switched off and of the forced scan, at limit=100, limit=1000 (backward) and
+unbounded ("all rows"). s/i = scan time / index time: above 1 the index path is faster.
+
+Corpora: 200,000 records in ONE sealed segment ("GET /api/v1/orders/<i> 200 took <ms>ms
+trace_id=..."), query {app="bench"} | latency_ms > T. Scattered = hashed latency, matches
+spread evenly over every page; clustered = latency falling with the record number, so the
+matches are the OLDEST records, contiguous at the start of the segment.
+
+Machine: Intel i5-1145G7 (4 cores / 8 threads), 15 GB, NVMe ext4, Linux 6.12, Go 1.26.2.
+Data on a real disk (LOGD_BENCH_DIR=$HOME/.cache/logd-bench; /tmp is tmpfs).
+
+LOAD CAVEAT: the machine was shared with other agents running builds and tests; the load
+average was 5.5-8.9 on 8 threads throughout (logged at the start and end of every run), and
+the author's own test runs overlapped parts of runs 1 and 3. Single cells vary by up to
+~2x between runs (see the min-max columns below); the conclusions rest only on patterns
+that hold in every run.
+
+Runs:
+  run 0  01:01-01:05  preliminary, limit=100 and unbounded only (before the limit=1000
+                      column was added); guard column = provisional fixed-ratio rule.
+  run 1  01:08-01:15  full sweep; guard column = provisional rule (candidates > 20 x limit
+  run 2  01:15-01:21  AND units > 90%), kept from the earlier uncommitted rework.
+  run 3  01:22-01:28  full sweep with the COMMITTED rule (guard column = that rule).
+
+Committed rule (from runs 1 and 2, confirmed by run 3): a bounded query scans a segment
+instead of fetching by offset iff
+    candidates > 1.0 * sqrt(limit * records_in_segment)   (here 4,472 at limit=100,
+                                                            14,142 at limit=1000)
+AND candidates cover > 90% of the segment's I/O units.
+An unbounded query never scans for the guard.
+
+Findings:
+  - Unbounded: the index path is faster in EVERY cell of every run, 2.6x-74x. Never trip.
+  - Clustered (<=50% of units): the index path is faster in every cell, 2.2x-74x, at both
+    limits; a backward scan must decode the whole newer part before its first match.
+    So coverage must be high before scanning can pay.
+  - Scattered (100% of units): the scan wins at high selectivity for bounded queries, by
+    up to 2x compressed and 11x uncompressed at limit=100 — the guard is worth keeping.
+    The crossover, in candidates:
+                      limit=100       limit=1000
+        compressed    ~5k-10k         ~10k-20k
+        uncompressed  ~4k-10k         ~20k
+    It moved ~2-3x for a 10x limit. sqrt(limit*n) predicts 3.2x (4.5k -> 14k); a fixed
+    over-fetch ratio predicts 10x: fitted at limit=100 (~50x), it would put limit=1000's
+    crossover at ~50k, where the scan already wins 1.3-1.5x (compressed) and 3-5x
+    (uncompressed).
+  - With the committed rule, the worst measured miss (median over runs 1-3) is the
+    compressed 2% cell at limit=100: kept on the index at s/i 0.86, i.e. the scan would
+    have been 1.16x faster. Every tripped cell has median s/i <= 0.94.
+
+Variance across runs 1-3: scan/index time ratio per cell (>1 = the index path is faster),
+as median [min-max]. "rule" is what the committed rule decides for that cell at that limit
+(trip = scan): candidates > sqrt(limit * 200000) AND units covered > 90%.
+
+=== compressed (8-page blocks), scattered
+  sel%    rows units% | l=100  s/i                  | l=1000 s/i                  | all rows s/i        
+  50.0   99982  100.0 | trip    0.51 [0.49- 0.52]   | trip    0.52 [0.47- 0.56]   |  2.89 [2.57- 3.64]  
+  30.0   59978  100.0 | trip    0.67 [0.61- 0.70]   | trip    0.67 [0.64- 0.67]   |  3.81 [3.30- 6.03]  
+  20.0   39982  100.0 | trip    0.72 [0.65- 0.77]   | trip    0.75 [0.74- 0.78]   |  4.30 [3.48- 5.24]  
+  10.0   19980  100.0 | trip    0.86 [0.81- 1.14]   | trip    0.77 [0.49- 0.93]   |  5.25 [4.57- 7.53]  
+   5.0    9979  100.0 | trip    0.94 [0.86- 1.25]   | index   1.07 [0.82- 1.19]   |  3.71 [3.01- 4.90]  
+   2.0    3985  100.0 | index   0.86 [0.81- 1.04]   | index   1.89 [1.76- 1.90]   |  5.96 [4.68- 8.67]  
+   1.0    1984   96.0 | index   1.10 [0.85- 1.51]   | index   3.17 [1.78- 3.25]   |  5.59 [5.00- 6.05]  
+   0.5     983   82.8 | index   1.48 [1.22- 1.59]   | index   4.68 [4.61- 6.25]   |  4.84 [4.68- 5.95]  
+   0.2     379   53.6 | index   2.67 [2.08- 3.54]   | index   7.53 [3.12- 9.03]   |  7.85 [7.16-10.48]  
+   0.1     180   26.7 | index   8.97 [8.81-11.03]   | index  14.97 [12.25-18.27]  | 15.31 [14.56-15.38] 
+
+=== compressed (8-page blocks), clustered
+  sel%    rows units% | l=100  s/i                  | l=1000 s/i                  | all rows s/i        
+  50.0   99980   50.0 | index   2.42 [2.27- 2.81]   | index   2.51 [2.19- 2.52]   |  5.81 [4.62- 5.84]  
+  30.0   59980   30.0 | index   5.18 [4.31- 5.98]   | index   4.24 [4.19- 5.10]   |  6.45 [6.04- 7.97]  
+  20.0   39980   20.1 | index   8.12 [7.08- 8.85]   | index   7.06 [5.45- 9.82]   | 11.94 [8.80-12.34]  
+  10.0   19980   10.1 | index  19.41 [7.84-21.41]   | index  13.69 [11.04-17.88]  | 14.14 [9.00-15.06]  
+   5.0    9980    5.0 | index  28.10 [18.30-41.30]  | index  19.74 [17.31-23.49]  | 21.13 [20.91-33.80] 
+   2.0    3980    2.1 | index  33.33 [17.98-42.26]  | index  43.01 [38.53-45.38]  | 40.12 [35.88-52.25] 
+   1.0    1980    1.0 | index  44.29 [19.15-55.57]  | index  58.82 [10.29-68.16]  | 58.48 [17.88-60.19] 
+   0.5     980    0.6 | index  48.53 [21.01-57.22]  | index  57.47 [38.55-60.06]  | 43.44 [18.20-58.12] 
+   0.2     380    0.3 | index  41.10 [19.27-62.71]  | index  62.52 [27.75-64.98]  | 49.29 [26.71-72.07] 
+   0.1     180    0.1 | index  53.12 [11.85-73.53]  | index  62.51 [55.14-70.36]  | 66.92 [58.36-74.31] 
+
+=== uncompressed, scattered
+  sel%    rows units% | l=100  s/i                  | l=1000 s/i                  | all rows s/i        
+  50.0   99982  100.0 | trip    0.09 [0.07- 0.09]   | trip    0.10 [0.10- 0.12]   |  4.16 [3.65- 6.10]  
+  30.0   59978  100.0 | trip    0.12 [0.09- 0.12]   | trip    0.21 [0.19- 0.23]   |  8.42 [5.39-12.18]  
+  20.0   39982  100.0 | trip    0.17 [0.12- 0.19]   | trip    0.34 [0.24- 0.39]   | 12.45 [8.35-16.37]  
+  10.0   19980  100.0 | trip    0.30 [0.26- 0.36]   | trip    0.93 [0.69- 1.11]   | 11.72 [8.60-15.59]  
+   5.0    9979  100.0 | trip    0.46 [0.35- 0.50]   | index   1.73 [1.20- 2.65]   | 15.66 [5.52-22.95]  
+   2.0    3985   54.2 | index   1.01 [0.55- 1.32]   | index   6.62 [4.77- 8.42]   | 15.59 [4.74-33.37]  
+   1.0    1984   28.2 | index   1.98 [1.70- 2.29]   | index  18.28 [16.43-24.60]  | 33.57 [30.52-33.78] 
+   0.5     983   14.9 | index   4.90 [3.81- 5.56]   | index  49.16 [25.47-49.63]  | 37.14 [30.00-42.55] 
+   0.2     379    6.7 | index   9.86 [9.62-10.26]   | index  58.52 [49.50-60.33]  | 33.32 [27.71-56.05] 
+   0.1     180    3.3 | index  23.63 [21.75-27.07]  | index  48.39 [40.40-63.41]  | 17.57 [17.42-64.92] 
+
+=== uncompressed, clustered
+  sel%    rows units% | l=100  s/i                  | l=1000 s/i                  | all rows s/i        
+  50.0   99980   50.0 | index   2.41 [2.19- 2.49]   | index   2.55 [2.32- 2.70]   |  5.74 [5.62- 6.01]  
+  30.0   59980   30.0 | index   5.23 [4.43- 6.65]   | index   5.29 [4.50- 5.50]   |  9.50 [5.95- 9.68]  
+  20.0   39980   20.0 | index   8.37 [7.22- 8.51]   | index   7.60 [7.58- 9.24]   | 11.04 [6.92-12.97]  
+  10.0   19980   10.0 | index  17.72 [16.48-18.31]  | index  13.48 [11.40-16.07]  | 22.93 [15.09-26.43] 
+   5.0    9980    5.0 | index  25.90 [21.62-46.08]  | index  24.97 [9.90-27.39]   | 21.23 [10.38-35.37] 
+   2.0    3980    2.0 | index  31.70 [25.22-36.24]  | index  26.93 [25.66-28.75]  | 20.39 [19.12-32.34] 
+   1.0    1980    1.0 | index  24.27 [14.18-38.10]  | index  37.64 [36.30-57.41]  | 45.45 [39.94-50.78] 
+   0.5     980    0.5 | index  63.71 [36.22-65.15]  | index  40.90 [20.55-49.17]  | 32.67 [21.50-35.26] 
+   0.2     380    0.2 | index  48.16 [44.70-54.05]  | index  62.50 [36.12-63.52]  | 36.06 [31.82-47.17] 
+   0.1     180    0.1 | index  53.58 [48.49-57.21]  | index  61.80 [34.64-64.12]  | 40.36 [37.18-53.00] 
+
+-------- run 0 (preliminary; limit=100 and unbounded only; provisional guard) --------
+
+load at start: 8.33 7.53 7.15 6/1765 2550042
+
+=== compressed (8-page blocks), scattered: 200000 records, 5399 data pages, block_pages=8, 675 I/O units
+  sel%    rows  pages%  units% |    guard | idx l=100      scan    s/i |   idx all      scan    s/i
+  50.0   99982   100.0   100.0 | cost_guard |   212.2ms   118.4ms   0.56 |   218.1ms   751.2ms   3.44
+  30.0   59978   100.0   100.0 | cost_guard |   147.8ms    95.1ms   0.64 |   163.0ms   647.7ms   3.97
+  20.0   39982   100.0   100.0 | cost_guard |   132.8ms    94.1ms   0.71 |   131.7ms   565.0ms   4.29
+  10.0   19980   100.0   100.0 | cost_guard |   112.4ms    93.4ms   0.83 |   118.4ms   546.2ms   4.61
+   5.0    9979   100.0   100.0 | cost_guard |   117.6ms    95.8ms   0.81 |   111.8ms   543.7ms   4.87
+   2.0    3985    54.2   100.0 | cost_guard |    95.9ms   104.2ms   1.09 |    98.2ms   513.9ms   5.23
+   1.0    1984    28.2    96.0 |    index |    94.7ms   107.3ms   1.13 |    93.2ms   499.8ms   5.37
+   0.5     983    14.9    82.8 |    index |    88.4ms   143.9ms   1.63 |    84.8ms   526.8ms   6.21
+   0.2     379     6.7    53.6 |    index |    46.0ms   159.3ms   3.46 |    43.8ms   412.0ms   9.41
+   0.1     180     3.3    26.7 |    index |    25.4ms   268.1ms  10.57 |    28.1ms   535.2ms  19.01
+
+=== compressed (8-page blocks), clustered: 200000 records, 5405 data pages, block_pages=8, 676 I/O units
+  sel%    rows  pages%  units% |    guard | idx l=100      scan    s/i |   idx all      scan    s/i
+  50.0   99980    50.0    50.0 |    index |    91.8ms   232.7ms   2.53 |    94.9ms   446.8ms   4.71
+  30.0   59980    30.0    30.0 |    index |    53.7ms   301.7ms   5.62 |    65.4ms   425.8ms   6.51
+  20.0   39980    20.0    20.1 |    index |    39.8ms   334.1ms   8.39 |    39.3ms   406.8ms  10.36
+  10.0   19980    10.0    10.1 |    index |    23.6ms   381.8ms  16.19 |    30.1ms   399.3ms  13.26
+   5.0    9980     5.0     5.0 |    index |    15.3ms   363.5ms  23.78 |    12.3ms   385.6ms  31.37
+   2.0    3980     2.0     2.1 |    index |     9.1ms   489.8ms  54.09 |    10.5ms   482.1ms  45.85
+   1.0    1980     1.0     1.0 |    index |     9.0ms   493.4ms  54.83 |     8.7ms   642.5ms  74.19
+   0.5     980     0.5     0.6 |    index |    23.5ms   476.7ms  20.30 |     9.3ms   541.6ms  58.45
+   0.2     380     0.2     0.3 |    index |    12.5ms   615.4ms  49.39 |    10.5ms   643.4ms  61.26
+   0.1     180     0.1     0.1 |    index |     9.4ms   488.7ms  52.14 |     9.4ms   412.5ms  44.09
+
+=== uncompressed, scattered: 200000 records, 5399 data pages, block_pages=0, 5399 I/O units
+  sel%    rows  pages%  units% |    guard | idx l=100      scan    s/i |   idx all      scan    s/i
+  50.0   99982   100.0   100.0 | cost_guard |    61.5ms     6.2ms   0.10 |    67.2ms   381.1ms   5.68
+  30.0   59978   100.0   100.0 | cost_guard |   159.8ms    18.1ms   0.11 |   143.8ms   995.4ms   6.92
+  20.0   39982   100.0   100.0 | cost_guard |   127.7ms    12.1ms   0.09 |   157.1ms   754.6ms   4.80
+  10.0   19980   100.0   100.0 | cost_guard |    33.9ms    12.6ms   0.37 |    46.8ms   477.2ms  10.19
+   5.0    9979   100.0   100.0 | cost_guard |    23.5ms    11.5ms   0.49 |    22.0ms   919.2ms  41.70
+   2.0    3985    54.2    54.2 |    index |    35.6ms    32.5ms   0.91 |    35.7ms   548.3ms  15.34
+   1.0    1984    28.2    28.2 |    index |    13.3ms    33.2ms   2.50 |    27.7ms   500.9ms  18.08
+   0.5     983    14.9    14.9 |    index |    14.3ms    54.2ms   3.80 |    13.2ms   507.8ms  38.39
+   0.2     379     6.7     6.7 |    index |    23.1ms   194.1ms   8.42 |    26.9ms   605.3ms  22.54
+   0.1     180     3.3     3.3 |    index |    10.3ms   217.0ms  21.11 |     6.0ms   310.1ms  51.45
+
+=== uncompressed, clustered: 200000 records, 5405 data pages, block_pages=0, 5405 I/O units
+  sel%    rows  pages%  units% |    guard | idx l=100      scan    s/i |   idx all      scan    s/i
+  50.0   99980    50.0    50.0 |    index |    62.5ms   159.5ms   2.55 |    65.5ms   468.1ms   7.15
+  30.0   59980    30.0    30.0 |    index |    45.5ms   308.0ms   6.77 |    67.0ms   481.4ms   7.18
+  20.0   39980    20.0    20.0 |    index |    34.3ms   312.0ms   9.08 |    98.1ms   605.3ms   6.17
+  10.0   19980    10.0    10.0 |    index |    56.3ms   545.4ms   9.69 |    33.4ms   433.1ms  12.98
+   5.0    9980     5.0     5.0 |    index |    13.1ms   468.3ms  35.78 |    17.6ms   456.7ms  26.01
+   2.0    3980     2.0     2.0 |    index |    21.7ms   543.7ms  25.05 |    40.3ms   581.8ms  14.45
+   1.0    1980     1.0     1.0 |    index |    11.3ms   558.5ms  49.45 |    24.8ms   723.0ms  29.13
+   0.5     980     0.5     0.5 |    index |    28.5ms   708.5ms  24.86 |    26.8ms   552.9ms  20.59
+   0.2     380     0.2     0.2 |    index |    15.4ms   648.8ms  42.00 |    31.2ms   569.3ms  18.27
+   0.1     180     0.1     0.1 |    index |    14.5ms   570.3ms  39.34 |    18.5ms   526.1ms  28.41
+load at end: 7.74 6.94 6.92 6/1772 2561324
+--- PASS: TestCostGuardSelectivitySweep (234.85s)
+
+
+-------- run 1 (guard column: provisional rule) --------
+
+load at start: 7.52 7.45 7.14 13/1802 2569431
+
+=== compressed (8-page blocks), scattered: 200000 records, 5399 data pages, block_pages=8, 675 I/O units
+                             | limit=100                          | limit=1000                         | all rows               
+  sel%    rows pages% units% | guard         index     scan   s/i | guard         index     scan   s/i |    index     scan   s/i
+  50.0   99982  100.0  100.0 | cost_guard  218.6ms  107.2ms  0.49 | cost_guard  227.3ms  127.7ms  0.56 |  398.2ms 1021.6ms  2.57
+  30.0   59978  100.0  100.0 | cost_guard  267.4ms  163.2ms  0.61 | cost_guard  250.6ms  169.1ms  0.67 |  284.9ms 1084.1ms  3.81
+  20.0   39982  100.0  100.0 | cost_guard  253.8ms  163.9ms  0.65 | cost_guard  261.0ms  194.3ms  0.74 |  225.5ms  969.7ms  4.30
+  10.0   19980  100.0  100.0 | cost_guard  203.1ms  175.1ms  0.86 | index       256.9ms  197.8ms  0.77 |  196.6ms 1031.4ms  5.25
+   5.0    9979  100.0  100.0 | cost_guard  148.0ms  185.7ms  1.25 | index       229.1ms  188.1ms  0.82 |  252.9ms  760.9ms  3.01
+   2.0    3985   54.2  100.0 | cost_guard  169.1ms  145.1ms  0.86 | index       140.4ms  265.8ms  1.89 |  165.7ms 1436.6ms  8.67
+   1.0    1984   28.2   96.0 | index       222.8ms  188.7ms  0.85 | index       265.6ms  472.5ms  1.78 |  165.8ms  828.2ms  5.00
+   0.5     983   14.9   82.8 | index       126.3ms  201.0ms  1.59 | index       175.1ms  818.9ms  4.68 |  152.0ms  904.0ms  5.95
+   0.2     379    6.7   53.6 | index       109.7ms  292.4ms  2.67 | index       215.0ms  670.4ms  3.12 |   96.5ms  757.4ms  7.85
+   0.1     180    3.3   26.7 | index        49.4ms  545.1ms 11.03 | index        55.2ms  675.9ms 12.25 |   43.2ms  664.1ms 15.38
+
+=== compressed (8-page blocks), clustered: 200000 records, 5405 data pages, block_pages=8, 676 I/O units
+                             | limit=100                          | limit=1000                         | all rows               
+  sel%    rows pages% units% | guard         index     scan   s/i | guard         index     scan   s/i |    index     scan   s/i
+  50.0   99980   50.0   50.0 | index       141.7ms  321.2ms  2.27 | index       133.3ms  335.4ms  2.52 |  136.5ms  793.5ms  5.81
+  30.0   59980   30.0   30.0 | index        94.6ms  407.5ms  4.31 | index        95.3ms  399.0ms  4.19 |   77.2ms  615.2ms  7.97
+  20.0   39980   20.0   20.1 | index        55.3ms  391.6ms  7.08 | index        56.3ms  397.7ms  7.06 |   51.8ms  618.4ms 11.94
+  10.0   19980   10.0   10.1 | index        89.4ms  701.0ms  7.84 | index        44.2ms  604.8ms 13.69 |   37.1ms  524.4ms 14.14
+   5.0    9980    5.0    5.0 | index        25.9ms  473.3ms 18.30 | index        19.1ms  449.0ms 23.49 |   23.5ms  490.6ms 20.91
+   2.0    3980    2.0    2.1 | index        12.2ms  517.1ms 42.26 | index        14.7ms  566.9ms 38.53 |   16.7ms  669.8ms 40.12
+   1.0    1980    1.0    1.0 | index        13.3ms  589.2ms 44.29 | index        54.6ms  561.6ms 10.29 |    9.2ms  537.6ms 58.48
+   0.5     980    0.5    0.6 | index        11.6ms  560.7ms 48.53 | index         9.3ms  535.2ms 57.47 |    9.9ms  573.3ms 58.12
+   0.2     380    0.2    0.3 | index        14.0ms  574.5ms 41.10 | index         8.8ms  552.3ms 62.52 |    7.4ms  530.8ms 72.07
+   0.1     180    0.1    0.1 | index         8.0ms  590.6ms 73.53 | index         9.2ms  645.3ms 70.36 |    7.8ms  579.0ms 74.31
+
+=== uncompressed, scattered: 200000 records, 5399 data pages, block_pages=0, 5399 I/O units
+                             | limit=100                          | limit=1000                         | all rows               
+  sel%    rows pages% units% | guard         index     scan   s/i | guard         index     scan   s/i |    index     scan   s/i
+  50.0   99982  100.0  100.0 | cost_guard  105.9ms    7.3ms  0.07 | cost_guard  116.9ms   11.7ms  0.10 |  140.5ms  584.9ms  4.16
+  30.0   59978  100.0  100.0 | cost_guard   70.5ms    8.2ms  0.12 | cost_guard   86.3ms   16.2ms  0.19 |   65.2ms  549.5ms  8.42
+  20.0   39982  100.0  100.0 | cost_guard   46.0ms    8.7ms  0.19 | cost_guard  125.6ms   30.0ms  0.24 |   61.2ms 1002.3ms 16.37
+  10.0   19980  100.0  100.0 | cost_guard  102.1ms   37.2ms  0.36 | index       123.8ms  115.7ms  0.93 |   93.3ms  802.5ms  8.60
+   5.0    9979  100.0  100.0 | cost_guard   41.1ms   14.4ms  0.35 | index        79.8ms   95.7ms  1.20 |   43.2ms  992.0ms 22.95
+   2.0    3985   54.2   54.2 | index        41.2ms   54.3ms  1.32 | index        86.1ms  410.2ms  4.77 |  155.6ms  737.9ms  4.74
+   1.0    1984   28.2   28.2 | index        21.3ms   42.2ms  1.98 | index        15.0ms  369.6ms 24.60 |   16.2ms  495.6ms 30.52
+   0.5     983   14.9   14.9 | index        10.3ms   50.6ms  4.90 | index        17.9ms  455.2ms 25.47 |   11.0ms  469.7ms 42.55
+   0.2     379    6.7    6.7 | index        12.3ms  121.3ms  9.86 | index         8.8ms  531.5ms 60.33 |   28.1ms  779.4ms 27.71
+   0.1     180    3.3    3.3 | index        19.8ms  468.8ms 23.63 | index        18.9ms  764.2ms 40.40 |   30.3ms  528.3ms 17.42
+
+=== uncompressed, clustered: 200000 records, 5405 data pages, block_pages=0, 5405 I/O units
+                             | limit=100                          | limit=1000                         | all rows               
+  sel%    rows pages% units% | guard         index     scan   s/i | guard         index     scan   s/i |    index     scan   s/i
+  50.0   99980   50.0   50.0 | index       111.2ms  267.6ms  2.41 | index       100.7ms  233.9ms  2.32 |   95.1ms  572.0ms  6.01
+  30.0   59980   30.0   30.0 | index        81.9ms  363.0ms  4.43 | index        72.6ms  326.8ms  4.50 |   86.1ms  512.3ms  5.95
+  20.0   39980   20.0   20.0 | index        44.5ms  372.0ms  8.37 | index        48.1ms  366.0ms  7.60 |   45.9ms  506.3ms 11.04
+  10.0   19980   10.0   10.0 | index        25.1ms  414.0ms 16.48 | index        30.0ms  482.7ms 16.07 |   32.1ms  735.8ms 22.93
+   5.0    9980    5.0    5.0 | index        15.6ms  718.4ms 46.08 | index        58.9ms  582.6ms  9.90 |   63.6ms  660.0ms 10.38
+   2.0    3980    2.0    2.0 | index        21.7ms  787.2ms 36.24 | index        21.3ms  545.7ms 25.66 |   26.9ms  514.9ms 19.12
+   1.0    1980    1.0    1.0 | index        19.0ms  461.8ms 24.27 | index        12.4ms  466.4ms 37.64 |   10.4ms  473.6ms 45.45
+   0.5     980    0.5    0.5 | index         9.0ms  574.0ms 63.71 | index        25.8ms  530.3ms 20.55 |   21.2ms  456.1ms 21.50
+   0.2     380    0.2    0.2 | index         8.2ms  445.0ms 54.05 | index         7.2ms  454.6ms 63.52 |    9.5ms  449.9ms 47.17
+   0.1     180    0.1    0.1 | index         7.8ms  447.8ms 57.21 | index        12.2ms  421.4ms 34.64 |    7.4ms  394.7ms 53.00
+load at end: 7.62 8.89 8.04 2/1783 2595382
+--- PASS: TestCostGuardSelectivitySweep (421.20s)
+
+
+-------- run 2 (guard column: provisional rule) --------
+
+load at start: 7.62 8.89 8.04 2/1777 2595389
+
+=== compressed (8-page blocks), scattered: 200000 records, 5399 data pages, block_pages=8, 675 I/O units
+                             | limit=100                          | limit=1000                         | all rows               
+  sel%    rows pages% units% | guard         index     scan   s/i | guard         index     scan   s/i |    index     scan   s/i
+  50.0   99982  100.0  100.0 | cost_guard  170.9ms   89.1ms  0.52 | cost_guard  175.6ms   91.6ms  0.52 |  181.8ms  526.2ms  2.89
+  30.0   59978  100.0  100.0 | cost_guard  103.9ms   69.6ms  0.67 | cost_guard  141.5ms   94.3ms  0.67 |  116.5ms  703.3ms  6.03
+  20.0   39982  100.0  100.0 | cost_guard   97.2ms   70.2ms  0.72 | cost_guard   98.7ms   76.9ms  0.78 |   94.5ms  495.1ms  5.24
+  10.0   19980  100.0  100.0 | cost_guard  105.6ms   85.7ms  0.81 | index        91.9ms   85.9ms  0.93 |   85.7ms  391.3ms  4.57
+   5.0    9979  100.0  100.0 | cost_guard   79.5ms   74.9ms  0.94 | index        84.5ms  100.9ms  1.19 |   80.4ms  394.2ms  4.90
+   2.0    3985   54.2  100.0 | cost_guard   89.6ms   93.1ms  1.04 | index        93.6ms  178.2ms  1.90 |   93.0ms  554.7ms  5.96
+   1.0    1984   28.2   96.0 | index        91.0ms  100.3ms  1.10 | index        85.3ms  270.3ms  3.17 |   71.6ms  400.3ms  5.59
+   0.5     983   14.9   82.8 | index        68.1ms  101.0ms  1.48 | index        65.9ms  412.0ms  6.25 |  132.0ms  638.8ms  4.84
+   0.2     379    6.7   53.6 | index       104.2ms  217.1ms  2.08 | index        73.3ms  552.2ms  7.53 |   63.2ms  662.4ms 10.48
+   0.1     180    3.3   26.7 | index        31.9ms  286.4ms  8.97 | index        31.6ms  473.4ms 14.97 |   33.9ms  518.3ms 15.31
+
+=== compressed (8-page blocks), clustered: 200000 records, 5405 data pages, block_pages=8, 676 I/O units
+                             | limit=100                          | limit=1000                         | all rows               
+  sel%    rows pages% units% | guard         index     scan   s/i | guard         index     scan   s/i |    index     scan   s/i
+  50.0   99980   50.0   50.0 | index       116.3ms  326.9ms  2.81 | index       110.7ms  278.0ms  2.51 |  111.3ms  649.7ms  5.84
+  30.0   59980   30.0   30.0 | index        66.5ms  344.1ms  5.18 | index        79.0ms  335.1ms  4.24 |   94.9ms  572.7ms  6.04
+  20.0   39980   20.0   20.1 | index        46.2ms  408.8ms  8.85 | index        50.6ms  496.4ms  9.82 |   66.4ms  819.4ms 12.34
+  10.0   19980   10.0   10.1 | index        35.8ms  694.9ms 19.41 | index        71.5ms  789.5ms 11.04 |   63.0ms  567.0ms  9.00
+   5.0    9980    5.0    5.0 | index        20.0ms  824.7ms 41.30 | index        31.9ms  629.6ms 19.74 |   26.6ms  563.1ms 21.13
+   2.0    3980    2.0    2.1 | index        16.1ms  536.9ms 33.33 | index        10.0ms  452.6ms 45.38 |   10.8ms  566.4ms 52.25
+   1.0    1980    1.0    1.0 | index        28.0ms  536.7ms 19.15 | index        11.7ms  795.6ms 68.16 |   12.8ms  770.4ms 60.19
+   0.5     980    0.5    0.6 | index        10.5ms  599.7ms 57.22 | index        10.3ms  618.8ms 60.06 |   37.1ms  675.1ms 18.20
+   0.2     380    0.2    0.3 | index        33.6ms  647.1ms 19.27 | index        23.9ms  663.9ms 27.75 |   24.0ms  640.3ms 26.71
+   0.1     180    0.1    0.1 | index        44.0ms  520.7ms 11.85 | index         7.2ms  452.4ms 62.51 |    7.4ms  494.8ms 66.92
+
+=== uncompressed, scattered: 200000 records, 5399 data pages, block_pages=0, 5399 I/O units
+                             | limit=100                          | limit=1000                         | all rows               
+  sel%    rows pages% units% | guard         index     scan   s/i | guard         index     scan   s/i |    index     scan   s/i
+  50.0   99982  100.0  100.0 | cost_guard   82.2ms    7.7ms  0.09 | cost_guard  124.3ms   12.1ms  0.10 |  130.5ms  476.9ms  3.65
+  30.0   59978  100.0  100.0 | cost_guard   82.6ms    7.7ms  0.09 | cost_guard   65.3ms   14.0ms  0.21 |   63.2ms  770.1ms 12.18
+  20.0   39982  100.0  100.0 | cost_guard   60.7ms    7.6ms  0.12 | cost_guard   51.2ms   17.6ms  0.34 |   66.1ms  551.5ms  8.35
+  10.0   19980  100.0  100.0 | cost_guard   27.6ms    8.1ms  0.30 | index        28.1ms   31.1ms  1.11 |   27.7ms  431.2ms 15.59
+   5.0    9979  100.0  100.0 | cost_guard   25.0ms   11.5ms  0.46 | index        26.7ms   46.2ms  1.73 |   24.4ms  381.6ms 15.66
+   2.0    3985   54.2   54.2 | index        15.6ms   15.7ms  1.01 | index        15.7ms  104.1ms  6.62 |   30.2ms  471.0ms 15.59
+   1.0    1984   28.2   28.2 | index        14.1ms   24.1ms  1.70 | index        11.0ms  201.9ms 18.28 |   11.6ms  388.0ms 33.57
+   0.5     983   14.9   14.9 | index        12.4ms   47.3ms  3.81 | index         9.4ms  468.8ms 49.63 |   12.8ms  384.3ms 30.00
+   0.2     379    6.7    6.7 | index        11.7ms  112.4ms  9.62 | index         8.6ms  424.2ms 49.50 |   13.6ms  453.2ms 33.32
+   0.1     180    3.3    3.3 | index        12.5ms  271.9ms 21.75 | index         9.4ms  593.5ms 63.41 |   25.9ms  455.8ms 17.57
+
+=== uncompressed, clustered: 200000 records, 5405 data pages, block_pages=0, 5405 I/O units
+                             | limit=100                          | limit=1000                         | all rows               
+  sel%    rows pages% units% | guard         index     scan   s/i | guard         index     scan   s/i |    index     scan   s/i
+  50.0   99980   50.0   50.0 | index        98.2ms  244.4ms  2.49 | index        95.7ms  243.8ms  2.55 |  130.2ms  747.8ms  5.74
+  30.0   59980   30.0   30.0 | index        60.6ms  317.2ms  5.23 | index        58.6ms  322.2ms  5.50 |   62.3ms  592.0ms  9.50
+  20.0   39980   20.0   20.0 | index        53.7ms  387.8ms  7.22 | index        40.9ms  377.8ms  9.24 |   37.7ms  488.6ms 12.97
+  10.0   19980   10.0   10.0 | index        23.0ms  408.3ms 17.72 | index        39.3ms  448.3ms 11.40 |   30.5ms  460.7ms 15.09
+   5.0    9980    5.0    5.0 | index        18.1ms  467.9ms 25.90 | index        19.3ms  481.1ms 24.97 |   22.4ms  476.4ms 21.23
+   2.0    3980    2.0    2.0 | index        18.2ms  458.4ms 25.22 | index        15.8ms  453.4ms 28.75 |   14.7ms  474.0ms 32.34
+   1.0    1980    1.0    1.0 | index        32.1ms  454.6ms 14.18 | index        12.3ms  445.3ms 36.30 |   10.2ms  515.6ms 50.78
+   0.5     980    0.5    0.5 | index        14.3ms  518.6ms 36.22 | index        11.2ms  456.6ms 40.90 |   13.7ms  482.6ms 35.26
+   0.2     380    0.2    0.2 | index        12.7ms  568.6ms 44.70 | index        14.4ms  519.6ms 36.12 |   13.1ms  471.4ms 36.06
+   0.1     180    0.1    0.1 | index         9.0ms  437.0ms 48.49 | index         8.6ms  550.1ms 64.12 |   11.6ms  431.9ms 37.18
+load at end: 6.83 7.26 7.54 3/1809 2606574
+--- PASS: TestCostGuardSelectivitySweep (341.27s)
+
+
+-------- run 3 (guard column: committed rule) --------
+
+load at start: 6.16 6.77 7.33 16/1810 2608362
+
+=== compressed (8-page blocks), scattered: 200000 records, 5399 data pages, block_pages=8, 675 I/O units
+                             | limit=100                          | limit=1000                         | all rows               
+  sel%    rows pages% units% | guard         index     scan   s/i | guard         index     scan   s/i |    index     scan   s/i
+  50.0   99982  100.0  100.0 | cost_guard  214.9ms  109.9ms  0.51 | cost_guard  236.8ms  112.3ms  0.47 |  183.7ms  668.4ms  3.64
+  30.0   59978  100.0  100.0 | cost_guard  157.4ms  109.6ms  0.70 | cost_guard  189.2ms  121.2ms  0.64 |  184.4ms  608.1ms  3.30
+  20.0   39982  100.0  100.0 | cost_guard  139.7ms  107.2ms  0.77 | cost_guard  152.3ms  114.5ms  0.75 |  195.2ms  679.7ms  3.48
+  10.0   19980  100.0  100.0 | cost_guard  133.7ms  151.8ms  1.14 | cost_guard  238.7ms  116.2ms  0.49 |  121.2ms  912.7ms  7.53
+   5.0    9979  100.0  100.0 | cost_guard  203.5ms  175.5ms  0.86 | index       223.7ms  238.8ms  1.07 |  245.8ms  912.7ms  3.71
+   2.0    3985   54.2  100.0 | index       183.4ms  148.7ms  0.81 | index       171.5ms  302.3ms  1.76 |  146.4ms  685.4ms  4.68
+   1.0    1984   28.2   96.0 | index        96.9ms  146.7ms  1.51 | index       100.5ms  326.8ms  3.25 |  106.5ms  644.5ms  6.05
+   0.5     983   14.9   82.8 | index       161.1ms  196.7ms  1.22 | index       130.8ms  602.8ms  4.61 |  138.8ms  649.3ms  4.68
+   0.2     379    6.7   53.6 | index        75.1ms  266.0ms  3.54 | index        61.9ms  558.7ms  9.03 |   78.3ms  560.9ms  7.16
+   0.1     180    3.3   26.7 | index        40.2ms  354.3ms  8.81 | index        31.1ms  567.2ms 18.27 |   36.1ms  526.2ms 14.56
+
+=== compressed (8-page blocks), clustered: 200000 records, 5405 data pages, block_pages=8, 676 I/O units
+                             | limit=100                          | limit=1000                         | all rows               
+  sel%    rows pages% units% | guard         index     scan   s/i | guard         index     scan   s/i |    index     scan   s/i
+  50.0   99980   50.0   50.0 | index       120.3ms  291.6ms  2.42 | index       134.5ms  294.6ms  2.19 |  136.8ms  631.5ms  4.62
+  30.0   59980   30.0   30.0 | index        79.5ms  475.1ms  5.98 | index        94.0ms  479.1ms  5.10 |  110.2ms  710.4ms  6.45
+  20.0   39980   20.0   20.1 | index        61.8ms  502.2ms  8.12 | index        80.3ms  437.0ms  5.45 |   54.2ms  477.1ms  8.80
+  10.0   19980   10.0   10.1 | index        23.4ms  501.8ms 21.41 | index        35.0ms  625.8ms 17.88 |   36.5ms  549.1ms 15.06
+   5.0    9980    5.0    5.0 | index        18.7ms  525.1ms 28.10 | index        30.0ms  519.7ms 17.31 |   15.4ms  520.8ms 33.80
+   2.0    3980    2.0    2.1 | index        26.3ms  472.0ms 17.98 | index        14.2ms  610.5ms 43.01 |   15.1ms  542.1ms 35.88
+   1.0    1980    1.0    1.0 | index        10.6ms  587.5ms 55.57 | index        12.3ms  724.5ms 58.82 |   34.1ms  609.3ms 17.88
+   0.5     980    0.5    0.6 | index        24.7ms  519.4ms 21.01 | index        12.9ms  498.0ms 38.55 |   11.3ms  489.5ms 43.44
+   0.2     380    0.2    0.3 | index         5.9ms  367.0ms 62.71 | index         7.2ms  467.0ms 64.98 |   10.8ms  531.0ms 49.29
+   0.1     180    0.1    0.1 | index        10.4ms  551.8ms 53.12 | index         7.9ms  437.8ms 55.14 |    7.9ms  462.5ms 58.36
+
+=== uncompressed, scattered: 200000 records, 5399 data pages, block_pages=0, 5399 I/O units
+                             | limit=100                          | limit=1000                         | all rows               
+  sel%    rows pages% units% | guard         index     scan   s/i | guard         index     scan   s/i |    index     scan   s/i
+  50.0   99982  100.0  100.0 | cost_guard   74.4ms    6.4ms  0.09 | cost_guard   88.3ms   10.3ms  0.12 |   94.8ms  578.3ms  6.10
+  30.0   59978  100.0  100.0 | cost_guard   54.5ms    6.6ms  0.12 | cost_guard   52.9ms   12.3ms  0.23 |   88.9ms  479.2ms  5.39
+  20.0   39982  100.0  100.0 | cost_guard   42.8ms    7.2ms  0.17 | cost_guard   41.7ms   16.2ms  0.39 |   41.3ms  514.8ms 12.45
+  10.0   19980  100.0  100.0 | cost_guard   44.5ms   11.8ms  0.26 | cost_guard   47.5ms   32.9ms  0.69 |   41.7ms  488.4ms 11.72
+   5.0    9979  100.0  100.0 | cost_guard   21.7ms   10.8ms  0.50 | index        22.1ms   58.4ms  2.65 |   97.1ms  536.4ms  5.52
+   2.0    3985   54.2   54.2 | index        32.1ms   17.6ms  0.55 | index        16.0ms  135.1ms  8.42 |   15.1ms  504.6ms 33.37
+   1.0    1984   28.2   28.2 | index        15.1ms   34.5ms  2.29 | index        16.6ms  273.0ms 16.43 |   12.1ms  409.6ms 33.78
+   0.5     983   14.9   14.9 | index         8.7ms   48.4ms  5.56 | index         9.3ms  455.6ms 49.16 |   10.3ms  383.4ms 37.14
+   0.2     379    6.7    6.7 | index         8.5ms   87.6ms 10.26 | index         6.3ms  370.3ms 58.52 |    8.4ms  471.3ms 56.05
+   0.1     180    3.3    3.3 | index         8.0ms  215.5ms 27.07 | index         9.0ms  435.3ms 48.39 |    8.0ms  516.3ms 64.92
+
+=== uncompressed, clustered: 200000 records, 5405 data pages, block_pages=0, 5405 I/O units
+                             | limit=100                          | limit=1000                         | all rows               
+  sel%    rows pages% units% | guard         index     scan   s/i | guard         index     scan   s/i |    index     scan   s/i
+  50.0   99980   50.0   50.0 | index       106.5ms  232.7ms  2.19 | index        99.8ms  269.4ms  2.70 |  106.7ms  599.6ms  5.62
+  30.0   59980   30.0   30.0 | index        52.4ms  348.3ms  6.65 | index        58.7ms  310.5ms  5.29 |   64.0ms  619.0ms  9.68
+  20.0   39980   20.0   20.0 | index        47.7ms  406.2ms  8.51 | index        65.2ms  494.3ms  7.58 |   79.1ms  547.5ms  6.92
+  10.0   19980   10.0   10.0 | index        24.7ms  452.7ms 18.31 | index        32.4ms  436.2ms 13.48 |   21.0ms  553.9ms 26.43
+   5.0    9980    5.0    5.0 | index        20.2ms  435.9ms 21.62 | index        17.3ms  475.0ms 27.39 |   14.2ms  503.7ms 35.37
+   2.0    3980    2.0    2.0 | index        14.6ms  464.3ms 31.70 | index        18.4ms  495.1ms 26.93 |   24.0ms  489.6ms 20.39
+   1.0    1980    1.0    1.0 | index        11.8ms  450.7ms 38.10 | index         9.7ms  555.4ms 57.41 |   12.4ms  494.7ms 39.94
+   0.5     980    0.5    0.5 | index         9.8ms  637.2ms 65.15 | index        11.9ms  584.2ms 49.17 |   12.9ms  421.7ms 32.67
+   0.2     380    0.2    0.2 | index         9.5ms  458.4ms 48.16 | index         8.4ms  524.9ms 62.50 |   19.9ms  634.3ms 31.82
+   0.1     180    0.1    0.1 | index         8.9ms  477.8ms 53.58 | index         7.8ms  480.5ms 61.80 |   11.3ms  454.1ms 40.36
+load at end: 5.52 5.98 6.84 4/1821 2619373
+--- PASS: TestCostGuardSelectivitySweep (355.89s)
+
+

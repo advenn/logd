@@ -220,9 +220,9 @@ func (e *Engine) labelAllowed(key string) bool {
 // offset sets (predicates are ANDed).
 //
 // Returns ok=false if any lookup's index can't be opened, so the caller degrades to a full
-// scan rather than a partial set. Returns guardTripped=true when the candidate set grows
-// past what is worth fetching by offset — see below.
-func intersectLookups(segBase string, lookups []plannedLookup, maxCandidates int) (offsets []uint64, guardTripped, ok bool) {
+// scan rather than a partial set. Returns guardTripped=true when the cost guard sends the
+// segment to the scan instead (see costguard.go).
+func intersectLookups(segBase string, lookups []plannedLookup, g costGuard) (offsets []uint64, guardTripped, ok bool) {
 	var result map[uint64]struct{}
 	for _, l := range lookups {
 		offs, lookupOK := l.run(segBase)
@@ -230,27 +230,18 @@ func intersectLookups(segBase string, lookups []plannedLookup, maxCandidates int
 			return nil, false, false
 		}
 		if result == nil {
-			// Early bail is only sound when this is the ONLY lookup, because the
-			// intersection can only shrink: a large first set says nothing about the final
-			// candidate count. Tripping the guard on it anyway would demote segments whose
-			// real intersection is tiny — caught immediately by TestExplainReportsAccessPath,
-			// where `{region="eu"} | latency_ms > 200` intersects 3 typed hits down to 2.
-			bailAt := 0
-			if len(lookups) == 1 {
-				bailAt = maxCandidates
+			// With a single lookup its result IS the candidate set, so the guard is decided
+			// before paying for the dedup map, which on a set the guard rejects is pure waste.
+			// With several it is decided only after intersecting: the intersection can only
+			// shrink, so a large first set says nothing about the final candidate count —
+			// TestExplainReportsAccessPath, where `{region="eu"} | latency_ms > 200`
+			// intersects 3 typed hits down to 2, caught a guard that bailed on the first set.
+			if len(lookups) == 1 && g.trips(offs) {
+				return nil, true, true
 			}
 			result = make(map[uint64]struct{}, len(offs))
 			for _, o := range offs {
 				result[o] = struct{}{}
-				// Applied DURING materialization, not after: building the whole set and
-				// then discarding it is what made a broad indexed query slower than the
-				// scan it fell back to. Bailing bounds the work at maxCandidates+1
-				// insertions. Exact, not an estimate — a raw index-entry count would
-				// over-count, since one record matching a template twice yields two entries
-				// for the same offset.
-				if bailAt > 0 && len(result) > bailAt {
-					return nil, true, true
-				}
 			}
 			// A first lookup that matched nothing means the intersection is empty. The old
 			// code only checked this from the SECOND lookup onward, so a zero-candidate
@@ -277,27 +268,10 @@ func intersectLookups(segBase string, lookups []plannedLookup, maxCandidates int
 	for o := range result {
 		out = append(out, o)
 	}
-	return out, false, true
-}
-
-// costGuardFraction: when candidate offsets exceed this fraction of a segment's records,
-// a sequential scan beats random-access fetches (constant; configurable later).
-const costGuardFraction = 0.5
-
-// costGuardTrips reports whether an index candidate set is too large to be worth fetching
-// by offset versus scanning the segment.
-func costGuardTrips(seg *storage.SegmentMeta, candidates int) bool {
-	return seg.Records > 0 && uint64(candidates) > uint64(costGuardFraction*float64(seg.Records))
-}
-
-// costGuardLimit is the candidate count above which the guard trips, or 0 when this segment
-// has no record count and the guard is therefore disabled. Passing it into
-// intersectLookups lets the guard fire while the set is being built.
-func costGuardLimit(seg *storage.SegmentMeta) int {
-	if seg.Records == 0 {
-		return 0
+	if len(lookups) > 1 && g.trips(out) {
+		return nil, true, true
 	}
-	return int(costGuardFraction * float64(seg.Records))
+	return out, false, true
 }
 
 // SegmentPlanReason explains why a segment took the path it did.
@@ -305,7 +279,7 @@ const (
 	ReasonNotIndexed   = "not_indexed"   // active or crash-recovered segment
 	ReasonNoPushdown   = "no_pushdown"   // no predicate could be pushed here
 	ReasonIndexMissing = "index_missing" // a sidecar was absent or corrupt
-	ReasonCostGuard    = "cost_guard"    // candidate set too large; sequential scan is cheaper
+	ReasonCostGuard    = "cost_guard"    // candidates over-fetch the limit and cover the segment; a scan is cheaper
 	ReasonIndexed      = "indexed"       // pushdown used
 )
 
@@ -385,12 +359,12 @@ func (e *Engine) Explain(q Query) []SegmentPlan {
 				continue
 			}
 			segBase := strings.TrimSuffix(seg.Path, ".log")
-			offsets, tripped, ok := intersectLookups(segBase, lookups, costGuardLimit(seg))
+			offsets, tripped, ok := intersectLookups(segBase, lookups, e.costGuard(seg, effectiveLimit(q.Limit)))
 			if !ok {
 				plans = append(plans, SegmentPlan{SegmentID: seg.ID, Mode: "scan", Reason: ReasonIndexMissing})
 				continue
 			}
-			if tripped || costGuardTrips(seg, len(offsets)) {
+			if tripped {
 				plans = append(plans, SegmentPlan{SegmentID: seg.ID, Mode: "scan", Reason: ReasonCostGuard})
 				continue
 			}
