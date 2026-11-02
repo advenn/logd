@@ -13,6 +13,7 @@ type Config struct {
 	Port                 int         `yaml:"port"`
 	DataDir              string      `yaml:"data_dir"`
 	SegmentSizeMB        int         `yaml:"segment_size_mb"`
+	MaxSegmentAgeMinutes *int        `yaml:"max_segment_age_minutes"` // seal the active segment once its first record is this old; default 60, 0 = never
 	FlushIntervalMs      int         `yaml:"flush_interval_ms"`
 	RetentionDays        int         `yaml:"retention_days"`           // delete sealed segments older than this (0 = keep forever)
 	IndexMemBudgetMB     int         `yaml:"index_mem_budget_mb"`      // seal early when the active segment's in-RAM index exceeds this (0 = no cap)
@@ -80,11 +81,37 @@ func (c *Config) validate() error {
 	if c.FlushIntervalMs < 10 || c.FlushIntervalMs > 60000 {
 		return fmt.Errorf("flush_interval_ms %d out of range", c.FlushIntervalMs)
 	}
+	if m := c.MaxSegmentAgeMinutes; m != nil && *m < 0 {
+		return fmt.Errorf("max_segment_age_minutes %d out of range (0 disables the age limit)", *m)
+	}
 	return nil
 }
 
 // SegmentSizeBytes returns the configured segment size in bytes.
 func (c *Config) SegmentSizeBytes() int64 { return int64(c.SegmentSizeMB) << 20 }
+
+// MaxSegmentAge returns how old the active segment's first record may get before the segment
+// is sealed, whatever its size; 0 means no age limit.
+//
+// Size alone is the wrong trigger for a quiet shard. At a few lines a second a 64 MB segment
+// takes days to fill, and all that time it stays raw (uncompressed, ~6x larger on disk), its
+// typed and label indexes exist only in the writer's memory, and retention cannot touch it,
+// because retention deletes sealed segments only. A deployment that set retention_days: 1 could
+// keep a week of logs in that one segment.
+//
+// The default is 60 minutes, which caps that at an hour. A busy shard fills its segment long
+// before then, so the limit never fires there and changes nothing. Unlike the other knobs,
+// an explicit 0 is honoured rather than read as unset: it disables the limit, which a
+// benchmark that measures a deliberately unsealed layout needs (testbed/stack/logd/logd.yaml).
+func (c *Config) MaxSegmentAge() time.Duration {
+	if c.MaxSegmentAgeMinutes == nil {
+		return defaultMaxSegmentAge
+	}
+	return time.Duration(*c.MaxSegmentAgeMinutes) * time.Minute
+}
+
+// defaultMaxSegmentAge is the shipped age limit. See MaxSegmentAge.
+const defaultMaxSegmentAge = 60 * time.Minute
 
 // FlushInterval returns the configured flush cadence.
 func (c *Config) FlushInterval() time.Duration {

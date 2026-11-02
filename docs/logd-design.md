@@ -167,6 +167,8 @@ Consequences: a removed template still accelerates queries on old segments; new 
 ### 7.5 Seal ✅
 Sort typed-range buffer → write `.tidx` + dictionaries + posting lists → fsync → fsync dir → rename → manifest update (including schema) → drop RAM buffers.
 
+Triggers ⚙️: the active segment seals at a page boundary when it reaches `segment_size_mb`, when its in-RAM index exceeds `index_mem_budget_mb`, or when its first record is older than `max_segment_age_minutes` (default 60; 0 = off). The age trigger is checked on every flush tick, so an idle segment seals too. Without it a low-volume shard kept one segment active for days — uncompressed, indexed only in memory, and immune to retention, which deletes sealed segments only. A recovered segment's age is its first surviving record's ingest time; an empty segment never seals for age.
+
 ---
 
 ## 8. Durability & crash recovery ✅

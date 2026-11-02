@@ -25,6 +25,11 @@ type Options struct {
 	Schema           []index.FieldType // indexed fields; each segment builds a per-field .tidx for these at seal
 	Retention        time.Duration     // delete sealed segments older than this (0 = keep forever)
 	IndexMemBudget   int64             // seal early when the active segment's in-RAM index exceeds this (0 = no cap)
+	// MaxSegmentAge seals the active segment once its first record was written longer ago
+	// than this, whatever its size (0 = no age limit). Size alone leaves a low-volume shard on
+	// one active segment for days: uncompressed, its .tidx/.lidx never written, and out of
+	// retention's reach, which deletes sealed segments only.
+	MaxSegmentAge time.Duration
 	// SyncInterval bounds how long a written page may sit unsynced. 0 fsyncs every page
 	// (the strongest durability, and by far the slowest: fsync dominates the write path).
 	// A positive value group-commits, trading a bounded loss window for throughput — the
@@ -104,6 +109,10 @@ type Writer struct {
 	needsSync  bool               // a page has been written but not yet fsynced
 	// rotateRetryAt holds off the next rotation attempt after one failed (see maybeRotate).
 	rotateRetryAt time.Time
+	// segFirstWrite is when the active segment's first record was written (zero while it has
+	// none), the start of its MaxSegmentAge. Reset on rotate; recovery restores it from the
+	// first record on disk, so a restart does not give an old segment a fresh lease.
+	segFirstWrite time.Time
 	// closeErr is what the final flush and seal in shutdown reported, returned by Close.
 	closeErr error
 
@@ -252,6 +261,18 @@ func (w *Writer) recoverActiveSegment(meta *SegmentMeta) error {
 				iw.Close()
 				seg.Close()
 				return err
+			}
+			// The free-space offset is checked, not trusted: a CRC proves the page is what
+			// was written, not that its header is sane.
+			if end := int(h.FreeSpaceOffset); w.segFirstWrite.IsZero() && end > PageHeaderSize && end <= PageSize {
+				// The writer stamps IngestedAt as it appends (processEntry), so the first
+				// record's says when the segment began, to within the ingest path's latency.
+				if e, err := DecodeEntry(buf[PageHeaderSize:end]); err == nil {
+					w.segFirstWrite = e.IngestedAt
+					if now := time.Now(); w.segFirstWrite.After(now) {
+						w.segFirstWrite = now // a clock that went back must not postpone the seal
+					}
+				}
 			}
 		}
 	}
@@ -582,13 +603,14 @@ func (w *Writer) flushTick(now time.Time) {
 		// lost its records and, worse, left their .tidx and label postings pointing at the
 		// page number the NEXT page was then written to: an exact-match index lookup
 		// returned whichever other record landed at the same offset.
-		//
-		// A page the tick did write is a page boundary like any other. At a low ingest
-		// rate EVERY page goes out this way before it fills, so checking only on the
-		// page-full path let such a segment grow without bound and never seal.
-		if w.hdr.EntryCount == 0 {
-			w.maybeRotate()
-		}
+	}
+	// With the page empty — just written, or nothing arrived since the last tick — this is a
+	// page boundary like any other. At a low ingest rate EVERY page goes out this way before
+	// it fills, so checking only on the page-full path let such a segment grow without bound
+	// and never seal. And a segment that has gone quiet altogether must still be checked, or
+	// it would never reach its age limit.
+	if w.hdr.EntryCount == 0 {
+		w.maybeRotate(now)
 	}
 	// Also the group-commit deadline check, so a page written just before the
 	// stream went quiet cannot sit unsynced indefinitely. The effective loss
@@ -630,7 +652,7 @@ func (w *Writer) processEntry(rec record) {
 		// A failed rotation must not cost this record: it was acknowledged when it was
 		// queued. maybeRotate leaves the active segment open in that case, so the record
 		// simply goes into it, and the segment keeps growing until a later rotation works.
-		w.maybeRotate()
+		w.maybeRotate(time.Now())
 	}
 
 	// Target segment settled: intern into THIS segment's dictionary, stamp StreamID,
@@ -668,6 +690,9 @@ func (w *Writer) processEntry(rec record) {
 	w.hdr.EntryCount++
 
 	w.segRecords++
+	if w.segFirstWrite.IsZero() {
+		w.segFirstWrite = time.Now()
+	}
 	if indexing && len(rec.labels) > 0 {
 		// Track the active segment's label streams for immediate discovery, reusing the
 		// canonical string already computed for interning.
@@ -742,9 +767,10 @@ func (w *Writer) LiveStreams() []label.Set {
 	return out
 }
 
-// maybeRotate seals and rotates the active segment when it has reached its size OR its
-// in-RAM index exceeds the memory budget — the latter caps index RAM without
-// spill-and-merge, staying true to the per-segment (no global merge) design.
+// maybeRotate seals and rotates the active segment when it has reached its size, when its
+// in-RAM index exceeds the memory budget — which caps index RAM without spill-and-merge,
+// staying true to the per-segment (no global merge) design — or when it holds records and
+// the first of them is older than MaxSegmentAge.
 //
 // Call it only right after a page was written, with the in-RAM page empty: the page being
 // assembled targets the active segment, so rotating under it would put its records in the
@@ -756,17 +782,24 @@ func (w *Writer) LiveStreams() []label.Set {
 // writer carries on appending to it and tries again at the first page boundary after
 // rotateRetryInterval. Retrying at every page instead would re-run a failing seal — which
 // rewrites every .tidx — thousands of times a second at full ingest, and log each one.
-func (w *Writer) maybeRotate() {
-	if w.currSeg.Size < w.opts.SegmentSizeBytes && !w.indexMemExceeded() {
+func (w *Writer) maybeRotate(now time.Time) {
+	if w.currSeg.Size < w.opts.SegmentSizeBytes && !w.indexMemExceeded() && !w.segmentExpired(now) {
 		return
 	}
-	if time.Now().Before(w.rotateRetryAt) {
+	if now.Before(w.rotateRetryAt) {
 		return
 	}
 	if err := w.rotateSegment(); err != nil {
-		w.rotateRetryAt = time.Now().Add(rotateRetryInterval)
+		w.rotateRetryAt = now.Add(rotateRetryInterval)
 		log.Printf("storage: rotating segment (next attempt in %v at the earliest): %v", rotateRetryInterval, err)
 	}
+}
+
+// segmentExpired reports whether the active segment has records and the first was written
+// more than MaxSegmentAge before now. An empty segment never expires: sealing it would only
+// trade one empty segment for another.
+func (w *Writer) segmentExpired(now time.Time) bool {
+	return w.opts.MaxSegmentAge > 0 && !w.segFirstWrite.IsZero() && now.Sub(w.segFirstWrite) > w.opts.MaxSegmentAge
 }
 
 // rotateRetryInterval is how long the writer waits after a failed rotation before trying
@@ -1058,6 +1091,7 @@ func (w *Writer) rotateSegment() error {
 	w.card = label.NewCardinality(w.opts.MaxLabelCardinality)
 	w.indexIncomplete = false
 	w.segRecords = 0
+	w.segFirstWrite = time.Time{}
 	// The just-sealed segment's labels are now served from its .lidx; start fresh so
 	// liveStreams stays bounded by the active segment's cardinality.
 	w.liveMu.Lock()

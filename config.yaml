@@ -2,6 +2,10 @@
 port: 7100
 data_dir: ./data
 segment_size_mb: 64
+# Seal the active segment once its first record is this many minutes old, whatever its size.
+# A quiet shard otherwise keeps one active segment for days: uncompressed, indexed only in
+# memory, and beyond retention (which deletes sealed segments only). 0 = size limit only.
+max_segment_age_minutes: 60
 flush_interval_ms: 500
 # Group commit: how long a written page may sit unsynced. fsync is the write path's entire
 # bottleneck — per-page fsync measures ~21k lines/s, 50ms measures ~1.05M. Pushes are

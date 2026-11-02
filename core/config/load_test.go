@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -68,5 +70,41 @@ func TestBlockPagesEncoding(t *testing.T) {
 	}
 	if got := (&Config{CompressBlockPages: 16}).BlockPages(); got != 16 {
 		t.Errorf("explicit: got %d, want 16", got)
+	}
+}
+
+// TestMaxSegmentAgeEncoding: unlike the zero-means-default knobs, an explicit 0 must DISABLE
+// the age limit (the testbed relies on it), so the YAML field is a pointer and only an absent
+// key takes the default. A negative age is rejected.
+func TestMaxSegmentAgeEncoding(t *testing.T) {
+	load := func(t *testing.T, yaml string) (Config, error) {
+		t.Helper()
+		p := filepath.Join(t.TempDir(), "logd.yaml")
+		if err := os.WriteFile(p, []byte(yaml), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Load(p)
+	}
+	for _, c := range []struct {
+		yaml string
+		want time.Duration
+	}{
+		{"port: 7100\n", 60 * time.Minute},
+		{"max_segment_age_minutes: 0\n", 0},
+		{"max_segment_age_minutes: 15\n", 15 * time.Minute},
+	} {
+		cfg, err := load(t, c.yaml)
+		if err != nil {
+			t.Fatalf("%q: %v", c.yaml, err)
+		}
+		if got := cfg.MaxSegmentAge(); got != c.want {
+			t.Errorf("%q: MaxSegmentAge %v, want %v", c.yaml, got, c.want)
+		}
+	}
+	if _, err := load(t, "max_segment_age_minutes: -5\n"); err == nil {
+		t.Error("a negative max_segment_age_minutes was accepted")
+	}
+	if d := Default(); d.MaxSegmentAge() != 60*time.Minute {
+		t.Errorf("Default(): MaxSegmentAge %v, want 60m", d.MaxSegmentAge())
 	}
 }

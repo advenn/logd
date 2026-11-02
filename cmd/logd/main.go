@@ -54,6 +54,7 @@ func run(configPath string) error {
 	opts := storage.Options{
 		Schema:              engine.IndexedFields(),
 		SegmentSizeBytes:    cfg.SegmentSizeBytes(),
+		MaxSegmentAge:       cfg.MaxSegmentAge(),
 		FlushInterval:       cfg.FlushInterval(),
 		Retention:           cfg.Retention(),
 		IndexMemBudget:      cfg.IndexMemBudgetBytes(),
