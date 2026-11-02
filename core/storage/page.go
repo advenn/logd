@@ -72,9 +72,9 @@ func NewPageHeader() PageHeader {
 // a shared or read-only buffer (no data race, no in-place write).
 func ChecksumPage(page []byte) uint32 {
 	h := crc32.New(ieeeCRC)
-	h.Write(page[:checksumFieldOffset])       // bytes before the checksum field
-	h.Write(zeroChecksum[:])                   // the checksum field, as zero
-	h.Write(page[checksumFieldEnd:])           // bytes after the checksum field
+	h.Write(page[:checksumFieldOffset]) // bytes before the checksum field
+	h.Write(zeroChecksum[:])            // the checksum field, as zero
+	h.Write(page[checksumFieldEnd:])    // bytes after the checksum field
 	return h.Sum32()
 }
 

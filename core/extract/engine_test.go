@@ -267,8 +267,8 @@ func TestExtractRejectsNaNInf(t *testing.T) {
 
 func TestCompileRejections(t *testing.T) {
 	cases := map[string]config.IndexConfig{
-		"leading capture": {Templates: []config.Template{{Name: "a", Pattern: "{x:int} tail"}}},
-		"no 3-byte anchor": {Templates: []config.Template{{Name: "a", Pattern: "x{n:int}y"}}},
+		"leading capture":   {Templates: []config.Template{{Name: "a", Pattern: "{x:int} tail"}}},
+		"no 3-byte anchor":  {Templates: []config.Template{{Name: "a", Pattern: "x{n:int}y"}}},
 		"adjacent captures": {Templates: []config.Template{{Name: "a", Pattern: "id {x:str}{y:int}"}}},
 		"unknown type":      {Templates: []config.Template{{Name: "a", Pattern: "id {x:blob}"}}},
 		"duplicate name":    {Templates: []config.Template{{Name: "a", Pattern: "aaa {x:int}"}, {Name: "a", Pattern: "bbb {y:int}"}}},
@@ -276,9 +276,9 @@ func TestCompileRejections(t *testing.T) {
 		"duplicate literal": {Literals: []string{"panic:", "panic:"}},
 		// int capture followed by a digit-starting literal would let the scanner eat
 		// the anchor → silent drop; must be rejected.
-		"int then digit anchor":   {Templates: []config.Template{{Name: "a", Pattern: "user{id:int}000"}}},
-		"float then dot anchor":   {Templates: []config.Template{{Name: "a", Pattern: "val {x:float}.done"}}},
-		"float then e-digit":      {Templates: []config.Template{{Name: "a", Pattern: "val {x:float}e2end"}}},
+		"int then digit anchor": {Templates: []config.Template{{Name: "a", Pattern: "user{id:int}000"}}},
+		"float then dot anchor": {Templates: []config.Template{{Name: "a", Pattern: "val {x:float}.done"}}},
+		"float then e-digit":    {Templates: []config.Template{{Name: "a", Pattern: "val {x:float}e2end"}}},
 	}
 	for name, cfg := range cases {
 		t.Run(name, func(t *testing.T) {

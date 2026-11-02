@@ -19,9 +19,9 @@ func sign(x int) int {
 	}
 }
 
-func intKey(i int64) [KeySize]byte   { return EncodeKey(Value{Kind: KindInt, Int: i}) }
+func intKey(i int64) [KeySize]byte     { return EncodeKey(Value{Kind: KindInt, Int: i}) }
 func floatKey(f float64) [KeySize]byte { return EncodeKey(Value{Kind: KindFloat, Float: f}) }
-func strKey(s string) [KeySize]byte  { return EncodeKey(Value{Kind: KindStr, Str: s}) }
+func strKey(s string) [KeySize]byte    { return EncodeKey(Value{Kind: KindStr, Str: s}) }
 
 // The core property: for two values of a kind, the byte-order of their keys matches
 // the values' natural order.

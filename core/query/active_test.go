@@ -142,7 +142,9 @@ func activeBattery() []struct {
 	name  string
 	preds []qr.Predicate
 } {
-	tc := func(f string, op qr.Op, v index.Value) qr.Predicate { return qr.TypedCompare{Field: f, Op: op, Value: v} }
+	tc := func(f string, op qr.Op, v index.Value) qr.Predicate {
+		return qr.TypedCompare{Field: f, Op: op, Value: v}
+	}
 	return []struct {
 		name  string
 		preds []qr.Predicate

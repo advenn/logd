@@ -61,8 +61,8 @@ func Compile(cfg config.IndexConfig) (*Engine, error) {
 
 	tmplNames := map[string]bool{}
 	fieldNames := map[string]bool{}
-	shapes := map[string]string{}          // normalized shape -> template name (overlap detection)
-	litSet := map[string]struct{}{}        // distinct literal strings for the automaton
+	shapes := map[string]string{}   // normalized shape -> template name (overlap detection)
+	litSet := map[string]struct{}{} // distinct literal strings for the automaton
 
 	for _, tc := range cfg.Templates {
 		if tc.Name == "" {
