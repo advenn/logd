@@ -447,9 +447,11 @@ func fmBuildGolden(t *testing.T, recs []fmRec) string {
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// The active segment's pages reach disk on the flush tick; the copy is taken once every
-	// record reads back, before any seal.
-	w = open(-1, 1<<30, 5*time.Millisecond)
+	// The active segment's full pages are written as they fill and the last, partial one on
+	// the flush tick; the copy is taken once every record reads back, before any seal. The
+	// tick is long enough to land after the ingest, not during it, so the page layout (and
+	// with it what a damaged page loses) is the same on every run.
+	w = open(-1, 1<<30, 100*time.Millisecond)
 	put(w, fmRawTo, fmRecords)
 	deadline := time.Now().Add(10 * time.Second)
 	for {
