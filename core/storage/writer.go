@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/advenn/logd/core/index"
@@ -103,7 +104,7 @@ type Writer struct {
 	buffer     *index.Buffer      // per-active-segment typed-range index buffer, flushed at seal
 	labelBuf   *label.Builder     // per-active-segment label index (stream dict + postings), flushed at seal
 	card       *label.Cardinality // per-active-segment value-cardinality cap (§6.2)
-	segRecords uint64             // record count of the active segment (for the cost guard), reset on rotate
+	segRecords uint64             // record count of the active segment, reset on rotate
 	compressWG sync.WaitGroup     // in-flight background segment compressions
 	lastSync   time.Time          // when the active segment was last fsynced (group commit)
 	needsSync  bool               // a page has been written but not yet fsynced
@@ -119,8 +120,15 @@ type Writer struct {
 	// liveStreams holds the ACTIVE segment's label streams for immediate discovery
 	// (sealed segments are served from their .lidx). Concurrency-safe: written by the
 	// writer goroutine, read by query goroutines. Reset on rotate.
+	//
+	// liveMu also guards what queries read of the active segment's buffer and label builder
+	// while the writer appends to them (see activeIndex): one lock per record covers both,
+	// where a lock inside each structure would be three.
 	liveMu      sync.Mutex
 	liveStreams map[string]label.Set
+	// active is the active segment's in-memory index as queries see it; nil while none is
+	// queryable (between a seal and the next segment, and after Close).
+	active atomic.Pointer[activeIndex]
 	// indexIncomplete marks the recovered active segment: its pre-crash records were
 	// never buffered, so writing a .tidx would drop them (false negatives). Such a
 	// segment is instead sealed with an empty schema → scanned. Cleared on rotate.
@@ -336,6 +344,7 @@ func (w *Writer) Start(ctx context.Context) error {
 	if w.labelBuf == nil {
 		w.labelBuf = label.NewBuilder()
 	}
+	w.publishActive()
 	w.resetPage()
 	w.flushTicker = time.NewTicker(w.opts.FlushInterval)
 	if w.opts.Retention > 0 {
@@ -669,7 +678,14 @@ func (w *Writer) processEntry(rec record) {
 		// One Canonical() serves both the interning dictionary and the live-discovery map
 		// below; it allocates, and this runs per record.
 		canon = rec.labels.Canonical()
-		streamID = w.labelBuf.InternCanonical(canon, rec.labels)
+		var known bool
+		if streamID, known = w.labelBuf.Find(canon); !known {
+			// A new stream is the one change to the dictionary a query reads (Postings), so
+			// only it takes the lock; finding an existing stream is the writer's own business.
+			w.liveMu.Lock()
+			streamID = w.labelBuf.InternCanonical(canon, rec.labels)
+			w.liveMu.Unlock()
+		}
 		e.StreamID = streamID
 	}
 
@@ -693,16 +709,6 @@ func (w *Writer) processEntry(rec record) {
 	if w.segFirstWrite.IsZero() {
 		w.segFirstWrite = time.Now()
 	}
-	if indexing && len(rec.labels) > 0 {
-		// Track the active segment's label streams for immediate discovery, reusing the
-		// canonical string already computed for interning.
-		if canon == "" {
-			canon = rec.labels.Canonical()
-		}
-		w.liveMu.Lock()
-		w.liveStreams[canon] = rec.labels
-		w.liveMu.Unlock()
-	}
 
 	tsNano := e.TS.UnixNano()
 	if tsNano < w.hdr.MinTS {
@@ -719,15 +725,35 @@ func (w *Writer) processEntry(rec record) {
 	}
 
 	// Buffer this record's typed-range keys and its label posting against its offset,
-	// unless this is a recovered segment whose index is left incomplete (scan-only).
+	// unless this is a recovered segment whose index is left incomplete (scan-only), and
+	// track its label stream for immediate discovery. All under one hold of liveMu: queries
+	// read the buffers through the active segment's index while the writer appends here.
+	// The record is not readable yet — its page is still in RAM — and a query's view stops
+	// at the pages already on disk, so it will not see these entries before the record
+	// itself; what it must never do is miss them afterwards (see ActiveIndex).
+	//
+	// A record with neither keys nor labels changes nothing a query reads — its one append
+	// is to the posting list of the empty label set, which Postings never reads, the empty
+	// set carrying no key — so it skips the lock rather than pay for it on every record.
 	if indexing {
-		if w.buffer != nil {
-			for _, kv := range rec.keys {
-				w.buffer.Add(kv.Field, kv.Key, segRelOffset)
+		visible := len(rec.keys) > 0 || len(rec.labels) > 0
+		if visible {
+			w.liveMu.Lock()
+		}
+		if len(rec.labels) > 0 {
+			if canon == "" {
+				canon = rec.labels.Canonical()
 			}
+			w.liveStreams[canon] = rec.labels
+		}
+		if w.buffer != nil {
+			w.buffer.AddAll(rec.keys, segRelOffset)
 		}
 		if w.labelBuf != nil {
 			w.labelBuf.AddPosting(streamID, segRelOffset)
+		}
+		if visible {
+			w.liveMu.Unlock()
 		}
 	}
 
@@ -1013,6 +1039,10 @@ func (w *Writer) flushPage() error {
 	// duplicates in every scan, while the index pointed at only the first copy.
 	minTS := w.hdr.MinTS
 	w.currSeg.PageNum++
+	// The page is readable now, so its records may be found through the active segment's
+	// index from here on — not before, or a query could fetch an offset the file does not
+	// hold yet (see ActiveIndex).
+	w.advanceActive()
 	w.needsSync = true // cleared only by a successful fsync, so a failed one stays due
 	w.resetPage()
 
@@ -1079,10 +1109,6 @@ func (w *Writer) rotateSegment() error {
 		}
 	}
 
-	// Registered complete: every field is set before the manifest (and so a concurrent
-	// query) can see the entry.
-	w.manifest.Add(&SegmentMeta{ID: id, Path: path, State: SegmentActive, MinTS: emptyMinTS, MaxTS: emptyMaxTS, Schema: []FieldSchema{}})
-
 	w.currSeg = seg
 	w.idxWriter = iw
 	// A brand-new segment indexes completely from its first record.
@@ -1092,6 +1118,11 @@ func (w *Writer) rotateSegment() error {
 	w.indexIncomplete = false
 	w.segRecords = 0
 	w.segFirstWrite = time.Time{}
+	w.publishActive()
+
+	// Registered complete: every field is set — and the segment's index published — before
+	// the manifest (and so a concurrent query) can see the entry.
+	w.manifest.Add(&SegmentMeta{ID: id, Path: path, State: SegmentActive, MinTS: emptyMinTS, MaxTS: emptyMaxTS, Schema: []FieldSchema{}})
 	// The just-sealed segment's labels are now served from its .lidx; start fresh so
 	// liveStreams stays bounded by the active segment's cardinality.
 	w.liveMu.Lock()
@@ -1177,6 +1208,11 @@ func (w *Writer) sealCurrentSegment() error {
 	if err := w.manifest.SealSegment(w.dir, w.currSeg.ID, info); err != nil {
 		return fmt.Errorf("saving manifest after seal: %w", err)
 	}
+	// The segment's sidecars now answer for it, so its in-memory index is withdrawn and its
+	// buffers can go once no query holds a view of them. A query that saw the segment as
+	// active before the seal finds no index for it any more, re-reads the manifest, and
+	// plans against the sidecars instead.
+	w.active.Store(nil)
 
 	if w.idxWriter != nil {
 		w.idxWriter.Close()
