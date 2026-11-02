@@ -47,7 +47,21 @@ type SegmentMeta struct {
 	Path    string        `json:"path"`
 	State   SegmentState  `json:"state"`
 	Schema  []FieldSchema `json:"schema"`  // fields with a .tidx for this segment
-	Records uint64        `json:"records"` // number of records (for the pushdown cost guard)
+	Records uint64        `json:"records"` // number of records
+	// Pages and BlockPages are the segment's I/O layout, which the planner's cost guard
+	// prices a candidate set against: how many of the segment's units of I/O fetching the
+	// candidates by offset would read, out of how many a scan reads. Pages is the data-page
+	// count (the page-0 placeholder not counted), recorded at seal. BlockPages is the number
+	// of pages per compressed block, recorded once the background compression has finished;
+	// 0 means the segment is read page by page (left uncompressed, or not compressed yet).
+	//
+	// They are the segment's own facts rather than the daemon's configuration because the
+	// two drift apart: compress_block_pages can change between runs, a compression can fail
+	// and leave the segment raw, and a restart finishes an interrupted one with whatever the
+	// configuration says then. Pages == 0 means not recorded (sealed before these fields
+	// existed); the guard then never trips (see costguard.go).
+	Pages      uint64 `json:"pages,omitempty"`
+	BlockPages int    `json:"block_pages,omitempty"`
 	// CappedKeys are label keys whose distinct-value cap was breached in this segment
 	// (§6.2): their over-cap values are in Extra but not the label index, so the planner
 	// must SCAN these keys for this segment rather than push them (else a false negative).
@@ -75,6 +89,7 @@ type SealInfo struct {
 	Schema            []FieldSchema
 	Indexed           bool
 	Records           uint64
+	Pages             uint64
 	CappedKeys        []string
 	LabelKeys         []string
 	LabelKeysRecorded bool
@@ -260,7 +275,21 @@ func (info *SealInfo) applyTo(s *SegmentMeta) {
 	s.State = SegmentSealed
 	s.MinTS, s.MaxTS = info.MinTS, info.MaxTS
 	s.Schema, s.Indexed, s.Records, s.CappedKeys = info.Schema, info.Indexed, info.Records, info.CappedKeys
+	s.Pages = info.Pages
 	s.LabelKeys, s.LabelKeysRecorded = info.LabelKeys, info.LabelKeysRecorded
+}
+
+// SetBlockPages records that a sealed segment is now stored in compressed blocks of n pages.
+// It changes only the in-memory entry: compression runs off the writer goroutine, and every
+// Save must stay on it (or follow it, at Close) so two saves never race on the temp file. The
+// next save persists it; one lost to a crash first leaves the segment looking raw, which only
+// makes the cost guard price it in pages — a smaller coverage, so a guard that trips less.
+func (m *Manifest) SetBlockPages(id string, n int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s, ok := m.segments[id]; ok {
+		s.BlockPages = n
+	}
 }
 
 // Remove deletes a segment from the manifest (used by retention). Returns the removed

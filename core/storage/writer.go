@@ -533,6 +533,12 @@ func (w *Writer) shutdown(graceful bool) {
 	// atomic, so being interrupted would not corrupt anything — but a test that inspects
 	// the directory right after Close deserves a settled answer.
 	w.compressWG.Wait()
+	// The compressions just waited for recorded their block size in memory only (see
+	// SetBlockPages); the seal's own save ran before they finished. Nothing else can save
+	// now — the writer goroutine has exited — so this one cannot race another.
+	if err := w.manifest.Save(w.dir); err != nil {
+		log.Printf("storage: saving manifest on close: %v", err)
+	}
 }
 
 // ---- writer goroutine ----
@@ -1124,6 +1130,7 @@ func (w *Writer) sealCurrentSegment() error {
 		Schema:     schema,
 		Indexed:    !w.indexIncomplete,
 		Records:    w.segRecords,
+		Pages:      w.currSeg.PageNum - 1, // page 0 is the placeholder
 		CappedKeys: cappedKeys,
 	}
 	if w.opts.LabelKeys != nil {
@@ -1141,7 +1148,7 @@ func (w *Writer) sealCurrentSegment() error {
 		w.idxWriter.Close()
 		w.idxWriter = nil
 	}
-	segPath := w.currSeg.Path
+	segID, segPath := w.currSeg.ID, w.currSeg.Path
 	// The seal is committed: the segment is fsynced and the manifest says it is sealed. A
 	// close error cannot undo that, and returning it would tell rotateSegment to keep
 	// writing to a segment whose descriptor is already gone.
@@ -1161,11 +1168,29 @@ func (w *Writer) sealCurrentSegment() error {
 	w.compressWG.Add(1)
 	go func() {
 		defer w.compressWG.Done()
-		if _, err := CompressSegment(segPath, w.opts.BlockPages); err != nil && !os.IsNotExist(err) {
-			log.Printf("storage: compressing %s (left uncompressed): %v", segPath, err)
-		}
+		w.compress(segID, segPath)
 	}()
 	return nil
+}
+
+// compress compresses one sealed segment and records the block size it was compressed with
+// in the manifest, as the segment's own layout (see SegmentMeta.BlockPages). Safe off the
+// writer goroutine: it changes the manifest in memory only.
+func (w *Writer) compress(id, logPath string) {
+	done, err := CompressSegment(logPath, w.opts.BlockPages)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("storage: compressing %s (left uncompressed): %v", logPath, err)
+		}
+		return
+	}
+	if done {
+		bp := w.opts.BlockPages
+		if bp == 0 {
+			bp = DefaultBlockPages
+		}
+		w.manifest.SetBlockPages(id, bp)
+	}
 }
 
 // finishInterruptedCompressions completes, in the background, the compressions a previous
@@ -1225,9 +1250,12 @@ func (w *Writer) finishCompression(id, logPath string) {
 	// and the raw copy can go. If it does not open, readers would fail on it even though the
 	// raw pages are intact, so it is removed and rebuilt from them below.
 	if f, err := os.Open(zpath); err == nil {
-		_, verr := newCompressedSource(f) // validates header, dictionary and directory CRC
+		src, verr := newCompressedSource(f) // validates header, dictionary and directory CRC
 		f.Close()
 		if verr == nil {
+			// The compression finished, but the save that would have recorded its block size
+			// may not have: take it from the file, which is the authority on it anyway.
+			w.manifest.SetBlockPages(id, src.blockPages)
 			if err := os.Remove(logPath); err == nil {
 				_ = syncDir(dir)
 			}
@@ -1243,10 +1271,7 @@ func (w *Writer) finishCompression(id, logPath string) {
 	if w.opts.BlockPages < 0 {
 		return // compression disabled: a raw segment is the intended state
 	}
-	if _, err := CompressSegment(logPath, w.opts.BlockPages); err != nil && !os.IsNotExist(err) {
-		log.Printf("storage: compressing %s (left uncompressed): %v", logPath, err)
-		return
-	}
+	w.compress(id, logPath)
 	// Retention may have dropped the segment while it was being compressed; do not leave an
 	// orphaned sidecar behind.
 	if w.manifest.Get(id) == nil {
