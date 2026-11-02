@@ -143,7 +143,7 @@ index:
 
 | Topic | Decision |
 |---|---|
-| Types (v1) | `int`, `float`, `str`, `uuid`; extensible. Numeric → range ops; str/uuid → equality/presence only. |
+| Types (v1) | `int`, `float`, `str`, `uuid`; extensible. Numeric → range ops; str/uuid → equality/presence only. ⚙️ As implemented, every type takes `=`, `!=`, `<`, `<=`, `>`, `>=`. Numbers order by value; `str` orders byte-wise (lexicographic UTF-8) and `uuid` by its 16 raw bytes. A `str` key is a lossy 16-byte prefix (§6.3), so a range on it is pushed down with its strict bounds widened to inclusive — a value whose truncated key equals the bound's is kept — and every candidate is re-verified against the full value; `=` likewise returns every record sharing the prefix, re-verified. int, float and uuid keys are lossless and need neither. |
 | Literal case | Case-sensitive (matches Loki `|=`; byte-exact). |
 | Naming | Field names and template names unique across config. Queryable field = `<template>_<capture>` (`latency: took {ms:int}ms` → `latency_ms`). Duplicate template names, duplicate queryable fields and duplicate literals are config errors. |
 | Overlapping declarations | Error at config load when two templates have the same **normalized shape**: the same literal fragments byte for byte, with captures of the same types in the same places. Capture names do not count, so `took {a:int}ms` and `took {b:int}ms` overlap, while `took {a:int}ms` and `took {a:float}ms` do not. Subsumption — one pattern matching a subset of another's lines — is **not** detected (⏳ a possible refinement). Shared anchors between a literal and a template are legal — both index on match. |
@@ -158,9 +158,9 @@ index:
 
 Config changes apply **only to future ingestion**. Old segments are never reindexed or stripped.
 
-Mechanism: each segment's manifest entry records the schema it was built with (§5). **The planner consults the segment's own schema, never the live config**, to decide index-vs-scan per segment. Live config governs ingestion only.
+Mechanism: each segment's manifest entry records the schema it was built with (§5), including the pattern that defined each field. ⚙️ Revised at implementation (F-03): the planner consults **both the segment's schema and the live config**. A typed predicate is pushed into a segment's index only when the field is in that segment's schema *and* the live config defines the field with the same pattern the index was built from; every other segment is scanned for it, as is a segment that recorded no pattern. The original rule — the segment's schema only, never the live config — was unsound: the scan path extracts with the live config, so an index built from an edited or removed template answers for a different definition of the field than the scan does, and `Execute` would no longer equal `ExecuteScan`. Label predicates follow the same idea (F-02): a key is pushed only if it was in the allowlist the segment was written with.
 
-Consequences: a removed template still accelerates queries on old segments; new segments scan. A query spanning the change gets mixed performance — correct, documented behavior.
+Consequences: an edited or removed template no longer accelerates queries on the segments built with it — they are scanned, and the scan extracts with the live config (for a removed template, nothing); segments written after the change use their own index. A query spanning the change gets mixed performance — correct, documented behavior.
 
 ### 7.4 Ingestion flow ✅
 
@@ -175,7 +175,7 @@ Sort typed-range buffer → write `.tidx` + dictionaries + posting lists → fsy
 
 As implemented, two orderings make a failure at any step leave the old state: the next segment's `.log` and `.idx` are created (and the directory fsynced) *before* the current segment seals, so a failed create leaves the current one open and active; and the manifest is saved with the seal applied *before* the seal takes effect in memory, so a failed save never shows queries a sealed segment whose `.tidx` lacks the records appended after the attempt. The seal sorts a copy of the buffer, not the buffer, which queries may be reading (§9.2).
 
-Triggers ⚙️: the active segment seals at a page boundary when it reaches `segment_size_mb`, when its in-RAM index exceeds `index_mem_budget_mb`, or when its first record is older than `max_segment_age_minutes` (default 60; 0 = off). The age trigger is checked on every flush tick, so an idle segment seals too. Without it a low-volume shard kept one segment active for days — uncompressed, indexed only in memory, and immune to retention, which deletes sealed segments only. A recovered segment's age is its first surviving record's ingest time; an empty segment never seals for age.
+Triggers ⚙️: the active segment seals at a page boundary when it reaches `segment_size_mb`, when its in-RAM index exceeds `index_mem_budget_mb` (an absent key or 0 means no cap, the code's default; the shipped configs set 256), or when its first record is older than `max_segment_age_minutes` (default 60; 0 = off). The age trigger is checked on every flush tick, so an idle segment seals too. Without it a low-volume shard kept one segment active for days — uncompressed, indexed only in memory, and immune to retention, which deletes sealed segments only. A recovered segment's age is its first surviving record's ingest time; an empty segment never seals for age.
 
 ---
 
@@ -248,7 +248,7 @@ Execution per shard:
 - *Explain:* `/logd/api/v1/explain` reports per parser stage and filter whether it was mapped to a template (index) or runs as a dynamic predicate (scan), and why.
 
 **Operator/type mismatch:** two-level.
-- Core native API is **strict**: an operator unsupported by the field's declared type is a plan-time error. Core separately offers an explicit *dynamic predicate* (decode → attempt conversion → filter), a scan-time operation.
+- Core native API is **strict**: an operator unsupported by the field's declared type is a plan-time error. Core separately offers an explicit *dynamic predicate* (decode → attempt conversion → filter), a scan-time operation. (As implemented, every declared type accepts every comparison operator, §7.2, so what the plan-time check rejects is a predicate with no meaningful answer: a non-finite float bound, and a dynamic predicate with no extractor, a non-finite numeric bound, or a regex under an ordering operator.)
 - Compat layers choose their own mapping. Loki layer maps numeric filters on untyped/str fields to the dynamic predicate (reproduces Loki's convert-per-line behavior). Other layers may map strictly.
 
 ✅ Implemented. `query.DynamicCompare{Name, Extract, Op, Value, Numeric, Re}`: `Extract(entry, resolver) (string, bool)` is supplied by the caller; numeric comparisons convert both sides to float64 per record and fail on a missing or unconvertible value whatever the operator; string comparisons read a missing value as `""`; a regex matches or must not. The planner has no case for it, so it is always a residual — evaluated on scan, on re-verify and in tail, keeping `Execute == ExecuteScan`. `MetricQuery.SeriesLabels`/`UnwrapValue` let metric queries group by and unwrap such values. The Loki layer maps every label filter after a parser stage, on a name the stage may extract, to it. Deliberate difference from Loki: a numeric filter on a value that does not convert does not match, where Loki keeps the line flagged `__error__=LabelFilterErr` (and skips numeric filters on a line that already carries an error); the rows agree for a query with `| __error__=""` after its last numeric filter.
@@ -335,6 +335,8 @@ Deviations from this document that v1 already had, recorded where they were deci
 1. **str keys** are plain 16-byte truncation, not a rune-boundary prefix, which is non-monotonic (§6.3).
 2. **Overlap** means an identical normalized shape; subsumption is not detected (§7.2).
 3. **Queryable field names** are `<template>_<capture>` (§7.2).
+4. **Every type takes range operators**; `str` ranges are pushed down with inclusive-widened bounds and re-verified (§7.2).
+5. **The planner consults the live config too**: a typed predicate is pushed only where the live pattern equals the one the segment's index was built from (F-03), a label only where the segment's recorded allowlist has the key (F-02) (§7.3).
 
 Changes after v1, each explained in the section named:
 
