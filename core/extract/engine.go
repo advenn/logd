@@ -22,6 +22,8 @@ type Engine struct {
 	templates      []template
 	bareLiterals   []string
 	bareLitField   map[string]string // literal -> its existence field name
+	bareLitPat     []int             // bareLiterals[i]'s pattern index in the automaton
+	bareLitFields  []string          // bareLiterals[i]'s existence field name, for the hot path
 	ac             *ahoCorasick
 	patternStrings []string          // AC pattern index -> literal string
 	firstLitTmpls  map[string][]int  // first-literal string -> indices of templates starting with it
@@ -37,7 +39,13 @@ type Engine struct {
 	candidates map[string]*atomic.Int64
 	matches    map[string]*atomic.Int64
 	failures   map[string]*atomic.Int64
+	// counters holds the same three counters per template index, for the ingest path:
+	// the maps are keyed by name for Stats, and a name lookup per record per template cost
+	// ~10% of extraction with 20 templates.
+	counters []templateCounters
 }
+
+type templateCounters struct{ candidates, matches, failures *atomic.Int64 }
 
 // Compile validates the config and builds an Engine. It enforces the §7.2 rules:
 // unique template/field/literal names, a leading literal + a ≥3-byte anchor per
@@ -100,6 +108,7 @@ func Compile(cfg config.IndexConfig) (*Engine, error) {
 		e.candidates[tc.Name] = new(atomic.Int64)
 		e.matches[tc.Name] = new(atomic.Int64)
 		e.failures[tc.Name] = new(atomic.Int64)
+		e.counters = append(e.counters, templateCounters{e.candidates[tc.Name], e.matches[tc.Name], e.failures[tc.Name]})
 	}
 
 	seenLit := map[string]bool{}
@@ -123,10 +132,21 @@ func Compile(cfg config.IndexConfig) (*Engine, error) {
 	}
 
 	// Build the automaton over every distinct literal string.
+	patIdx := make(map[string]int, len(litSet))
 	for lit := range litSet {
+		patIdx[lit] = len(e.patternStrings)
 		e.patternStrings = append(e.patternStrings, lit)
 	}
 	e.ac = newAhoCorasick(e.patternStrings)
+	// Extraction matches a hit to its template by pattern index, so the per-line path needs
+	// no map keyed by literal strings (see extractValues).
+	for i := range e.templates {
+		e.templates[i].firstLitPat = patIdx[e.templates[i].firstLiteral]
+	}
+	for _, lit := range e.bareLiterals {
+		e.bareLitPat = append(e.bareLitPat, patIdx[lit])
+		e.bareLitFields = append(e.bareLitFields, e.bareLitField[lit])
+	}
 	return e, nil
 }
 
@@ -229,11 +249,6 @@ func (e *Engine) Literals() []string {
 	return out
 }
 
-type captureVal struct {
-	field string
-	value index.Value
-}
-
 // FieldValue is one extracted, typed value (before key encoding) and the queryable
 // field it belongs to. The scan/re-verify path (Phase 4/5) compares these EXACTLY;
 // the index path encodes them into keys. Sharing one extractor means the two paths
@@ -259,27 +274,27 @@ func (e *Engine) ExtractValues(message string) []FieldValue {
 // extractValues is the shared core. With a non-nil tally it also classifies each attempt
 // for the counters; that changes nothing about what is extracted.
 func (e *Engine) extractValues(message string, tally *Tally) []FieldValue {
-	hits := e.ac.search(message)
+	// A line holds a handful of literal occurrences, so a stack buffer covers almost every
+	// line without an allocation; append moves to the heap only for a line with more. The
+	// hits are matched to templates by pattern index below rather than grouped into a map
+	// keyed by literal: the map, built per line, cost more than the automaton did.
+	var buf [32]acHit
+	hits := e.ac.searchInto(buf[:0], message)
 	if len(hits) == 0 {
 		return nil
-	}
-	posByLit := make(map[string][]int, len(hits))
-	for _, h := range hits {
-		lit := e.patternStrings[h.pattern]
-		posByLit[lit] = append(posByLit[lit], h.start)
 	}
 
 	var out []FieldValue
 	for ti := range e.templates {
 		t := &e.templates[ti]
 		c := templateTally{tmpl: ti}
-		for _, start := range posByLit[t.firstLiteral] {
-			vals, ok := e.matchAt(message, start, t)
-			if ok {
-				for _, cv := range vals {
-					out = append(out, FieldValue{Field: cv.field, Value: cv.value})
-				}
+		for _, h := range hits { // in text order, as the per-literal lists used to be
+			if h.pattern != t.firstLitPat {
+				continue
 			}
+			start := h.start
+			var ok bool
+			out, ok = e.matchAt(out, message, start, t)
 			if tally == nil {
 				continue
 			}
@@ -300,9 +315,12 @@ func (e *Engine) extractValues(message string, tally *Tally) []FieldValue {
 			tally.add(c)
 		}
 	}
-	for _, lit := range e.bareLiterals {
-		if len(posByLit[lit]) > 0 {
-			out = append(out, FieldValue{Field: e.bareLitField[lit], Value: index.Value{Kind: index.KindStr}})
+	for i, pat := range e.bareLitPat {
+		for _, h := range hits {
+			if h.pattern == pat {
+				out = append(out, FieldValue{Field: e.bareLitFields[i], Value: index.Value{Kind: index.KindStr}})
+				break
+			}
 		}
 	}
 	return out
@@ -343,10 +361,18 @@ func (e *Engine) AddTally(t Tally) {
 }
 
 func (e *Engine) addTemplateTally(c templateTally) {
-	name := e.templates[c.tmpl].name
-	e.candidates[name].Add(c.candidates)
-	e.matches[name].Add(c.matches)
-	e.failures[name].Add(c.failures)
+	// Zero increments are skipped: an atomic add is a locked instruction on a cache line
+	// every ingest goroutine shares, and most records add nothing to failures.
+	tc := e.counters[c.tmpl]
+	if c.candidates != 0 {
+		tc.candidates.Add(c.candidates)
+	}
+	if c.matches != 0 {
+		tc.matches.Add(c.matches)
+	}
+	if c.failures != 0 {
+		tc.failures.Add(c.failures)
+	}
 }
 
 // Tally is one record's contribution to the per-template counters, as ExtractTally returns
@@ -386,17 +412,38 @@ func encodeKeys(vals []FieldValue) []index.KeyedValue {
 		return nil
 	}
 	out := make([]index.KeyedValue, 0, len(vals))
-	seen := map[dedupKey]struct{}{}
+	// A line yields a few values, so a linear check against what is already kept is cheaper
+	// than a map allocated per line. Past dedupLinearMax values the map takes over, so a line
+	// packed with occurrences stays linear in its length rather than quadratic.
+	var seen map[dedupKey]struct{}
+	if len(vals) > dedupLinearMax {
+		seen = make(map[dedupKey]struct{}, len(vals))
+	}
 	for _, fv := range vals {
 		key := index.EncodeKey(fv.Value)
-		dk := dedupKey{field: fv.Field, key: key}
-		if _, ok := seen[dk]; ok {
+		if seen != nil {
+			dk := dedupKey{field: fv.Field, key: key}
+			if _, ok := seen[dk]; ok {
+				continue
+			}
+			seen[dk] = struct{}{}
+		} else if keptAlready(out, fv.Field, key) {
 			continue
 		}
-		seen[dk] = struct{}{}
 		out = append(out, index.KeyedValue{Field: fv.Field, Key: key})
 	}
 	return out
+}
+
+const dedupLinearMax = 32
+
+func keptAlready(kept []index.KeyedValue, field string, key [index.KeySize]byte) bool {
+	for i := range kept {
+		if kept[i].Key == key && kept[i].Field == field {
+			return true
+		}
+	}
+	return false
 }
 
 type dedupKey struct {
@@ -406,13 +453,17 @@ type dedupKey struct {
 
 // matchAt attempts to match template t against message starting at start. How a miss is
 // counted is not decided here but by classifyMiss.
-func (e *Engine) matchAt(message string, start int, t *template) ([]captureVal, bool) {
+//
+// The captured values are appended to dst, which is returned. On a miss dst is returned at
+// its original length, so a partial match leaves nothing behind; appending in place saves
+// the per-attempt slice the values used to be collected in.
+func (e *Engine) matchAt(dst []FieldValue, message string, start int, t *template) ([]FieldValue, bool) {
+	kept := len(dst)
 	cursor := start
-	var vals []captureVal
 	for i, f := range t.fragments {
 		if !f.isCapture {
 			if !hasPrefixAt(message, cursor, f.literal) {
-				return nil, false
+				return dst[:kept], false
 			}
 			cursor += len(f.literal)
 			continue
@@ -423,12 +474,12 @@ func (e *Engine) matchAt(message string, start int, t *template) ([]captureVal, 
 		}
 		val, consumed, ok := parseCapture(message[cursor:], f.kind, nextLit)
 		if !ok {
-			return nil, false
+			return dst[:kept], false
 		}
 		cursor += consumed
-		vals = append(vals, captureVal{field: f.field, value: val})
+		dst = append(dst, FieldValue{Field: f.field, Value: val})
 	}
-	return vals, true
+	return dst, true
 }
 
 // classifyMiss decides how the counters see an attempt at start that matchAt did not match.

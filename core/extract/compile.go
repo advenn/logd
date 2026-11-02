@@ -39,6 +39,7 @@ type template struct {
 	pattern      string // the raw configured pattern, kept only so Stats can report it
 	fragments    []fragment
 	firstLiteral string
+	firstLitPat  int // firstLiteral's pattern index in the engine's automaton (set by Compile)
 	anchor       int
 }
 
