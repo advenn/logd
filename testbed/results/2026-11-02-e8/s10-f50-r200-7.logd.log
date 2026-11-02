@@ -1,0 +1,4 @@
+2026/11/02 01:00:56 logd: listening on :53761 (data /home/beck/.cache/logd-bench/e8.tIfoPP/s10-f50-r200-7/data, 1 shard(s))
+--- restart after kill -9 ---
+2026/11/02 01:00:58 logd: listening on :53761 (data /home/beck/.cache/logd-bench/e8.tIfoPP/s10-f50-r200-7/data, 1 shard(s))
+2026/11/02 01:00:58 logd: shutting down

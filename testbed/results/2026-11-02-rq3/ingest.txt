@@ -1,0 +1,87 @@
+goos: linux
+goarch: amd64
+pkg: github.com/advenn/logd/core/ingest
+cpu: 11th Gen Intel(R) Core(TM) i5-1145G7 @ 2.60GHz
+BenchmarkTemplateWrite/rate=80/templates=0-8         	  500000	      1763 ns/op	         0 keys/line	    567170 lines/s	         0 match%	     561 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=80/templates=1-8         	  500000	      2103 ns/op	         0.8003 keys/line	    475519 lines/s	        80.03 match%	     696 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=80/templates=5-8         	  500000	      5315 ns/op	         2.790 keys/line	    188145 lines/s	        80.03 match%	    1038 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=80/templates=20-8        	  500000	      7374 ns/op	         4.809 keys/line	    135620 lines/s	        80.03 match%	    1377 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=80/templates=5never-8    	  500000	      4972 ns/op	         0 keys/line	    201121 lines/s	         0 match%	     561 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=80/templates=20never-8   	  500000	      1945 ns/op	         0 keys/line	    514078 lines/s	         0 match%	     561 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=5/templates=0-8          	  500000	      1583 ns/op	         0 keys/line	    631662 lines/s	         0 match%	     545 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=5/templates=1-8          	  500000	      1678 ns/op	         0.05200 keys/line	    595869 lines/s	         5.200 match%	     556 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=5/templates=5-8          	  500000	      1804 ns/op	         0.1780 keys/line	    554297 lines/s	         5.200 match%	     588 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=5/templates=20-8         	  500000	      2909 ns/op	         0.3147 keys/line	    343776 lines/s	         5.200 match%	     624 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=5/templates=5never-8     	  500000	      2925 ns/op	         0 keys/line	    341835 lines/s	         0 match%	     545 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=5/templates=20never-8    	  500000	      2372 ns/op	         0 keys/line	    421576 lines/s	         0 match%	     545 B/op	       3 allocs/op
+BenchmarkTemplateIngest/rate=80/templates=0-8        	  500000	      2562 ns/op	         0 keys/line	    390246 lines/s	         0 match%	     657 B/op	       4 allocs/op
+BenchmarkTemplateIngest/rate=80/templates=1-8        	  500000	      5770 ns/op	         0.8003 keys/line	    173320 lines/s	        80.03 match%	    1005 B/op	       9 allocs/op
+BenchmarkTemplateIngest/rate=80/templates=5-8        	  500000	      7100 ns/op	         2.790 keys/line	    140851 lines/s	        80.03 match%	    3132 B/op	      23 allocs/op
+BenchmarkTemplateIngest/rate=80/templates=20-8       	  500000	     14178 ns/op	         4.809 keys/line	     70531 lines/s	        80.03 match%	    4469 B/op	      29 allocs/op
+BenchmarkTemplateIngest/rate=80/templates=5never-8   	  500000	      5435 ns/op	         0 keys/line	    183997 lines/s	         0 match%	     690 B/op	       6 allocs/op
+BenchmarkTemplateIngest/rate=80/templates=20never-8  	  500000	      7740 ns/op	         0 keys/line	    129193 lines/s	         0 match%	     960 B/op	      11 allocs/op
+BenchmarkTemplateIngest/rate=5/templates=0-8         	  500000	      2498 ns/op	         0 keys/line	    400360 lines/s	         0 match%	     641 B/op	       4 allocs/op
+BenchmarkTemplateIngest/rate=5/templates=1-8         	  500000	      3807 ns/op	         0.05200 keys/line	    262655 lines/s	         5.200 match%	     674 B/op	       5 allocs/op
+BenchmarkTemplateIngest/rate=5/templates=5-8         	  500000	      5086 ns/op	         0.1780 keys/line	    196627 lines/s	         5.200 match%	     997 B/op	       9 allocs/op
+BenchmarkTemplateIngest/rate=5/templates=20-8        	  500000	     12051 ns/op	         0.3147 keys/line	     82983 lines/s	         5.200 match%	    1101 B/op	      10 allocs/op
+BenchmarkTemplateIngest/rate=5/templates=5never-8    	  500000	      6966 ns/op	         0 keys/line	    143546 lines/s	         0 match%	     650 B/op	       4 allocs/op
+BenchmarkTemplateIngest/rate=5/templates=20never-8   	  500000	      9639 ns/op	         0 keys/line	    103742 lines/s	         0 match%	     845 B/op	       8 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/advenn/logd/core/ingest
+cpu: 11th Gen Intel(R) Core(TM) i5-1145G7 @ 2.60GHz
+BenchmarkTemplateWrite/rate=80/templates=0-8         	  500000	      2724 ns/op	         0 keys/line	    367132 lines/s	         0 match%	     561 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=80/templates=1-8         	  500000	      4798 ns/op	         0.8003 keys/line	    208406 lines/s	        80.03 match%	     696 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=80/templates=5-8         	  500000	      4608 ns/op	         2.790 keys/line	    217012 lines/s	        80.03 match%	    1038 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=80/templates=20-8        	  500000	      6522 ns/op	         4.809 keys/line	    153318 lines/s	        80.03 match%	    1378 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=80/templates=5never-8    	  500000	      1693 ns/op	         0 keys/line	    590543 lines/s	         0 match%	     561 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=80/templates=20never-8   	  500000	      1667 ns/op	         0 keys/line	    599805 lines/s	         0 match%	     561 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=5/templates=0-8          	  500000	      2358 ns/op	         0 keys/line	    424045 lines/s	         0 match%	     545 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=5/templates=1-8          	  500000	      2237 ns/op	         0.05200 keys/line	    446964 lines/s	         5.200 match%	     556 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=5/templates=5-8          	  500000	      2320 ns/op	         0.1780 keys/line	    431117 lines/s	         5.200 match%	     588 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=5/templates=20-8         	  500000	      1810 ns/op	         0.3147 keys/line	    552528 lines/s	         5.200 match%	     624 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=5/templates=5never-8     	  500000	      1351 ns/op	         0 keys/line	    739968 lines/s	         0 match%	     545 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=5/templates=20never-8    	  500000	      1382 ns/op	         0 keys/line	    723411 lines/s	         0 match%	     545 B/op	       3 allocs/op
+BenchmarkTemplateIngest/rate=80/templates=0-8        	  500000	      2166 ns/op	         0 keys/line	    461628 lines/s	         0 match%	     657 B/op	       4 allocs/op
+BenchmarkTemplateIngest/rate=80/templates=1-8        	  500000	      5799 ns/op	         0.8003 keys/line	    172454 lines/s	        80.03 match%	    1005 B/op	       9 allocs/op
+BenchmarkTemplateIngest/rate=80/templates=5-8        	  500000	      9081 ns/op	         2.790 keys/line	    110117 lines/s	        80.03 match%	    3132 B/op	      23 allocs/op
+BenchmarkTemplateIngest/rate=80/templates=20-8       	  500000	     12568 ns/op	         4.809 keys/line	     79569 lines/s	        80.03 match%	    4469 B/op	      29 allocs/op
+BenchmarkTemplateIngest/rate=80/templates=5never-8   	  500000	      4687 ns/op	         0 keys/line	    213337 lines/s	         0 match%	     690 B/op	       6 allocs/op
+BenchmarkTemplateIngest/rate=80/templates=20never-8  	  500000	      7594 ns/op	         0 keys/line	    131683 lines/s	         0 match%	     960 B/op	      11 allocs/op
+BenchmarkTemplateIngest/rate=5/templates=0-8         	  500000	      2249 ns/op	         0 keys/line	    444667 lines/s	         0 match%	     641 B/op	       4 allocs/op
+BenchmarkTemplateIngest/rate=5/templates=1-8         	  500000	      5350 ns/op	         0.05200 keys/line	    186905 lines/s	         5.200 match%	     674 B/op	       5 allocs/op
+BenchmarkTemplateIngest/rate=5/templates=5-8         	  500000	      6571 ns/op	         0.1780 keys/line	    152192 lines/s	         5.200 match%	     997 B/op	       9 allocs/op
+BenchmarkTemplateIngest/rate=5/templates=20-8        	  500000	      8171 ns/op	         0.3147 keys/line	    122381 lines/s	         5.200 match%	    1101 B/op	      10 allocs/op
+BenchmarkTemplateIngest/rate=5/templates=5never-8    	  500000	      7981 ns/op	         0 keys/line	    125298 lines/s	         0 match%	     651 B/op	       4 allocs/op
+BenchmarkTemplateIngest/rate=5/templates=20never-8   	  500000	     10126 ns/op	         0 keys/line	     98755 lines/s	         0 match%	     845 B/op	       8 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/advenn/logd/core/ingest
+cpu: 11th Gen Intel(R) Core(TM) i5-1145G7 @ 2.60GHz
+BenchmarkTemplateWrite/rate=80/templates=0-8         	  500000	      1225 ns/op	         0 keys/line	    816040 lines/s	         0 match%	     561 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=80/templates=1-8         	  500000	      1834 ns/op	         0.8003 keys/line	    545233 lines/s	        80.03 match%	     696 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=80/templates=5-8         	  500000	      4335 ns/op	         2.790 keys/line	    230672 lines/s	        80.03 match%	    1038 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=80/templates=20-8        	  500000	      4567 ns/op	         4.809 keys/line	    218978 lines/s	        80.03 match%	    1377 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=80/templates=5never-8    	  500000	      1174 ns/op	         0 keys/line	    851791 lines/s	         0 match%	     561 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=80/templates=20never-8   	  500000	      1132 ns/op	         0 keys/line	    883274 lines/s	         0 match%	     561 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=5/templates=0-8          	  500000	      1141 ns/op	         0 keys/line	    876242 lines/s	         0 match%	     545 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=5/templates=1-8          	  500000	      1211 ns/op	         0.05200 keys/line	    825776 lines/s	         5.200 match%	     556 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=5/templates=5-8          	  500000	      1264 ns/op	         0.1780 keys/line	    790916 lines/s	         5.200 match%	     588 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=5/templates=20-8         	  500000	      1486 ns/op	         0.3147 keys/line	    672836 lines/s	         5.200 match%	     624 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=5/templates=5never-8     	  500000	      1206 ns/op	         0 keys/line	    829174 lines/s	         0 match%	     545 B/op	       3 allocs/op
+BenchmarkTemplateWrite/rate=5/templates=20never-8    	  500000	      1418 ns/op	         0 keys/line	    705053 lines/s	         0 match%	     545 B/op	       3 allocs/op
+BenchmarkTemplateIngest/rate=80/templates=0-8        	  500000	      2133 ns/op	         0 keys/line	    468720 lines/s	         0 match%	     657 B/op	       4 allocs/op
+BenchmarkTemplateIngest/rate=80/templates=1-8        	  500000	      6113 ns/op	         0.8003 keys/line	    163591 lines/s	        80.03 match%	    1005 B/op	       9 allocs/op
+BenchmarkTemplateIngest/rate=80/templates=5-8        	  500000	      8591 ns/op	         2.790 keys/line	    116397 lines/s	        80.03 match%	    3132 B/op	      23 allocs/op
+BenchmarkTemplateIngest/rate=80/templates=20-8       	  500000	     16425 ns/op	         4.809 keys/line	     60882 lines/s	        80.03 match%	    4469 B/op	      29 allocs/op
+BenchmarkTemplateIngest/rate=80/templates=5never-8   	  500000	      6689 ns/op	         0 keys/line	    149505 lines/s	         0 match%	     690 B/op	       6 allocs/op
+BenchmarkTemplateIngest/rate=80/templates=20never-8  	  500000	      7456 ns/op	         0 keys/line	    134122 lines/s	         0 match%	     960 B/op	      11 allocs/op
+BenchmarkTemplateIngest/rate=5/templates=0-8         	  500000	      2374 ns/op	         0 keys/line	    421271 lines/s	         0 match%	     641 B/op	       4 allocs/op
+BenchmarkTemplateIngest/rate=5/templates=1-8         	  500000	      4289 ns/op	         0.05200 keys/line	    233135 lines/s	         5.200 match%	     674 B/op	       5 allocs/op
+BenchmarkTemplateIngest/rate=5/templates=5-8         	  500000	      8301 ns/op	         0.1780 keys/line	    120466 lines/s	         5.200 match%	     998 B/op	       9 allocs/op
+BenchmarkTemplateIngest/rate=5/templates=20-8        	  500000	      9929 ns/op	         0.3147 keys/line	    100719 lines/s	         5.200 match%	    1101 B/op	      10 allocs/op
+BenchmarkTemplateIngest/rate=5/templates=5never-8    	  500000	      4940 ns/op	         0 keys/line	    202427 lines/s	         0 match%	     651 B/op	       4 allocs/op
+BenchmarkTemplateIngest/rate=5/templates=20never-8   	  500000	      5977 ns/op	         0 keys/line	    167313 lines/s	         0 match%	     845 B/op	       8 allocs/op
+PASS

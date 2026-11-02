@@ -1,0 +1,1 @@
+crashpush: 417 batches, last acknowledged seq 41599, stopped: Post "http://127.0.0.1:38057/loki/api/v1/push": read tcp 127.0.0.1:55060->127.0.0.1:38057: read: connection reset by peer
