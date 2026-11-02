@@ -34,4 +34,10 @@ var (
 	// ErrWriterClosed is returned by the Write methods once Close has begun. The record
 	// was not stored.
 	ErrWriterClosed = errors.New("writer is closed")
+
+	// ErrSegmentUnreadable is returned when a segment's file exists but cannot be opened
+	// for reading at all: today, a compressed segment whose header or block directory
+	// fails its checks. None of its pages can be located, so its records are lost to
+	// every reader alike, the way a corrupt block's records are.
+	ErrSegmentUnreadable = errors.New("segment file unreadable")
 )

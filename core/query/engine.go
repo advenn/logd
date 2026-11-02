@@ -1,6 +1,8 @@
 package query
 
 import (
+	"errors"
+	"log"
 	"math"
 	"os"
 	"sort"
@@ -310,7 +312,7 @@ func (e *Engine) querySegment(acc collector, sh Shard, seg *storage.SegmentMeta,
 				}
 				return !acc.done()
 			})
-		return skipIfGone(err)
+		return skipUnreadable(seg.Path, err)
 	}
 
 	if forceScan {
@@ -336,7 +338,7 @@ func (e *Engine) querySegment(acc collector, sh Shard, seg *storage.SegmentMeta,
 		}
 		return !acc.done()
 	})
-	return skipIfGone(err)
+	return skipUnreadable(a.seg.Path, err)
 }
 
 // segmentAccess is the access path chosen for one segment of one query.
@@ -374,14 +376,40 @@ func (e *Engine) access(sh Shard, seg *storage.SegmentMeta, preds []Predicate, l
 	return segmentAccess{seg: meta, fetch: true, reason: reason, offsets: offsets, residuals: residuals}
 }
 
-// skipIfGone turns a "segment file no longer exists" error into a clean empty result:
-// retention may delete a segment between manifest.Filter and the query opening it, and
-// that data was intentionally expired — not a query failure.
-func skipIfGone(err error) error {
-	if err != nil && os.IsNotExist(err) {
+// skipUnreadable turns two per-segment failures into "this segment contributes nothing",
+// the same way on the index and the scan path:
+//
+//   - The segment's file no longer exists. Retention may delete a segment between
+//     manifest.Filter and the query opening it, and that data was intentionally expired,
+//     so this is not a query failure. Files removed behind logd's back look the same,
+//     which is why it is logged (once per segment) rather than passed over in silence.
+//   - The segment cannot be opened at all (storage.ErrSegmentUnreadable: a compressed
+//     segment whose block directory fails its checksum). Its records are lost to every
+//     reader, as a corrupt block's are. Failing instead would turn one bad byte into an
+//     error for every query over the segment's time range, and the two paths would
+//     disagree: an index lookup with no candidates in the segment never opens the file.
+func skipUnreadable(segPath string, err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case os.IsNotExist(err):
+		reportSkipped(segPath, "its files are gone (expired by retention during the query, or removed outside logd)")
+		return nil
+	case errors.Is(err, storage.ErrSegmentUnreadable):
+		reportSkipped(segPath, err.Error())
 		return nil
 	}
 	return err
+}
+
+// skippedSegments remembers which segments have been reported as skipped, so a dashboard
+// re-running its queries does not repeat the same log line every few seconds.
+var skippedSegments sync.Map
+
+func reportSkipped(segPath, why string) {
+	if _, seen := skippedSegments.LoadOrStore(segPath, struct{}{}); !seen {
+		log.Printf("query: skipping segment %s: %s", segPath, why)
+	}
 }
 
 // Tail delivers records written from now on that match all predicates (no time bound).

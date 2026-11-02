@@ -587,9 +587,7 @@ func fmFaults() []fmFault {
 		}},
 		{name: ".logz block directory corrupted", apply: func(t *testing.T, dir string, s fmSegments, _ *rand.Rand) {
 			corruptDirectory(t, storage.SegzPath(seg(dir, s.compressed[1])))
-		}, known: "the segment cannot be opened, so every query over it fails rather than skipping it; and when its " +
-			".tidx has no candidates there, Execute never opens it and answers while ExecuteScan fails " +
-			"(TestCorruptSegzDirectorySameOnBothPaths)"},
+		}},
 		{name: "sealed .log page corrupted", apply: func(t *testing.T, dir string, s fmSegments, _ *rand.Rand) {
 			flipAt(t, seg(dir, s.raw[1]), 2*storage.PageSize+200)
 		}},
@@ -977,7 +975,7 @@ func must(t *testing.T, err error) {
 // no candidates there, never opens the file (FetchRecords returns early on an empty offset
 // list) and answers without an error.
 func TestCorruptSegzDirectorySameOnBothPaths(t *testing.T) {
-	t.Skip("known: with a corrupt .logz block directory, Execute answers a query whose .tidx lookup has no candidates in that segment, while ExecuteScan fails with \"segz: directory checksum mismatch\"")
+	// X-1: an unopenable compressed segment is skipped on both paths, like a corrupt block.
 	dir := t.TempDir()
 	eng := compileOrFail(t, config.IndexConfig{Templates: []config.Template{{Name: "latency", Pattern: "took {ms:int}ms"}}})
 	w, err := storage.NewWriter(dir, storage.Options{Schema: eng.IndexedFields(), SegmentSizeBytes: 1 << 40, FlushInterval: time.Hour, BlockPages: 8})

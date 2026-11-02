@@ -310,11 +310,14 @@ func openPageSource(logPath string) (*pageSource, error) {
 }
 
 // openCompressed reads an opened .logz's header and directory, closing f if they are bad.
+// A bad header or directory is reported as ErrSegmentUnreadable: without them no page of
+// the segment can be located, so the query layer treats the whole segment the way it treats
+// a corrupt block, rather than as a failure of every query over its time range.
 func openCompressed(f *os.File) (*pageSource, error) {
 	s, err := newCompressedSource(f)
 	if err != nil {
 		f.Close()
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrSegmentUnreadable, err)
 	}
 	return s, nil
 }
