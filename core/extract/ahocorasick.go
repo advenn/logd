@@ -23,6 +23,19 @@ type acNode struct {
 type ahoCorasick struct {
 	nodes    []acNode
 	patterns []string
+
+	// The search runs on a dense transition table compiled from the trie and its fail links
+	// (a DFA): delta[state*numClasses+class[b]] is the state after reading byte b, with every
+	// fail-link walk already folded in. The trie keeps maps because they make building it
+	// easy to follow; the hot loop must not use them. Profiling the ingest path found ~70%
+	// of extraction time in map lookups — one per input byte, more along fail chains.
+	//
+	// Bytes that occur in no pattern all behave alike (every state sends them to the root's
+	// row for "no edge"), so they share class 0, and the table has one column per byte that
+	// does occur. That keeps it to a few KB for realistic configs instead of 1 KB per state.
+	class      [256]uint8
+	numClasses int
+	delta      []int32
 }
 
 // acHit is one occurrence of a pattern in the searched text: which pattern, and the
@@ -55,7 +68,79 @@ func newAhoCorasick(patterns []string) *ahoCorasick {
 	}
 
 	ac.buildFailLinks()
+	ac.compileDFA()
 	return ac
+}
+
+// compileDFA fills class and delta from the trie and its fail links. The goto function is
+// completed in breadth-first order: a missing edge from s on c leads wherever the same byte
+// leads from fail(s), whose row is already final because a fail target is always shallower.
+func (ac *ahoCorasick) compileDFA() {
+	// Class 0 is every byte that no pattern contains; each byte that some pattern contains
+	// gets its own class. If the patterns use all 256 byte values there is no byte left for
+	// class 0, so that (unrealistic) config falls back to one class per byte value.
+	var used [256]bool
+	for _, p := range ac.patterns {
+		for i := 0; i < len(p); i++ {
+			used[p[i]] = true
+		}
+	}
+	n := 1
+	for b := 0; b < 256; b++ {
+		if used[b] {
+			n++
+		}
+	}
+	identity := n > 256
+	if identity {
+		for b := 0; b < 256; b++ {
+			ac.class[b] = uint8(b)
+		}
+		n = 256
+	} else {
+		next := 1
+		for b := 0; b < 256; b++ {
+			if used[b] {
+				ac.class[b] = uint8(next)
+				next++
+			}
+		}
+	}
+	ac.numClasses = n
+
+	// Representative byte per class, to look up trie edges (class 0 has no edges anywhere).
+	rep := make([]int, n)
+	for i := range rep {
+		rep[i] = -1
+	}
+	for b := 255; b >= 0; b-- {
+		if used[b] || identity {
+			rep[ac.class[b]] = b
+		}
+	}
+
+	ac.delta = make([]int32, len(ac.nodes)*n)
+	const root = 0
+	order := make([]int, 0, len(ac.nodes))
+	order = append(order, root)
+	for i := 0; i < len(order); i++ { // breadth-first, so fail(s) precedes s
+		s := order[i]
+		row := ac.delta[s*n : (s+1)*n]
+		for c := 0; c < n; c++ {
+			if b := rep[c]; b >= 0 {
+				if child, ok := ac.nodes[s].children[byte(b)]; ok {
+					row[c] = int32(child)
+					order = append(order, child)
+					continue
+				}
+			}
+			if s == root {
+				row[c] = root
+			} else {
+				row[c] = ac.delta[ac.nodes[s].fail*n+c]
+			}
+		}
+	}
 }
 
 // buildFailLinks computes the fail link and flattened outputs for every node via a
@@ -95,24 +180,23 @@ func (ac *ahoCorasick) buildFailLinks() {
 
 // search returns every pattern occurrence in text (one acHit per occurrence).
 func (ac *ahoCorasick) search(text string) []acHit {
-	const root = 0
-	var hits []acHit
-	cur := root
+	return ac.searchInto(nil, text)
+}
+
+// searchInto appends every pattern occurrence in text to dst and returns it, so a caller can
+// reuse one slice across lines. One table lookup per byte: the fail-link walks of the
+// textbook formulation are already folded into delta (compileDFA).
+func (ac *ahoCorasick) searchInto(dst []acHit, text string) []acHit {
+	n := ac.numClasses
+	delta, class := ac.delta, &ac.class
+	cur := int32(0)
 	for i := 0; i < len(text); i++ {
-		b := text[i]
-		// Follow fail links until b extends the current state (or we're at root).
-		for cur != root {
-			if _, ok := ac.nodes[cur].children[b]; ok {
-				break
+		cur = delta[int(cur)*n+int(class[text[i]])]
+		if outs := ac.nodes[cur].outputs; len(outs) > 0 {
+			for _, pidx := range outs {
+				dst = append(dst, acHit{pattern: pidx, start: i - len(ac.patterns[pidx]) + 1})
 			}
-			cur = ac.nodes[cur].fail
-		}
-		if nxt, ok := ac.nodes[cur].children[b]; ok {
-			cur = nxt
-		}
-		for _, pidx := range ac.nodes[cur].outputs {
-			hits = append(hits, acHit{pattern: pidx, start: i - len(ac.patterns[pidx]) + 1})
 		}
 	}
-	return hits
+	return dst
 }
