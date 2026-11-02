@@ -196,7 +196,8 @@ if os.path.exists(p):
 p = os.path.join(R, "e8-powercut.txt")
 if os.path.exists(p):
     print("\n## E-8: power-cut approximation (in process)\n")
-    print("\n".join(l.strip().split(": ", 1)[-1] for l in open(p) if "|" in l))
+    # Strip go test's "file_test.go:NN: " prefix only; a plain split on ": " also cut table cells.
+    print("\n".join(re.sub(r"^\s*\S+_test\.go:\d+:\s*", "", l.rstrip()) for l in open(p) if "|" in l))
 p = os.path.join(R, "costguard-sweep.txt")
 if os.path.exists(p):
     print("\n## Cost-guard selectivity sweep\n\n```")

@@ -364,8 +364,8 @@ raw results in /home/beck/IdeaProjects/university/masters_thesis/logd/testbed/re
 
 ## E-8: power-cut approximation (in process)
 
-open page only (process crash) | lost: + unsynced pages (machine crash) | machine-crash loss, ms of data | since last fsync, ms |
-| ---: | ---: | ---: | ---: | ---: | ---: |
+| rate (lines/s) | sync_interval_ms | flush_interval_ms | lost: open page only (process crash) | lost: + unsynced pages (machine crash) | machine-crash loss, ms of data | since last fsync, ms |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 10000 | 50 | 500 | 33 (45) | 192 (489) | 19.1 (48.9) | 19.8 (49.8) |
 | 10000 | 10 | 50 | 16 (51) | 45 (105) | 4.5 (10.5) | 5.3 (10.8) |
 | 200 | 50 | 500 | 38 (49) | 38 (49) | 192.5 (245.0) | 190.4 (243.3) |

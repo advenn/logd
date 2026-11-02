@@ -126,6 +126,19 @@ HDFS = ["logd (typed index)", "Loki (2× | pattern)", "VictoriaLogs (extract_reg
 latency_figure(R, "samples-hdfs-sealed", "sweep-hdfs-sealed.txt", 2000000, HDFS, "fig-latency-hdfs",
                "Loghub HDFS, 2M lines, sealed")
 
+# The available tools alone, for the initial-benchmark chapter: no logd series. Loki gets both
+# syntaxes, since presenting only one would flatter or penalise it by choice of syntax.
+ENGINES["Loki (| regexp)"] = ("Loki | regexp", C[1], "<", "--")
+TOOLS_APP = ["Loki (| pattern)", "Loki (| regexp)", "VictoriaLogs (extract)",
+             "PostgreSQL (generated col + B-tree)", "PostgreSQL (extract in WHERE)"]
+latency_figure(R, "samples-app-sealed", "sweep-app-sealed.txt", 500000, TOOLS_APP, "fig-tools-app",
+               "Available tools, synthetic corpus, 500k lines")
+ENGINES["Loki (| regexp)"] = ("Loki | regexp", C[1], "<", "--")
+TOOLS_HDFS = ["Loki (2× | pattern)", "Loki (| regexp)", "VictoriaLogs (extract_regexp)",
+              "PostgreSQL (generated col + B-tree)", "PostgreSQL (extract in WHERE)"]
+latency_figure(R, "samples-hdfs-sealed", "sweep-hdfs-sealed.txt", 2000000, TOOLS_HDFS, "fig-tools-hdfs",
+               "Available tools, Loghub HDFS, 2M lines")
+
 # Live vs sealed, current logd and v1: what indexing the active segment changed.
 fig, ax = plt.subplots(figsize=(7.2, 4.2))
 for run_dir, layout, ls in (("samples-app-sealed", "sealed", "-"), ("samples-app-live", "last segment active", "--")):
@@ -223,10 +236,15 @@ if R1:
         for b, v in zip(bars, ys):
             ax.annotate(f"{v:.0f}", (b.get_x() + b.get_width() / 2, v), xytext=(0, 2), textcoords="offset points",
                         ha="center", fontsize=8, color=INK)
-    vl = [statistics.median(d2[(t, slug("VictoriaLogs (extract_regexp)"))]) for t in ts]
-    ax.plot(range(len(ts)), vl, color=C[2], marker="D", linewidth=2, label="VictoriaLogs, run 2 (reference)")
+    # VictoriaLogs did not change between the runs, so its own shift shows how much of logd's
+    # change is the session (load, cache) rather than the code. Both runs are drawn.
+    vl1 = [statistics.median(d1[(t, slug("VictoriaLogs (extract_regexp)"))]) for t in ts]
+    vl2 = [statistics.median(d2[(t, slug("VictoriaLogs (extract_regexp)"))]) for t in ts]
+    ax.plot(range(len(ts)), vl1, color=C[2], marker="D", linewidth=2, linestyle="--",
+            label="VictoriaLogs, run 1 (unchanged engine)")
+    ax.plot(range(len(ts)), vl2, color=C[2], marker="D", linewidth=2, label="VictoriaLogs, run 2 (unchanged engine)")
     ax.set_xticks(range(len(ts)), [f"< {t:,}\n{rw[t]:,} rows" for t in ts], fontsize=8)
     style(ax, "size_bytes threshold", "median latency (ms)")
-    ax.set_title("HDFS: covering stream selector and empty sidecars (08f8ed5, f63c51f)", color=INK, fontsize=10, loc="left")
+    ax.set_title("HDFS, run 1 vs run 2: the planner fix (08f8ed5, f63c51f) and the session shift", color=INK, fontsize=10, loc="left")
     ax.legend(frameon=False, fontsize=8)
     save(fig, "fig-hdfs-run1-run2")
