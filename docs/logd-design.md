@@ -192,7 +192,7 @@ Execution per shard:
 
 ### 9.1 Unindexed queries ✅ (defined behavior, not an error path)
 - Arbitrary substring (undeclared): full scan within time-pruned range. Supported always.
-- Range on an undeclared field: scan + extract at query time + filter. Supported, O(n).
+- Range on an undeclared field: scan + extract at query time + filter. Supported, O(n). ✅ Implemented as the dynamic predicate (`query.DynamicCompare`, §9.3); in LogQL, a parser stage (`| regexp`, `| pattern`, `| logfmt`, `| json`) followed by a filter on what it extracts.
 - **Fast ranges require a declared template.** Honest limit; document it.
 - Missing/corrupt/version-mismatched `.tidx`: silently degrade to scan for that segment.
 
@@ -201,11 +201,20 @@ The unsealed segment is always scanned (no `.tidx` yet; in-RAM buffer stays unso
 
 ### 9.3 Query decisions ⚙️ resolved
 
-**Matcher (LogQL pattern ≡ declared template):** strict structural equality. Normalize both sides to (literal fragments, capture names); match iff fragments are byte-identical, captures align positionally, names are equal. Types come from config (queries carry none). Any deviation — whitespace, extra fragment, renamed capture — is no match → scan. Rationale: a false match uses the wrong index (wrong answers); a false no-match only costs a scan. Upgrade path: explain output (index-hit vs scan per query) so users can see why a query scanned; not v1.
+**Matcher (LogQL pattern ≡ declared template):** strict structural equality. Normalize both sides to (literal fragments, capture names); match iff fragments are byte-identical, captures align positionally, names are equal. Types come from config (queries carry none). Any deviation — whitespace, extra fragment, renamed capture — is no match → scan. Rationale: a false match uses the wrong index (wrong answers); a false no-match only costs a scan. Upgrade path: explain output (index-hit vs scan per query) so users can see why a query scanned.
+
+✅ Implemented (`compat/loki/logql/structural.go`, which carries the full argument). Precisions made at implementation:
+- *Names:* a capture's name is compared with the template's queryable field name, `<template>_<capture>` — the name the native syntax and results use. `<_>took=<latency_ms>ms<_>` matches template `latency: took={ms:int}ms`.
+- *The ends:* the pattern must start with `<_>` (Loki anchors a pattern that starts with a literal at the start of the line; a template matches anywhere). A trailing `<_>` is dropped: Loki never anchors the end, so the pattern extracts the same labels with or without it. A template ending in a capture never matches (Loki's last capture runs to the end of the line). The literal after an int/float/uuid capture must not start with a byte the value may contain (`+`, `-`; hex for uuid).
+- *Scope:* the pattern must be the query's only parser stage, and every filter on the template's fields must be `=`, `<`, `<=`, `>`, `>=` with a number on an int/float field (a bound of the field's type) or `=` with a non-empty string on a str field. Anything else (`!=`, a regex, `= "200"` on a number) gives the match up for the whole query.
+- *Semantics:* on a *conforming* line — the template matches at the first occurrence of its first literal and nowhere later — Loki's capture equals the template's value and the comparisons agree (ints within ±2^53). Elsewhere they differ: several occurrences (Loki reads the first, the template any), a first value not of the type (`took=12.5ms` under int; Loki converts it, or keeps an unconvertible one flagged `__error__`), a missing or displaced literal, ints beyond 2^53. No rewrite closes that gap, so **a structural match uses the template's semantics** — the rows of the native form — and a test pins the differences. Result labels are still re-extracted with Loki's semantics.
+- *Explain:* `/logd/api/v1/explain` reports per parser stage and filter whether it was mapped to a template (index) or runs as a dynamic predicate (scan), and why.
 
 **Operator/type mismatch:** two-level.
 - Core native API is **strict**: an operator unsupported by the field's declared type is a plan-time error. Core separately offers an explicit *dynamic predicate* (decode → attempt conversion → filter), a scan-time operation.
 - Compat layers choose their own mapping. Loki layer maps numeric filters on untyped/str fields to the dynamic predicate (reproduces Loki's convert-per-line behavior). Other layers may map strictly.
+
+✅ Implemented. `query.DynamicCompare{Name, Extract, Op, Value, Numeric, Re}`: `Extract(entry, resolver) (string, bool)` is supplied by the caller; numeric comparisons convert both sides to float64 per record and fail on a missing or unconvertible value whatever the operator; string comparisons read a missing value as `""`; a regex matches or must not. The planner has no case for it, so it is always a residual — evaluated on scan, on re-verify and in tail, keeping `Execute == ExecuteScan`. `MetricQuery.SeriesLabels`/`UnwrapValue` let metric queries group by and unwrap such values. The Loki layer maps every label filter after a parser stage, on a name the stage may extract, to it. Deliberate difference from Loki: a numeric filter on a value that does not convert does not match, where Loki keeps the line flagged `__error__=LabelFilterErr` (and skips numeric filters on a line that already carries an error); the rows agree for a query with `| __error__=""` after its last numeric filter.
 Core stays protocol-agnostic (invariant 7); compat semantics live in compat.
 
 **Predicate ordering:** fixed pipeline, no cost-based planner in v1: time → label (union posting lists per label match, intersect across labels) → typed-range (intersect with prior set) → decode-time line filters + re-verify. LogQL pipelines are AND; OR exists only inside regex, evaluated at decode. Sorted offset lists make intersect/union linear merges. Order is correctness-independent (set intersection), so selectivity-aware reordering can be added later without breaking anything.
@@ -231,7 +240,7 @@ Core primitive: subscribe to matching records at write time. The writer, after a
 ## 12. Compat layer (not core) ✅
 
 - **Loki push** → native ingest. Timestamp arrives as nanosecond string; structured metadata (flat string→string) → `Extra`.
-- **LogQL** → native plan. `pattern "took <ms>ms" | ms > 200` maps to declared template `took {ms:int}ms` when the matcher can prove equivalence → index pushdown; else scan. Index invisible to Grafana.
+- **LogQL** → native plan. `| pattern "<_>took <latency_ms>ms<_>" | latency_ms > 200` maps to declared template `latency: took {ms:int}ms` when the matcher can prove equivalence → index pushdown; else scan (§9.3). Index invisible to Grafana. ✅ Implemented with the parser stages `pattern`, `regexp`, `logfmt`, `json` (plain forms); like Loki, results carry the extracted labels (re-extracted per returned line; a name the stream already has becomes `<name>_extracted`).
 - **Grafana endpoints:** `/loki/api/v1/labels`, `/label/<n>/values`, `/series` (from stream dictionary); `/query_range`, `/query`; `/tail` (WS); `/ready`; metric-query stub early (Grafana health check runs an instant metric query). Responses Prometheus-shaped. Tenancy header accepted.
 - OTLP, ES bulk: later. Severity strings normalize into `Level`.
 

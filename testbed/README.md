@@ -90,6 +90,10 @@ VictoriaLogs  _stream:{app="checkout"} "took=" | extract "took=<latency_ms>ms" |
 Loki's line filter `|= "took="` is deliberately included. Omitting it would sandbag Loki,
 and the first reader would say so.
 
+logd also accepts the Loki query as written: its `| pattern` equals the declared template
+`took={ms:int}ms`, so it is answered from the same index as logd's own form and returns the
+same rows (`/logd/api/v1/explain` shows the mapping; see the main README's LogQL section).
+
 ### Query latency — 500,000 lines, all three fed identically
 
 Medians of 7 runs, 3 warm-ups discarded. Every row verified to return the identical result
