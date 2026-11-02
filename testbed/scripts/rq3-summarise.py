@@ -57,7 +57,7 @@ def main():
         sys.exit(f"no benchmark lines found in {R}")
 
     with open(os.path.join(R, "samples.csv"), "w", newline="") as f:
-        w = csv.writer(f)
+        w = csv.writer(f, lineterminator="\n")
         w.writerow(["bench", "rate", "templates", "metric", "value"])
         for k in sorted(data, key=keyorder):
             for unit, vals in data[k].items():
