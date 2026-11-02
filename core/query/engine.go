@@ -167,6 +167,36 @@ func (e *Engine) Series() []map[string]string {
 	return out
 }
 
+// labelCapDropper is a Shard that counts what its label-value cap drops; *storage.Writer
+// is one. A shard that is not contributes no counts.
+type labelCapDropper interface {
+	LabelCapDrops() map[string]map[string]int64
+}
+
+// LabelCapDrops sums over the shards how many label pairs the per-segment value cap has
+// kept out of the label index (storage.Writer.LabelCapDrops): tenant ("" for records
+// without one) → label key → count.
+func (e *Engine) LabelCapDrops() map[string]map[string]int64 {
+	out := map[string]map[string]int64{}
+	for _, sh := range e.shards {
+		d, ok := sh.(labelCapDropper)
+		if !ok {
+			continue
+		}
+		for tenant, byKey := range d.LabelCapDrops() {
+			m := out[tenant]
+			if m == nil {
+				m = map[string]int64{}
+				out[tenant] = m
+			}
+			for k, n := range byKey {
+				m[k] += n
+			}
+		}
+	}
+	return out
+}
+
 // forEachLiveStream visits every shard's active-segment label streams.
 func (e *Engine) forEachLiveStream(fn func(label.Set)) {
 	for _, sh := range e.shards {

@@ -5,6 +5,7 @@ import (
 
 	"github.com/advenn/logd/compat/loki/logql"
 	"github.com/advenn/logd/core/index"
+	"github.com/advenn/logd/core/model"
 )
 
 // This file is logd's own introspection surface. It deliberately lives under /logd/api/v1/
@@ -29,6 +30,13 @@ type indexStatsResponse struct {
 	Literals  []string       `json:"literals"`
 	Schema    []schemaField  `json:"schema"`
 	Labels    []string       `json:"labels"`
+	// LabelCapDrops counts, per label key, the records whose value for the key the
+	// per-segment value cap (max_label_values_per_key, design §6.2) kept out of the label
+	// index since the daemon started: the value was new to its segment after the key had
+	// reached the cap. Those records are still stored and found, by scan; a count here says
+	// the key's index no longer covers them, and that the key holds more distinct values
+	// than a label should. Keys without drops are absent.
+	LabelCapDrops map[string]int64 `json:"label_cap_drops"`
 }
 
 // templateStat mirrors extract.TemplateStat plus the derived rates, so a caller reading
@@ -66,15 +74,18 @@ func kindName(k index.ValueKind) string {
 // index list: without it, choosing templates is guesswork.
 //
 // With multitenancy on, Labels lists only the requester's own label keys (never the
-// internal tenant label). The template counters stay daemon-wide: extraction runs once per
-// record for all tenants and keeps no per-tenant tally, and the templates themselves are
-// daemon configuration. They reveal aggregate match counts across tenants, not data.
+// internal tenant label), and LabelCapDrops counts only the requester's own records: the
+// writer keeps those counts per tenant, and a key name is as much the tenant's data as its
+// values. The template counters stay daemon-wide: extraction runs once per record for all
+// tenants and keeps no per-tenant tally, and the templates themselves are daemon
+// configuration. They reveal aggregate match counts across tenants, not data.
 func (s *Server) handleIndexStats(w http.ResponseWriter, r *http.Request) {
 	resp := indexStatsResponse{
-		Templates: []templateStat{},
-		Literals:  []string{},
-		Schema:    []schemaField{},
-		Labels:    s.labelKeys(r),
+		Templates:     []templateStat{},
+		Literals:      []string{},
+		Schema:        []schemaField{},
+		Labels:        s.labelKeys(r),
+		LabelCapDrops: s.labelCapDrops(r),
 	}
 	if s.ex != nil {
 		for _, st := range s.ex.Stats() {
@@ -103,6 +114,27 @@ func (s *Server) handleIndexStats(w http.ResponseWriter, r *http.Request) {
 		resp.Labels = []string{}
 	}
 	writeJSON(w, resp)
+}
+
+// labelCapDrops is the requester's view of the engine's cardinality-cap drop counts: its
+// own records' with multitenancy on, everyone's otherwise, and never the internal tenant
+// label's (which the cap can drop too, once there are more tenants than the cap).
+func (s *Server) labelCapDrops(r *http.Request) map[string]int64 {
+	out := map[string]int64{}
+	byTenant := s.qe.LabelCapDrops()
+	if t := s.tenant(r); t != "" {
+		for k, n := range byTenant[t] {
+			out[k] = n
+		}
+	} else {
+		for _, byKey := range byTenant {
+			for k, n := range byKey {
+				out[k] += n
+			}
+		}
+	}
+	delete(out, model.TenantLabel)
+	return out
 }
 
 type explainResponse struct {

@@ -51,3 +51,53 @@ func TestCardinalityDisabled(t *testing.T) {
 		t.Fatal("disabled cap should never mark a key capped")
 	}
 }
+
+// Drops counts each dropped pair, per key and per value of the scope key, across the
+// per-segment caps that feed it; a cap that is not given one counts nothing beyond itself.
+func TestCardinalityDropsCounted(t *testing.T) {
+	d := NewDrops("tenant")
+	set := func(tenant, region string) Set {
+		m := map[string]string{"region": region}
+		if tenant != "" {
+			m["tenant"] = tenant
+		}
+		return NewSet(m)
+	}
+	for seg := 0; seg < 2; seg++ { // two segments: the cap starts afresh, the count does not
+		c := NewCardinality(2)
+		c.CountDropsIn(d)
+		for _, s := range []Set{set("a", "r0"), set("a", "r1"), set("a", "r2"), set("b", "r3"), set("b", "r0"), set("", "r4")} {
+			c.Apply(s)
+		}
+	}
+	got := d.Snapshot()
+	// Per segment: r0 and r1 are kept; r2 (a), r3 (b) and r4 (no tenant) dropped; and the
+	// tenant key itself never passes two values. Twice over.
+	want := map[string]map[string]int64{"a": {"region": 2}, "b": {"region": 2}, "": {"region": 2}}
+	if len(got) != len(want) {
+		t.Fatalf("Snapshot = %v, want %v", got, want)
+	}
+	for scope, byKey := range want {
+		for k, n := range byKey {
+			if got[scope][k] != n || len(got[scope]) != len(byKey) {
+				t.Fatalf("Snapshot = %v, want %v", got, want)
+			}
+		}
+	}
+
+	// A cap with no Drops attached still caps, and counts nothing outside itself.
+	c := NewCardinality(1)
+	c.Apply(set("a", "r0"))
+	c.Apply(set("a", "r1"))
+	if b := c.Breaches(); b["region"] != 1 {
+		t.Fatalf("Breaches = %v", b)
+	}
+	if got := d.Snapshot(); got["a"]["region"] != 2 {
+		t.Fatalf("an unattached cap changed the count: %v", got)
+	}
+	// The snapshot is a copy.
+	got["a"]["region"] = 99
+	if d.Snapshot()["a"]["region"] != 2 {
+		t.Fatal("Snapshot shares its maps with the counter")
+	}
+}

@@ -16,6 +16,7 @@ type Cardinality struct {
 	max      int
 	values   map[string]map[string]struct{} // key → distinct values kept (bounded by max)
 	breaches map[string]int                 // per-key count of dropped (over-cap) pairs
+	drops    *Drops                         // also counts each dropped pair past this segment; nil = not counted
 	// capped is the one field a query reads, so it alone is locked. It changes only on a
 	// key's first breach, so the lock is off the per-record path.
 	mu     sync.Mutex
@@ -31,6 +32,10 @@ func NewCardinality(max int) *Cardinality {
 		breaches: map[string]int{},
 	}
 }
+
+// CountDropsIn makes the cap also count every pair it drops from now on in d, which
+// outlives the segment.
+func (c *Cardinality) CountDropsIn(d *Drops) { c.drops = d }
 
 // Apply returns the subset of set whose (key,value) pairs are within their key's value
 // cap, recording new values and marking/counting any pair that breaches. When nothing is
@@ -64,6 +69,9 @@ func (c *Cardinality) Apply(set Set) Set {
 			c.mu.Unlock()
 		}
 		c.breaches[p.Key]++
+		if c.drops != nil {
+			c.drops.add(set, p.Key)
+		}
 		dropped = true
 	}
 	if !dropped {
@@ -99,6 +107,54 @@ func (c *Cardinality) Breaches() map[string]int {
 	out := make(map[string]int, len(c.breaches))
 	for k, v := range c.breaches {
 		out[k] = v
+	}
+	return out
+}
+
+// Drops counts the label pairs a cardinality cap kept out of the index, per label key, for
+// as long as it lives: a Cardinality lasts one segment, a Drops the writer, so the count is
+// the "counter increments" of design §6.2 rather than a per-segment tally. Each count is
+// kept per value of a scope key in the record's label set — the tenant label, so that a
+// tenant can be shown the drops among its own records only. It is written only when a pair
+// is dropped, so it costs nothing while every key is under its cap; one goroutine writes it
+// and any may read it.
+type Drops struct {
+	scopeKey string
+	mu       sync.Mutex
+	n        map[dropKey]int64
+}
+
+type dropKey struct{ scope, key string }
+
+// NewDrops counts dropped pairs per label key and per value of scopeKey ("" for a record
+// without it).
+func NewDrops(scopeKey string) *Drops {
+	return &Drops{scopeKey: scopeKey, n: map[dropKey]int64{}}
+}
+
+// add counts one dropped pair of key, from a record whose (whole, uncapped) set is set.
+func (d *Drops) add(set Set, key string) {
+	scope, _ := set.Get(d.scopeKey)
+	d.mu.Lock()
+	d.n[dropKey{scope, key}]++
+	d.mu.Unlock()
+}
+
+// Snapshot returns the counts so far: scope value → label key → dropped pairs.
+func (d *Drops) Snapshot() map[string]map[string]int64 {
+	if d == nil {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make(map[string]map[string]int64)
+	for k, n := range d.n {
+		m := out[k.scope]
+		if m == nil {
+			m = make(map[string]int64)
+			out[k.scope] = m
+		}
+		m[k.key] = n
 	}
 	return out
 }

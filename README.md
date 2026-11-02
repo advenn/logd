@@ -267,10 +267,11 @@ and an answer to a question the client did not ask is worse than an error.
   scanned, never pushed into the label index, which does not hold the fallback values.
 - With `multitenancy: true`, `X-Scope-OrgID` (default `default`) tags every push and scopes
   every read: queries, tail, `labels`, `label/{name}/values`, `series`, the stream count of
-  `index/stats` and the label keys of `index_stats`. The internal `__tenant__` label is never
-  returned, whether or not multitenancy is on, so data stored while it was on does not
-  surface it later. The template counters and `index/stats`' chunk count stay daemon-wide:
-  they describe configuration and shared layout, not anyone's data.
+  `index/stats`, and the label keys and label-cap drop counts of `index_stats`. The
+  internal `__tenant__` label is never returned, whether or not multitenancy is on, so data
+  stored while it was on does not surface it later. The template counters and
+  `index/stats`' chunk count stay daemon-wide: they describe configuration and shared
+  layout, not anyone's data.
 
 **Health check.** logd has no `vector()`. Grafana's "Save & test" sends
 `vector(1)+vector(1)` and checks that the answer is 2, so exactly that expression

@@ -137,6 +137,9 @@ type Writer struct {
 	// Internally synchronized, safe to touch from other goroutines:
 	manifest  *Manifest
 	serviceLT *LookupTable
+	// labelDrops counts, across segments, the label pairs the value cap kept out of the
+	// index, per tenant and key (LabelCapDrops). Every segment's card adds to it.
+	labelDrops *label.Drops
 
 	// servicesPersisted is the LookupTable size at the last durable lookup.bin
 	// write; when the table grows past it, flushPage re-persists (writer-goroutine
@@ -203,8 +206,9 @@ func NewWriter(dir string, opts Options) (*Writer, error) {
 		schema:      opts.Schema,
 		subs:        newTailRegistry(),
 		liveStreams: make(map[string]label.Set),
-		card:        label.NewCardinality(opts.MaxLabelCardinality),
+		labelDrops:  label.NewDrops(model.TenantLabel),
 	}
+	w.card = w.newCardinality()
 
 	w.lockFile = lockFile
 
@@ -326,6 +330,9 @@ func (w *Writer) reindexRecoveredSegment(meta *SegmentMeta) error {
 	}
 	w.buffer = index.NewBuffer(w.schema)
 	w.labelBuf = label.NewBuilder()
+	// The cap drops what it dropped before the crash, but those pairs were counted when they
+	// were first written (as ReExtract does not count extraction again); only records
+	// written from now on are counted, below.
 	w.card = label.NewCardinality(w.opts.MaxLabelCardinality)
 	for _, rec := range recs {
 		keys, labels := w.opts.Reindex(rec.Entry)
@@ -345,8 +352,16 @@ func (w *Writer) reindexRecoveredSegment(meta *SegmentMeta) error {
 		}
 		w.segRecords++
 	}
+	w.card.CountDropsIn(w.labelDrops)
 	w.indexIncomplete = false
 	return nil
+}
+
+// newCardinality is a fresh per-segment value cap whose drops also count in w.labelDrops.
+func (w *Writer) newCardinality() *label.Cardinality {
+	c := label.NewCardinality(w.opts.MaxLabelCardinality)
+	c.CountDropsIn(w.labelDrops)
+	return c
 }
 
 // Start creates an initial active segment if recovery didn't provide one, then
@@ -801,6 +816,14 @@ func (w *Writer) Manifest() *Manifest { return w.manifest }
 // resolving ServiceID → name during query-time label matching.
 func (w *Writer) ServiceLookup() *LookupTable { return w.serviceLT }
 
+// LabelCapDrops returns how many label pairs the per-segment value cap
+// (Options.MaxLabelCardinality, design §6.2) has kept out of the label index since the writer
+// started, by the record's tenant (its model.TenantLabel value, "" without one) and then
+// label key. Each is a record whose value for the key was new to its segment after the key
+// had reached the cap: stored, and found by scan, but not by the index. Rebuilding a
+// recovered segment's index does not count its records again.
+func (w *Writer) LabelCapDrops() map[string]map[string]int64 { return w.labelDrops.Snapshot() }
+
 // LiveStreams returns a snapshot of the ACTIVE segment's label streams, so label
 // discovery sees them immediately (before the segment seals into its .lidx).
 func (w *Writer) LiveStreams() []label.Set {
@@ -1134,7 +1157,7 @@ func (w *Writer) rotateSegment() error {
 	// A brand-new segment indexes completely from its first record.
 	w.buffer = index.NewBuffer(w.schema)
 	w.labelBuf = label.NewBuilder()
-	w.card = label.NewCardinality(w.opts.MaxLabelCardinality)
+	w.card = w.newCardinality()
 	w.indexIncomplete = false
 	w.segRecords = 0
 	w.segFirstWrite = time.Time{}
