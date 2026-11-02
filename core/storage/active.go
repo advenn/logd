@@ -86,6 +86,19 @@ func (v *ActiveIndex) LabelOffsets(key, value string) []uint64 {
 	return label.MergePostings(lists, v.below)
 }
 
+// LabelCovers reports whether every label stream of the segment carries key=value. It reads
+// the streams interned so far, which can include some whose records are beyond the view;
+// that only makes the answer more conservative (a later stream without the pair makes it
+// false), never wrong for the viewed records.
+func (v *ActiveIndex) LabelCovers(key, value string) bool {
+	if v.src.labels == nil {
+		return false
+	}
+	v.src.mu.Lock()
+	defer v.src.mu.Unlock()
+	return v.src.labels.Covers(key, value)
+}
+
 // HasLabelKey reports whether any of the segment's label streams carries key.
 func (v *ActiveIndex) HasLabelKey(key string) bool {
 	if v.src.labels == nil {

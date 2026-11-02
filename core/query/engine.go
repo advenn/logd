@@ -393,12 +393,14 @@ func (e *Engine) access(sh Shard, seg *storage.SegmentMeta, preds []Predicate, l
 		}
 		return segmentAccess{seg: meta, reason: ReasonNoPushdown}
 	}
-	offsets, tripped, ok := intersectLookups(lookups, e.costGuard(meta, limit))
+	offsets, tripped, unrestricted, ok := intersectLookups(lookups, e.costGuard(meta, limit))
 	switch {
 	case !ok:
 		return segmentAccess{seg: meta, reason: ReasonIndexMissing} // degrade to scan
 	case tripped:
 		return segmentAccess{seg: meta, reason: ReasonCostGuard}
+	case unrestricted:
+		return segmentAccess{seg: meta, reason: ReasonLabelCovers}
 	}
 	reason := ReasonIndexed
 	if inMemory {

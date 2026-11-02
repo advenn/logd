@@ -111,20 +111,81 @@ func (b *Builder) HasKey(key string) bool {
 // MergePostings returns the offsets below `below` from the lists Postings returned,
 // ascending: for the active segment, what Reader.LabelOffsets returns for a sealed one.
 func MergePostings(lists [][]uint64, below uint64) []uint64 {
-	var out []uint64
+	return mergeSorted(lists, below)
+}
+
+// mergeSorted merges ascending, pairwise-disjoint offset lists (a record is in exactly one
+// stream) into one ascending list of the offsets below `below`.
+//
+// It used to concatenate and sort. With a stream selector that matches most of a segment —
+// `{app="hdfs"}` on the HDFS replay, four streams of ~80k records each — that sort was more
+// than half of the query's CPU time, on every query. The lists are sorted already, so a
+// k-way merge does the same in one pass, and a single list (the common case of one stream)
+// is returned without a copy. Callers must treat the result as read-only.
+func mergeSorted(lists [][]uint64, below uint64) []uint64 {
+	cut := func(l []uint64) []uint64 { // the prefix below `below`; l is ascending
+		return l[:sort.Search(len(l), func(i int) bool { return l[i] >= below })]
+	}
+	switch len(lists) {
+	case 0:
+		return nil
+	case 1:
+		return cut(lists[0])
+	}
+	heads := make([][]uint64, 0, len(lists))
+	n := 0
 	for _, l := range lists {
-		for _, o := range l {
-			if o < below {
-				out = append(out, o)
-			}
+		if l = cut(l); len(l) > 0 {
+			heads = append(heads, l)
+			n += len(l)
 		}
 	}
-	// Each list is ascending already (offsets are appended in write order); only several
-	// of them need merging. A record is in exactly one stream, so there are no duplicates.
-	if len(lists) > 1 {
-		sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	out := make([]uint64, 0, n)
+	// A min-heap on each remaining list's first offset.
+	less := func(i, j int) bool { return heads[i][0] < heads[j][0] }
+	down := func(i int) {
+		for {
+			m, l, r := i, 2*i+1, 2*i+2
+			if l < len(heads) && less(l, m) {
+				m = l
+			}
+			if r < len(heads) && less(r, m) {
+				m = r
+			}
+			if m == i {
+				return
+			}
+			heads[i], heads[m] = heads[m], heads[i]
+			i = m
+		}
+	}
+	for i := len(heads)/2 - 1; i >= 0; i-- {
+		down(i)
+	}
+	for len(heads) > 0 {
+		out = append(out, heads[0][0])
+		if heads[0] = heads[0][1:]; len(heads[0]) == 0 {
+			heads[0] = heads[len(heads)-1]
+			heads = heads[:len(heads)-1]
+		}
+		down(0)
 	}
 	return out
+}
+
+// Covers reports whether every stream interned so far carries key=value, and there is at
+// least one: then every record of the segment satisfies the label predicate, and a lookup
+// would only return all of them. The caller must hold the lock (see Builder).
+func (b *Builder) Covers(key, value string) bool {
+	if len(b.streams) == 0 {
+		return false
+	}
+	for _, s := range b.streams {
+		if v, ok := s.set.Get(key); !ok || v != value {
+			return false
+		}
+	}
+	return true
 }
 
 // Flush writes the segment's label index to path atomically. It returns wrote=false

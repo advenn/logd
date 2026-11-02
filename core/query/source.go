@@ -24,6 +24,9 @@ type segmentIndex interface {
 type labelLookup interface {
 	LabelOffsets(key, value string) []uint64
 	HasKey(key string) bool
+	// Covers reports whether every stream of the segment carries key=value, so the label
+	// predicate holds for every record and restricts nothing.
+	Covers(key, value string) bool
 }
 
 // sidecars reads a sealed segment's .tidx and .lidx files through the reader cache.
@@ -63,6 +66,7 @@ type activeLabels struct{ v *storage.ActiveIndex }
 
 func (a activeLabels) LabelOffsets(key, value string) []uint64 { return a.v.LabelOffsets(key, value) }
 func (a activeLabels) HasKey(key string) bool                  { return a.v.HasLabelKey(key) }
+func (a activeLabels) Covers(key, value string) bool           { return a.v.LabelCovers(key, value) }
 
 // indexFor returns the segment as the planner should see it, how to read its indexes, and
 // whether that is the active segment's in-memory index.

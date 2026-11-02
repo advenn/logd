@@ -137,15 +137,31 @@ func readString(data []byte, pos int) (string, int, error) {
 // LabelOffsets returns the union of record offsets across every stream whose label set
 // contains key=value, sorted ascending. This is the candidate set a label-equality
 // pushdown fetches and re-verifies.
+//
+// The result may share memory with the reader, which a cache hands to concurrent queries:
+// callers must not modify it.
 func (r *Reader) LabelOffsets(key, value string) []uint64 {
-	var acc []uint64
+	var lists [][]uint64
 	for i := range r.streams {
 		if v, ok := r.streams[i].set.Get(key); ok && v == value {
-			acc = append(acc, r.streams[i].offsets...)
+			lists = append(lists, r.streams[i].offsets)
 		}
 	}
-	sort.Slice(acc, func(i, j int) bool { return acc[i] < acc[j] })
-	return acc
+	return mergeSorted(lists, ^uint64(0))
+}
+
+// Covers reports whether every stream of the segment carries key=value (and it has one):
+// then the label predicate holds for every record, and the planner need not look it up.
+func (r *Reader) Covers(key, value string) bool {
+	if len(r.streams) == 0 {
+		return false
+	}
+	for i := range r.streams {
+		if v, ok := r.streams[i].set.Get(key); !ok || v != value {
+			return false
+		}
+	}
+	return true
 }
 
 // Keys returns all distinct label keys present, sorted.

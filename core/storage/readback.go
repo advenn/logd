@@ -29,7 +29,13 @@ func FetchRecords(path string, offsets []uint64, visit func(model.LogEntry) bool
 	page := make([]byte, PageSize)
 	curPage := ^uint64(0) // sentinel: no page loaded
 	pageOK := false
-	for _, off := range sorted {
+	for i, off := range sorted {
+		// An offset can arrive more than once: a typed lookup returns a record once per
+		// indexed occurrence, so "took 33ms took 20ms" is there twice for latency_ms > 10.
+		// Each record is materialized once, whatever the caller did or did not de-duplicate.
+		if i > 0 && off == sorted[i-1] {
+			continue
+		}
 		pageNum := off / PageSize
 		if pageNum != curPage {
 			curPage = pageNum

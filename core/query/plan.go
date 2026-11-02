@@ -26,6 +26,11 @@ var (
 // degrades the whole segment to a scan (design §9.1).
 type plannedLookup struct {
 	run func() (offsets []uint64, ok bool)
+	// covers, when set, reports that run would return every record of the segment (a label
+	// predicate that every stream satisfies). Such a lookup restricts nothing, so it is not
+	// run and takes no part in the intersection; the predicate is still re-verified as a
+	// residual.
+	covers func() bool
 }
 
 // plan decides which predicates can be pushed into this segment's indexes, read through
@@ -120,13 +125,24 @@ func (e *Engine) plan(seg *storage.SegmentMeta, src segmentIndex, preds []Predic
 				continue
 			}
 			key, value := pred.Key, pred.Value
-			lookups = append(lookups, plannedLookup{run: func() ([]uint64, bool) {
-				l, ok := src.labels()
-				if !ok {
-					return nil, false
-				}
-				return l.LabelOffsets(key, value), true
-			}})
+			lookups = append(lookups, plannedLookup{
+				run: func() ([]uint64, bool) {
+					l, ok := src.labels()
+					if !ok {
+						return nil, false
+					}
+					return l.LabelOffsets(key, value), true
+				},
+				// The stream selector of most queries (`{app="checkout"}`) matches every stream
+				// of the segments it reaches. Looked up, it returned every offset of the
+				// segment, merged from the streams' posting lists, only for the intersection to
+				// keep what the typed lookup had already found: on the HDFS replay that made a
+				// 181-row query take 232 ms instead of 68.
+				covers: func() bool {
+					l, ok := src.labels()
+					return ok && l.Covers(key, value)
+				},
+			})
 		default:
 			keepResidual(p) // no pushdown case for this type: always re-verified
 		}
@@ -223,18 +239,27 @@ func (e *Engine) labelAllowed(key string) bool {
 // Returns ok=false if any lookup's index can't be opened, so the caller degrades to a full
 // scan rather than a partial set. Returns guardTripped=true when the cost guard sends the
 // segment to the scan instead (see costguard.go).
-func intersectLookups(lookups []plannedLookup, g costGuard) (offsets []uint64, guardTripped, ok bool) {
+//
+// unrestricted reports that every lookup covered the whole segment, so there is no candidate
+// set to fetch: the caller scans, which reads the same records without the offsets.
+func intersectLookups(lookups []plannedLookup, g costGuard) (offsets []uint64, guardTripped, unrestricted, ok bool) {
 	sets := make([][]uint64, 0, len(lookups))
 	for _, l := range lookups {
+		if l.covers != nil && l.covers() {
+			continue
+		}
 		offs, lookupOK := l.run()
 		if !lookupOK {
-			return nil, false, false
+			return nil, false, false, false
 		}
 		// A lookup that matched nothing empties the intersection: the rest need not run.
 		if len(offs) == 0 {
-			return nil, false, true
+			return nil, false, false, true
 		}
 		sets = append(sets, offs)
+	}
+	if len(sets) == 0 {
+		return nil, false, true, true
 	}
 	// With a single lookup its result IS the candidate set, so the guard is decided before
 	// paying for the dedup map, which on a set the guard rejects is pure waste. With several
@@ -242,8 +267,14 @@ func intersectLookups(lookups []plannedLookup, g costGuard) (offsets []uint64, g
 	// says nothing about the final candidate count — TestExplainReportsAccessPath, where
 	// `{region="eu"} | latency_ms > 200` intersects 3 typed hits down to 2, caught a guard
 	// that bailed on the first set.
-	if len(sets) == 1 && g.trips(sets[0]) {
-		return nil, true, true
+	if len(sets) == 1 {
+		// One restricting lookup: its result is the candidate set as it is. Building and
+		// draining a dedup map for it cost more than the lookup, now that a covering stream
+		// selector no longer adds a second set to most queries.
+		if g.trips(sets[0]) {
+			return nil, true, false, true
+		}
+		return sets[0], false, false, true
 	}
 	// Smallest set first: the map is built from it and every larger set only probes it. In
 	// predicate order, `{app="checkout"} | latency_ms > 1000` built a map of every record in
@@ -273,16 +304,17 @@ func intersectLookups(lookups []plannedLookup, g costGuard) (offsets []uint64, g
 	for o := range result {
 		out = append(out, o)
 	}
-	if len(sets) > 1 && g.trips(out) {
-		return nil, true, true
+	if g.trips(out) {
+		return nil, true, false, true
 	}
-	return out, false, true
+	return out, false, false, true
 }
 
 // SegmentPlanReason explains why a segment took the path it did.
 const (
 	ReasonNotIndexed      = "not_indexed"       // no complete index: a crash-recovered segment never re-indexed
 	ReasonNoPushdown      = "no_pushdown"       // no predicate could be pushed here
+	ReasonLabelCovers     = "label_covers"      // the only pushable predicates are label selectors every record here satisfies
 	ReasonIndexMissing    = "index_missing"     // a sidecar was absent or corrupt
 	ReasonCostGuard       = "cost_guard"        // candidates over-fetch the limit and cover the segment; a scan is cheaper
 	ReasonIndexed         = "indexed"           // pushdown used, into the sealed segment's sidecars
