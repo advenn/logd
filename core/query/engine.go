@@ -142,8 +142,9 @@ func (e *Engine) LabelValues(key string) []string {
 	return sortedStrings(seen)
 }
 
-// Series returns the distinct label streams (as maps) across sealed segments, for the
-// Loki /series endpoint. Deduplicated across segments.
+// Series returns the distinct label streams (as maps) across the active and sealed segments
+// of all shards, for the Loki /series endpoint: the active segments' live streams, then
+// every sealed segment's .lidx (in that order, see Labels). Deduplicated across segments.
 func (e *Engine) Series() []map[string]string {
 	seen := map[string]struct{}{}
 	var out []map[string]string
