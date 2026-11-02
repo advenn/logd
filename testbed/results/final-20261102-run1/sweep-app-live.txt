@@ -1,0 +1,119 @@
+layout: live   dataset: app   samples per cell: 60 (interleaved), 5 warm-ups
+load at start: 4.14 2.79 2.90 2/1973 2814278
+explain http://localhost:7100:
+  summary: {'segments_total': 2, 'segments_indexed': 2, 'segments_scanned': 0, 'candidates': 469}
+  01M6D1E6WTSE53G18RR7JQQMVC sealed index indexed candidates=355
+  01M6D1F1YG2V4ZK2FM85DX80K1 active index indexed_in_memory candidates=114
+explain http://localhost:7101:
+  summary: {'segments_total': 2, 'segments_indexed': 1, 'segments_scanned': 1, 'candidates': 355}
+  01M6D1E75SBT98QYPGD4NDVN7T ? index indexed candidates=355
+  01M6D1F287PSK3EFR0D6B0WEEZ ? scan not_indexed candidates=0
+=========== threshold 200
+Result sets (must all be identical, and non-empty):
+  logd (typed index)        27089 rows  sha256 9da28698f04bb7b3
+  logd (forced scan)        27089 rows  sha256 9da28698f04bb7b3
+  logd v1 (typed index)     27089 rows  sha256 9da28698f04bb7b3
+  logd (Loki | pattern text)    27089 rows  sha256 9da28698f04bb7b3
+  logd (Loki | regexp text)    27089 rows  sha256 9da28698f04bb7b3
+  Loki (| pattern)          27089 rows  sha256 9da28698f04bb7b3
+  Loki (| regexp)           27089 rows  sha256 9da28698f04bb7b3
+  VictoriaLogs (extract)    27089 rows  sha256 9da28698f04bb7b3
+  PostgreSQL (generated col + B-tree)    27089 rows  sha256 9da28698f04bb7b3
+  PostgreSQL (extract in WHERE)    27089 rows  sha256 9da28698f04bb7b3
+
+Collecting 60 interleaved samples per engine...
+
+engine                     median      p95      p99      min      max      n
+------------------------ -------- -------- -------- -------- -------- ------
+logd (typed index)          308.1    479.1    646.3    252.5    646.3     60
+logd (forced scan)          702.2    969.4   1009.3    580.3   1009.3     60
+logd v1 (typed index)       740.1   1079.6   1569.6    610.4   1569.6     60
+logd (Loki | pattern text)    341.7    446.4    533.6    277.3    533.6     60
+logd (Loki | regexp text)    790.2   1221.3   1378.4    647.6   1378.4     60
+Loki (| pattern)            538.1    811.2   1067.9    449.1   1067.9     60
+Loki (| regexp)             637.1    805.1   1157.4    516.0   1157.4     60
+VictoriaLogs (extract)      144.4    165.4    349.6    110.9    349.6     60
+PostgreSQL (generated col + B-tree)     52.5     73.1    145.4     42.8    145.4     60
+PostgreSQL (extract in WHERE)   1608.9   2216.3   2392.2   1332.0   2392.2     60
+=========== threshold 1000
+Result sets (must all be identical, and non-empty):
+  logd (typed index)         3861 rows  sha256 4712a1a808ff81bf
+  logd (forced scan)         3861 rows  sha256 4712a1a808ff81bf
+  logd v1 (typed index)      3861 rows  sha256 4712a1a808ff81bf
+  logd (Loki | pattern text)     3861 rows  sha256 4712a1a808ff81bf
+  logd (Loki | regexp text)     3861 rows  sha256 4712a1a808ff81bf
+  Loki (| pattern)           3861 rows  sha256 4712a1a808ff81bf
+  Loki (| regexp)            3861 rows  sha256 4712a1a808ff81bf
+  VictoriaLogs (extract)     3861 rows  sha256 4712a1a808ff81bf
+  PostgreSQL (generated col + B-tree)     3861 rows  sha256 4712a1a808ff81bf
+  PostgreSQL (extract in WHERE)     3861 rows  sha256 4712a1a808ff81bf
+
+Collecting 60 interleaved samples per engine...
+
+engine                     median      p95      p99      min      max      n
+------------------------ -------- -------- -------- -------- -------- ------
+logd (typed index)          169.5    254.9    298.8    146.6    298.8     60
+logd (forced scan)          602.7    774.6   1104.5    521.0   1104.5     60
+logd v1 (typed index)       603.4    814.4    934.6    542.4    934.6     60
+logd (Loki | pattern text)    176.0    235.7    282.2    155.9    282.2     60
+logd (Loki | regexp text)    661.3   1002.3   1077.9    576.7   1077.9     60
+Loki (| pattern)            364.9    525.4    605.6    311.0    605.6     60
+Loki (| regexp)             463.2    645.5    772.8    401.0    772.8     60
+VictoriaLogs (extract)       96.2    162.9    209.9     71.8    209.9     60
+PostgreSQL (generated col + B-tree)     16.2     32.5     64.3     14.2     64.3     60
+PostgreSQL (extract in WHERE)   1623.0   2116.2   2266.0   1409.7   2266.0     60
+=========== threshold 3000
+Result sets (must all be identical, and non-empty):
+  logd (typed index)         1066 rows  sha256 80b94082c04d810c
+  logd (forced scan)         1066 rows  sha256 80b94082c04d810c
+  logd v1 (typed index)      1066 rows  sha256 80b94082c04d810c
+  logd (Loki | pattern text)     1066 rows  sha256 80b94082c04d810c
+  logd (Loki | regexp text)     1066 rows  sha256 80b94082c04d810c
+  Loki (| pattern)           1066 rows  sha256 80b94082c04d810c
+  Loki (| regexp)            1066 rows  sha256 80b94082c04d810c
+  VictoriaLogs (extract)     1066 rows  sha256 80b94082c04d810c
+  PostgreSQL (generated col + B-tree)     1066 rows  sha256 80b94082c04d810c
+  PostgreSQL (extract in WHERE)     1066 rows  sha256 80b94082c04d810c
+
+Collecting 60 interleaved samples per engine...
+
+engine                     median      p95      p99      min      max      n
+------------------------ -------- -------- -------- -------- -------- ------
+logd (typed index)           81.2    124.2    191.1     71.1    191.1     60
+logd (forced scan)          593.8    719.2    948.1    496.9    948.1     60
+logd v1 (typed index)       515.2    645.9    780.6    470.0    780.6     60
+logd (Loki | pattern text)     83.6    113.7    170.1     79.3    170.1     60
+logd (Loki | regexp text)    651.3    953.8   1252.8    627.6   1252.8     60
+Loki (| pattern)            323.1    429.2    490.8    308.0    490.8     60
+Loki (| regexp)             419.2    592.7    686.6    390.5    686.6     60
+VictoriaLogs (extract)       90.5    150.9    247.6     76.5    247.6     60
+PostgreSQL (generated col + B-tree)     11.1     18.6     36.9     10.4     36.9     60
+PostgreSQL (extract in WHERE)   1606.0   2148.8   2511.1   1514.3   2511.1     60
+=========== threshold 5000
+Result sets (must all be identical, and non-empty):
+  logd (typed index)          469 rows  sha256 f6591f752f1f7752
+  logd (forced scan)          469 rows  sha256 f6591f752f1f7752
+  logd v1 (typed index)       469 rows  sha256 f6591f752f1f7752
+  logd (Loki | pattern text)      469 rows  sha256 f6591f752f1f7752
+  logd (Loki | regexp text)      469 rows  sha256 f6591f752f1f7752
+  Loki (| pattern)            469 rows  sha256 f6591f752f1f7752
+  Loki (| regexp)             469 rows  sha256 f6591f752f1f7752
+  VictoriaLogs (extract)      469 rows  sha256 f6591f752f1f7752
+  PostgreSQL (generated col + B-tree)      469 rows  sha256 f6591f752f1f7752
+  PostgreSQL (extract in WHERE)      469 rows  sha256 f6591f752f1f7752
+
+Collecting 60 interleaved samples per engine...
+
+engine                     median      p95      p99      min      max      n
+------------------------ -------- -------- -------- -------- -------- ------
+logd (typed index)           46.6     59.4     99.5     39.3     99.5     60
+logd (forced scan)          568.1    734.5    877.5    487.5    877.5     60
+logd v1 (typed index)       469.8    567.8    670.8    398.9    670.8     60
+logd (Loki | pattern text)     46.5     73.9    131.3     40.4    131.3     60
+logd (Loki | regexp text)    628.7   1039.3   1587.4    526.7   1587.4     60
+Loki (| pattern)            305.1    481.3    720.6    258.2    720.6     60
+Loki (| regexp)             385.3    555.8    707.1    328.1    707.1     60
+VictoriaLogs (extract)       84.3    133.2    198.6     65.7    198.6     60
+PostgreSQL (generated col + B-tree)      9.6     11.5     16.7      8.0     16.7     60
+PostgreSQL (extract in WHERE)   1529.1   2096.8   2167.8   1288.8   2167.8     60
+load at end: 2.97 3.01 3.12 2/1987 2875622

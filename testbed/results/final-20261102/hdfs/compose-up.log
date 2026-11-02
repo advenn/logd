@@ -1,0 +1,181 @@
+ Image pgshim:testbed Building 
+ Image logd:testbed Building 
+#1 [internal] load local bake definitions
+#1 reading from stdin 1.06kB done
+#1 DONE 0.0s
+
+#2 [pgshim internal] load build definition from Dockerfile
+#2 transferring dockerfile: 1.15kB done
+#2 DONE 0.0s
+
+#3 [logd internal] load build definition from Dockerfile
+#3 transferring dockerfile: 912B done
+#3 DONE 0.0s
+
+#4 [logd] resolve image config for docker-image://docker.io/docker/dockerfile:1
+#4 ...
+
+#5 [auth] docker/dockerfile:pull token for registry-1.docker.io
+#5 DONE 0.0s
+
+#4 [logd] resolve image config for docker-image://docker.io/docker/dockerfile:1
+#4 DONE 0.9s
+
+#6 [pgshim] docker-image://docker.io/docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+#6 resolve docker.io/docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e 0.0s done
+#6 CACHED
+
+#7 [pgshim internal] load metadata for docker.io/library/golang:1.26-alpine
+#7 ...
+
+#8 [auth] library/alpine:pull token for registry-1.docker.io
+#8 DONE 0.0s
+
+#9 [auth] library/golang:pull token for registry-1.docker.io
+#9 DONE 0.0s
+
+#10 [logd internal] load metadata for docker.io/library/alpine:3.20
+#10 DONE 0.8s
+
+#7 [logd internal] load metadata for docker.io/library/golang:1.26-alpine
+#7 DONE 0.8s
+
+#11 [pgshim internal] load .dockerignore
+#11 transferring context: 204B done
+#11 DONE 0.0s
+
+#12 [logd internal] load .dockerignore
+#12 transferring context: 440B done
+#12 DONE 0.0s
+
+#13 [logd internal] load build context
+#13 transferring context: 7.80kB done
+#13 DONE 0.0s
+
+#14 [pgshim stage-1 1/4] FROM docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+#14 resolve docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc 0.0s done
+#14 DONE 0.0s
+
+#15 [logd build 1/6] FROM docker.io/library/golang:1.26-alpine@sha256:a2012b4a1d1f9f7e9f44e0d39b805a901e856b1dd80b4e6ee4338db547050308
+#15 resolve docker.io/library/golang:1.26-alpine@sha256:a2012b4a1d1f9f7e9f44e0d39b805a901e856b1dd80b4e6ee4338db547050308 0.0s done
+#15 DONE 0.0s
+
+#16 [logd build 6/6] RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/logd ./cmd/logd
+#16 CACHED
+
+#17 [logd stage-1 2/4] RUN apk add --no-cache wget  && adduser -D -H -u 10001 logd  && mkdir -p /data /etc/logd  && chown logd:logd /data
+#17 CACHED
+
+#18 [logd build 4/6] RUN go mod download
+#18 CACHED
+
+#19 [logd build 3/6] COPY go.mod go.sum ./
+#19 CACHED
+
+#20 [logd stage-1 3/4] COPY --from=build /out/logd /usr/local/bin/logd
+#20 CACHED
+
+#21 [logd build 5/6] COPY . .
+#21 CACHED
+
+#22 [logd stage-1 4/4] COPY deploy/logd.yaml /etc/logd/config.yaml
+#22 CACHED
+
+#23 [pgshim internal] load build context
+#23 transferring context: 437B done
+#23 DONE 0.0s
+
+#24 [pgshim build 7/7] RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/pgshim ./cmd/pgshim
+#24 CACHED
+
+#25 [pgshim build 2/6] WORKDIR /src
+#25 CACHED
+
+#26 [pgshim stage-1 2/3] RUN apk add --no-cache wget && adduser -D -H -u 10001 pgshim
+#26 CACHED
+
+#27 [pgshim build 6/7] COPY cmd/pgshim ./cmd/pgshim
+#27 CACHED
+
+#28 [pgshim build 4/7] RUN go mod edit -dropreplace=github.com/advenn/logd -droprequire=github.com/advenn/logd  && go mod download github.com/jackc/pgx/v5
+#28 CACHED
+
+#29 [pgshim build 3/7] COPY go.mod go.sum ./
+#29 CACHED
+
+#30 [pgshim build 5/7] COPY internal/pgdata ./internal/pgdata
+#30 CACHED
+
+#31 [pgshim stage-1 3/3] COPY --from=build /out/pgshim /usr/local/bin/pgshim
+#31 CACHED
+
+#32 [pgshim] exporting to image
+#32 exporting layers done
+#32 exporting manifest sha256:74f22c8dcb182b032cb11312c6db202260bc56d100ff4ca8a033d7123e405bca done
+#32 exporting config sha256:d5c1edf1311698613a4d431a5591ff95a230c76f8b29077e47d14c5b7127a65e done
+#32 exporting attestation manifest sha256:6d5d4fcaef3f8076de5a1b60811085450f148bc85585ec268329244bd2f671b6
+#32 exporting attestation manifest sha256:6d5d4fcaef3f8076de5a1b60811085450f148bc85585ec268329244bd2f671b6 0.0s done
+#32 exporting manifest list sha256:c09e6de40a7900c8d56189ae5462c0a9675124c60ecd377424df1b1ac87cbc5e 0.0s done
+#32 naming to docker.io/library/pgshim:testbed done
+#32 unpacking to docker.io/library/pgshim:testbed done
+#32 DONE 0.1s
+
+#33 [logd] exporting to image
+#33 exporting layers done
+#33 exporting manifest sha256:99d2526452413f5a681879e74490d08b6742e9433dca9842856ed81877a6180e done
+#33 exporting config sha256:88650d5a061340801311a73ca23f5309b76fab17b93351e5198e44df1e1371af done
+#33 exporting attestation manifest sha256:5146093277be1181219b6426f2e7b5d0350fa833bcdf85cabdb7a37e04d71914 0.0s done
+#33 exporting manifest list sha256:459bff5b9196d53c77c23f75e6b4bf5c58149246546e020991d5d9f545b926e5 0.0s done
+#33 naming to docker.io/library/logd:testbed done
+#33 unpacking to docker.io/library/logd:testbed done
+#33 DONE 0.1s
+
+#34 [logd] resolving provenance for metadata file
+#34 DONE 0.0s
+
+#35 [pgshim] resolving provenance for metadata file
+#35 DONE 0.0s
+ Image logd:testbed Built 
+ Image pgshim:testbed Built 
+ Volume logd-testbed_vlogs-data Creating 
+ Volume logd-testbed_loki-data Creating 
+ Volume logd-testbed_loki-data Creating 
+ Network logd-testbed_default Creating 
+ Network logd-testbed_default Creating 
+ Volume logd-testbed_vlogs-data Creating 
+ Volume logd-testbed_pg-data Creating 
+ Volume logd-testbed_pg-data Creating 
+ Volume logd-testbed_logd-data Creating 
+ Volume logd-testbed_logd-data Creating 
+ Volume logd-testbed_loki-data Created 
+ Volume logd-testbed_loki-data Created 
+ Volume logd-testbed_pg-data Created 
+ Volume logd-testbed_pg-data Created 
+ Volume logd-testbed_logd-data Created 
+ Volume logd-testbed_logd-data Created 
+ Volume logd-testbed_vlogs-data Created 
+ Volume logd-testbed_vlogs-data Created 
+ Network logd-testbed_default Created 
+ Network logd-testbed_default Created 
+ Container tb-victorialogs Creating 
+ Container tb-logd Creating 
+ Container tb-postgres Creating 
+ Container tb-loki Creating 
+ Container tb-logd Created 
+ Container tb-loki Created 
+ Container tb-postgres Created 
+ Container tb-pgshim Creating 
+ Container tb-victorialogs Created 
+ Container tb-pgshim Created 
+ Container tb-postgres Starting 
+ Container tb-victorialogs Starting 
+ Container tb-loki Starting 
+ Container tb-logd Starting 
+ Container tb-postgres Started 
+ Container tb-postgres Waiting 
+ Container tb-victorialogs Started 
+ Container tb-loki Started 
+ Container tb-logd Started 
+ Container tb-postgres Healthy 
+ Container tb-pgshim Starting 
+ Container tb-pgshim Started 

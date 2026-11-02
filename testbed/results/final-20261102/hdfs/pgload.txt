@@ -1,0 +1,10 @@
+       variant          table     rows  load s  lines/s  vacuum s  WAL MB  heap MB  index MB  total MB
+    structured      hdfs_logs  2000000   13.43   148868      0.23  512.72   378.89     65.40    444.28
+  unstructured  hdfs_logs_raw  2000000    9.08   220260      0.22  456.69   372.73     44.94    417.67
+
+  index hdfs_logs_size              20.46 MB
+  index hdfs_logs_ts                44.94 MB
+  index hdfs_logs_raw_ts            44.94 MB
+
+MB = 10^6 bytes. heap = pg_table_size (heap + TOAST + FSM + VM), index = pg_indexes_size,
+total = pg_total_relation_size; WAL is what the load wrote and is not part of total.

@@ -1,0 +1,4 @@
+2026/11/02 04:40:36 logd: listening on :34653 (data /home/beck/.cache/logd-bench/e8.uPhyLu/s50-f500-r10000-2/data, 1 shard(s))
+--- restart after kill -9 ---
+2026/11/02 04:40:39 logd: listening on :34653 (data /home/beck/.cache/logd-bench/e8.uPhyLu/s50-f500-r10000-2/data, 1 shard(s))
+2026/11/02 04:40:39 logd: shutting down

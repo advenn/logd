@@ -1,0 +1,17 @@
+goos: linux
+goarch: amd64
+pkg: github.com/advenn/logd/core/ingest
+cpu: 11th Gen Intel(R) Core(TM) i5-1145G7 @ 2.60GHz
+BenchmarkTemplateIndexRAM/rate=80/templates=0-8         	       1	  22333625 ns/op	         0 entries/seg	         0 estMB/seg	         0.005089 heapMB/seg	         0 keys/line	         3.300 labelMB/seg	         0 match%	    363714 records/seg
+BenchmarkTemplateIndexRAM/rate=80/templates=1-8         	       1	  38633434 ns/op	        24.93 B/entry	    291025 entries/seg	         6.661 estMB/seg	         6.918 heapMB/seg	         0.8003 keys/line	         3.289 labelMB/seg	        80.03 match%	    363714 records/seg
+BenchmarkTemplateIndexRAM/rate=80/templates=5-8         	       1	  77736417 ns/op	        25.22 B/entry	   1014605 entries/seg	        23.22 estMB/seg	        24.40 heapMB/seg	         2.790 keys/line	         3.289 labelMB/seg	        80.03 match%	    363714 records/seg
+BenchmarkTemplateIndexRAM/rate=80/templates=20-8        	       1	 113745487 ns/op	        25.19 B/entry	   1748805 entries/seg	        40.03 estMB/seg	        42.02 heapMB/seg	         4.809 keys/line	         3.289 labelMB/seg	        80.03 match%	    363714 records/seg
+BenchmarkTemplateIndexRAM/rate=80/templates=5never-8    	       1	  20816842 ns/op	         0 entries/seg	         0 estMB/seg	         0 heapMB/seg	         0 keys/line	         3.289 labelMB/seg	         0 match%	    363714 records/seg
+BenchmarkTemplateIndexRAM/rate=80/templates=20never-8   	       1	  25061135 ns/op	         0 entries/seg	         0 estMB/seg	         0.0005035 heapMB/seg	         0 keys/line	         3.289 labelMB/seg	         0 match%	    363714 records/seg
+BenchmarkTemplateIndexRAM/rate=5/templates=0-8          	       1	  19749807 ns/op	         0 entries/seg	         0 estMB/seg	         0 heapMB/seg	         0 keys/line	         3.289 labelMB/seg	         0 match%	    385659 records/seg
+BenchmarkTemplateIndexRAM/rate=5/templates=1-8          	       1	  22185755 ns/op	        29.32 B/entry	     20064 entries/seg	         0.4592 estMB/seg	         0.5610 heapMB/seg	         0.05200 keys/line	         3.289 labelMB/seg	         5.200 match%	    385659 records/seg
+BenchmarkTemplateIndexRAM/rate=5/templates=5-8          	       1	  24314670 ns/op	        29.68 B/entry	     68670 entries/seg	         1.572 estMB/seg	         1.944 heapMB/seg	         0.1780 keys/line	         3.289 labelMB/seg	         5.200 match%	    385659 records/seg
+BenchmarkTemplateIndexRAM/rate=5/templates=20-8         	       1	  29434507 ns/op	        28.61 B/entry	    121420 entries/seg	         2.779 estMB/seg	         3.313 heapMB/seg	         0.3147 keys/line	         3.289 labelMB/seg	         5.200 match%	    385659 records/seg
+BenchmarkTemplateIndexRAM/rate=5/templates=5never-8     	       1	  18927254 ns/op	         0 entries/seg	         0 estMB/seg	         0 heapMB/seg	         0 keys/line	         3.289 labelMB/seg	         0 match%	    385659 records/seg
+BenchmarkTemplateIndexRAM/rate=5/templates=20never-8    	       1	  22441884 ns/op	         0 entries/seg	         0 estMB/seg	         0.0005035 heapMB/seg	         0 keys/line	         3.289 labelMB/seg	         0 match%	    385659 records/seg
+PASS

@@ -1,0 +1,28 @@
+      1 /shard-0000/LOCK
+      1 bin
+      3 idx
+      1 json
+      2 lidx
+      1 log
+      2 logz
+      8 tidx
+2	./shard-0000/lookup.bin
+37	./shard-0000/segments/seg-01M6D7332HDX521M441Y0T3YDB.__lit_circuit%20breaker%20opened.tidx
+37	./shard-0000/segments/seg-01M6D7332HDX521M441Y0T3YDB.__lit_panic%3A.tidx
+37	./shard-0000/segments/seg-01M6D73V8MC6M93X1096XTPPM7.__lit_circuit%20breaker%20opened.tidx
+37	./shard-0000/segments/seg-01M6D73V8MC6M93X1096XTPPM7.__lit_panic%3A.tidx
+1978	./shard-0000/manifest.json
+3837	./shard-0000/segments/seg-01M6D73V8MC6M93X1096XTPPM7.status_code.tidx
+4096	./shard-0000/segments/seg-01M6D846EEWNY3ZJT4DB3V84Y2.log
+12006	./shard-0000/segments/seg-01M6D7332HDX521M441Y0T3YDB.status_code.tidx
+85232	./shard-0000/segments/seg-01M6D73V8MC6M93X1096XTPPM7.idx
+245412	./shard-0000/segments/seg-01M6D73V8MC6M93X1096XTPPM7.labels.lidx
+262128	./shard-0000/segments/seg-01M6D7332HDX521M441Y0T3YDB.idx
+475409	./shard-0000/segments/seg-01M6D73V8MC6M93X1096XTPPM7.latency_ms.tidx
+754692	./shard-0000/segments/seg-01M6D7332HDX521M441Y0T3YDB.labels.lidx
+1444857	./shard-0000/segments/seg-01M6D7332HDX521M441Y0T3YDB.latency_ms.tidx
+3069497	./shard-0000/segments/seg-01M6D73V8MC6M93X1096XTPPM7.logz
+9313021	./shard-0000/segments/seg-01M6D7332HDX521M441Y0T3YDB.logz
+15674431	./shard-0000/segments
+15680507	./shard-0000
+15684603	.

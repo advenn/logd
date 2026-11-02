@@ -1,0 +1,44 @@
+dataset hdfs, manifest /home/beck/.cache/logd-bench/hdfs-2000000.jsonl
+  2,000,000 lines, 633,736 carry size_bytes; window [1793587345398079890, 1793589347397079890), app=hdfs, limit=200000
+
+size_bytes < 67108864: expected 31,671 (1.5835% of lines)
+  logd (typed index)                 31,671  ok  (837 ms, one unwarmed sample)
+  logd (forced scan)                 31,671  ok  (2625 ms, one unwarmed sample)
+  Loki (| pattern)                   31,671  ok  (1267 ms, one unwarmed sample)
+  Loki (| regexp)                    31,671  ok  (1298 ms, one unwarmed sample)
+  VictoriaLogs (extract_regexp)      31,671  ok  (472 ms, one unwarmed sample)
+  VictoriaLogs (extract)             31,671  ok  (309 ms, one unwarmed sample)
+  PostgreSQL (structured)            31,671  ok  (96 ms, one unwarmed sample)
+  PostgreSQL (unstructured)          31,671  ok  (2424 ms, one unwarmed sample)
+
+size_bytes < 28490000: expected 20,483 (1.0242% of lines)
+  logd (typed index)                 20,483  ok  (680 ms, one unwarmed sample)
+  logd (forced scan)                 20,483  ok  (3266 ms, one unwarmed sample)
+  Loki (| pattern)                   20,483  ok  (1281 ms, one unwarmed sample)
+  Loki (| regexp)                    20,483  ok  (1299 ms, one unwarmed sample)
+  VictoriaLogs (extract_regexp)      20,483  ok  (379 ms, one unwarmed sample)
+  VictoriaLogs (extract)             20,483  ok  (293 ms, one unwarmed sample)
+  PostgreSQL (structured)            20,483  ok  (44 ms, one unwarmed sample)
+  PostgreSQL (unstructured)          20,483  ok  (2392 ms, one unwarmed sample)
+
+size_bytes < 3535000: expected 2,123 (0.1061% of lines)
+  logd (typed index)                  2,123  ok  (300 ms, one unwarmed sample)
+  logd (forced scan)                  2,123  ok  (3012 ms, one unwarmed sample)
+  Loki (| pattern)                    2,123  ok  (887 ms, one unwarmed sample)
+  Loki (| regexp)                     2,123  ok  (880 ms, one unwarmed sample)
+  VictoriaLogs (extract_regexp)       2,123  ok  (355 ms, one unwarmed sample)
+  VictoriaLogs (extract)              2,123  ok  (261 ms, one unwarmed sample)
+  PostgreSQL (structured)             2,123  ok  (5 ms, one unwarmed sample)
+  PostgreSQL (unstructured)           2,123  ok  (2410 ms, one unwarmed sample)
+
+size_bytes < 90000: expected 181 (0.0091% of lines)
+  logd (typed index)                    181  ok  (253 ms, one unwarmed sample)
+  logd (forced scan)                    181  ok  (2535 ms, one unwarmed sample)
+  Loki (| pattern)                      181  ok  (733 ms, one unwarmed sample)
+  Loki (| regexp)                       181  ok  (869 ms, one unwarmed sample)
+  VictoriaLogs (extract_regexp)         181  ok  (337 ms, one unwarmed sample)
+  VictoriaLogs (extract)                181  ok  (251 ms, one unwarmed sample)
+  PostgreSQL (structured)               181  ok  (2 ms, one unwarmed sample)
+  PostgreSQL (unstructured)             181  ok  (2325 ms, one unwarmed sample)
+
+GATE PASSED

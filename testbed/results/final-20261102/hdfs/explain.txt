@@ -1,0 +1,8 @@
+  summary: {'segments_total': 7, 'segments_indexed': 7, 'segments_scanned': 0, 'candidates': 181}
+  01M6D95APAF014R4R8NGY7NA90 sealed index indexed candidates=12
+  01M6D9611TGY3608MNHQ77E0XC sealed index indexed candidates=37
+  01M6D963A4HM009HA7JPTX7X10 sealed index indexed candidates=0
+  01M6D965HCF50Z2WRV7HJEXVM4 sealed index indexed candidates=12
+  01M6D967VW2W2JXQDB1Y3RD727 sealed index indexed candidates=24
+  01M6D96A53GF88T572TJHKAZRA sealed index indexed candidates=96
+  01M6D96CFSWMSPQ2QMCKCGQ2P0 sealed index indexed candidates=0

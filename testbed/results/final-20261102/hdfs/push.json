@@ -1,0 +1,48 @@
+{
+  "elapsed_sec": 14.249816255,
+  "endpoints": {
+    "http://localhost:3100/loki/api/v1/push": {
+      "bytes": 75848172,
+      "elapsed_sec": 7.622785446,
+      "entries": 2000000,
+      "failures": 0,
+      "rate_limited": 0,
+      "requests": 2000,
+      "retries": 0
+    },
+    "http://localhost:7100/loki/api/v1/push": {
+      "bytes": 75848172,
+      "elapsed_sec": 4.1962564,
+      "entries": 2000000,
+      "failures": 0,
+      "rate_limited": 0,
+      "requests": 2000,
+      "retries": 0
+    },
+    "http://localhost:9428/insert/loki/api/v1/push?_stream_fields=app,component": {
+      "bytes": 75848172,
+      "elapsed_sec": 4.392365771,
+      "entries": 2000000,
+      "failures": 0,
+      "rate_limited": 0,
+      "requests": 2000,
+      "retries": 0
+    }
+  },
+  "lines": 2000000,
+  "lines_per_s": 140352.68695469925,
+  "replay": {
+    "lines": 2000000,
+    "with_value": 633736,
+    "multi_value": 0,
+    "unparsable": 0,
+    "skipped_empty": 0,
+    "components": {
+      "datablockscanner": 55989,
+      "datanode": 1432269,
+      "fsdataset": 10909,
+      "fsnamesystem": 500833
+    },
+    "value_name": "size_bytes"
+  }
+}

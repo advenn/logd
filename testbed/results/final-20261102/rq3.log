@@ -1,0 +1,40 @@
+| 5% | 5never | 0.00 | 0.0% | 1183 (1156–1204) | 845218 (830651–865422) | 654 | 4 |
+| 5% | 20never | 0.00 | 0.0% | 1490 (1466–1509) | 671109 (662850–681901) | 690 | 4 |
+
+### Cost split and slowdown vs 0 templates (medians, ns/line)
+
+| match rate | templates | extract | writer | ingest | ingest Δ vs 0 | ingest lines/s vs 0 |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 80% | 0 | 275 | 877 | 1142 | +0 | 1.00× |
+| 80% | 1 | 400 | 1359 | 1671 | +529 | 0.68× |
+| 80% | 5 | 858 | 2380 | 3064 | +1922 | 0.37× |
+| 80% | 20 | 1474 | 3592 | 5035 | +3893 | 0.23× |
+| 80% | 5never | 305 | 940 | 1237 | +95 | 0.92× |
+| 80% | 20never | 520 | 1081 | 1557 | +415 | 0.73× |
+| 5% | 0 | 256 | 873 | 1129 | +0 | 1.00× |
+| 5% | 1 | 268 | 909 | 1180 | +51 | 0.96× |
+| 5% | 5 | 337 | 996 | 1346 | +217 | 0.84× |
+| 5% | 20 | 465 | 1226 | 1655 | +526 | 0.68× |
+| 5% | 5never | 265 | 908 | 1183 | +54 | 0.95× |
+| 5% | 20never | 425 | 1064 | 1490 | +361 | 0.76× |
+
+### Active-segment index RAM for one 64 MB segment (RQ4)
+
+estimate = entries × 24 B, as indexMemExceeded computes it; heap = live heap of the typed-range buffer;
+label = the label builder (one posting per record), which the estimate does not count
+
+| match rate | templates | records/seg | entries/seg | estimate MB | heap MB | B/entry (heap) | label MB |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 80% | 0 | 363714 | 0 | 0.0 | 0.0 | – | 3.3 |
+| 80% | 1 | 363714 | 291025 | 6.7 | 6.9 | 24.9 | 3.3 |
+| 80% | 5 | 363714 | 1014605 | 23.2 | 24.4 | 25.2 | 3.3 |
+| 80% | 20 | 363714 | 1748805 | 40.0 | 42.0 | 25.2 | 3.3 |
+| 80% | 5never | 363714 | 0 | 0.0 | 0.0 | – | 3.3 |
+| 80% | 20never | 363714 | 0 | 0.0 | 0.0 | – | 3.3 |
+| 5% | 0 | 385659 | 0 | 0.0 | 0.0 | – | 3.3 |
+| 5% | 1 | 385659 | 20064 | 0.5 | 0.6 | 29.3 | 3.3 |
+| 5% | 5 | 385659 | 68670 | 1.6 | 1.9 | 29.7 | 3.3 |
+| 5% | 20 | 385659 | 121420 | 2.8 | 3.3 | 28.6 | 3.3 |
+| 5% | 5never | 385659 | 0 | 0.0 | 0.0 | – | 3.3 |
+| 5% | 20never | 385659 | 0 | 0.0 | 0.0 | – | 3.3 |
+raw output and summary in /home/beck/IdeaProjects/university/masters_thesis/logd/testbed/results/final-20261102/rq3

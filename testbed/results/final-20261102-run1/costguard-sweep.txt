@@ -1,0 +1,62 @@
+=== RUN   TestCostGuardSelectivitySweep
+    costguard_sweep_test.go:48: load at start: 1.58 2.06 2.83 3/1780 2987782
+    costguard_sweep_test.go:156: 
+    costguard_sweep_test.go:157: === compressed (8-page blocks), scattered: 200000 records, 5399 data pages, block_pages=8, 675 I/O units
+    costguard_sweep_test.go:158:                              | limit=100                          | limit=1000                         | all rows               
+    costguard_sweep_test.go:160:   sel%    rows pages% units% | guard         index     scan   s/i | guard         index     scan   s/i |    index     scan   s/i
+    costguard_sweep_test.go:194:   50.0   99982  100.0  100.0 | cost_guard  115.2ms   66.9ms  0.58 | cost_guard  124.2ms   67.6ms  0.54 |  132.9ms  225.6ms  1.70
+    costguard_sweep_test.go:194:   30.0   59978  100.0  100.0 | cost_guard   97.9ms   68.1ms  0.70 | cost_guard  102.1ms   68.4ms  0.67 |  101.1ms  201.6ms  1.99
+    costguard_sweep_test.go:194:   20.0   39982  100.0  100.0 | cost_guard   87.2ms   67.6ms  0.77 | cost_guard   90.2ms   70.0ms  0.78 |   88.6ms  183.3ms  2.07
+    costguard_sweep_test.go:194:   10.0   19980  100.0  100.0 | cost_guard   79.4ms   67.9ms  0.85 | cost_guard   79.6ms   71.7ms  0.90 |   79.3ms  169.5ms  2.14
+    costguard_sweep_test.go:194:    5.0    9979  100.0  100.0 | cost_guard   73.2ms   67.6ms  0.92 | index        74.5ms   78.6ms  1.06 |   73.4ms  162.9ms  2.22
+    costguard_sweep_test.go:194:    2.0    3985   54.2  100.0 | index        70.2ms   69.2ms  0.99 | index        69.9ms   90.2ms  1.29 |   69.4ms  160.7ms  2.32
+    costguard_sweep_test.go:194:    1.0    1984   28.2   96.0 | index        65.9ms   71.8ms  1.09 | index        66.0ms  113.2ms  1.72 |   65.4ms  171.2ms  2.62
+    costguard_sweep_test.go:194:    0.5     983   14.9   82.8 | index        57.6ms   76.9ms  1.34 | index        57.0ms  194.7ms  3.42 |   69.9ms  220.7ms  3.16
+    costguard_sweep_test.go:194:    0.2     379    6.7   53.6 | index        47.9ms  126.1ms  2.63 | index        51.2ms  225.3ms  4.40 |   59.9ms  219.0ms  3.66
+    costguard_sweep_test.go:194:    0.1     180    3.3   26.7 | index        24.8ms  161.9ms  6.52 | index        25.9ms  186.9ms  7.23 |   25.8ms  189.8ms  7.37
+    costguard_sweep_test.go:156: 
+    costguard_sweep_test.go:157: === compressed (8-page blocks), clustered: 200000 records, 5405 data pages, block_pages=8, 676 I/O units
+    costguard_sweep_test.go:158:                              | limit=100                          | limit=1000                         | all rows               
+    costguard_sweep_test.go:160:   sel%    rows pages% units% | guard         index     scan   s/i | guard         index     scan   s/i |    index     scan   s/i
+    costguard_sweep_test.go:194:   50.0   99980   50.0   50.0 | index        94.6ms  147.1ms  1.55 | index       100.9ms  120.8ms  1.20 |  100.9ms  264.1ms  2.62
+    costguard_sweep_test.go:194:   30.0   59980   30.0   30.0 | index        56.0ms  143.1ms  2.56 | index        61.2ms  145.2ms  2.37 |   56.8ms  195.1ms  3.44
+    costguard_sweep_test.go:194:   20.0   39980   20.0   20.1 | index        30.3ms  128.9ms  4.25 | index        33.6ms  129.8ms  3.86 |   31.9ms  168.7ms  5.29
+    costguard_sweep_test.go:194:   10.0   19980   10.0   10.1 | index        16.2ms  137.6ms  8.49 | index        17.9ms  139.6ms  7.80 |   17.6ms  156.2ms  8.88
+    costguard_sweep_test.go:194:    5.0    9980    5.0    5.0 | index         9.3ms  142.9ms 15.45 | index        10.0ms  144.2ms 14.38 |    8.8ms  151.1ms 17.08
+    costguard_sweep_test.go:194:    2.0    3980    2.0    2.1 | index         5.0ms  145.3ms 28.82 | index         5.9ms  159.6ms 26.92 |    8.5ms  186.2ms 21.83
+    costguard_sweep_test.go:194:    1.0    1980    1.0    1.0 | index         4.2ms  180.8ms 43.08 | index         4.5ms  176.1ms 39.35 |    3.9ms  196.7ms 50.66
+    costguard_sweep_test.go:194:    0.5     980    0.5    0.6 | index         3.4ms  185.9ms 54.57 | index         3.2ms  179.4ms 55.78 |    3.1ms  174.4ms 56.46
+    costguard_sweep_test.go:194:    0.2     380    0.2    0.3 | index         4.5ms  181.4ms 40.52 | index         4.1ms  174.4ms 42.22 |    4.6ms  178.3ms 39.15
+    costguard_sweep_test.go:194:    0.1     180    0.1    0.1 | index         3.0ms  148.7ms 50.28 | index         2.8ms  148.1ms 52.10 |    2.9ms  147.1ms 50.01
+    costguard_sweep_test.go:156: 
+    costguard_sweep_test.go:157: === uncompressed, scattered: 200000 records, 5399 data pages, block_pages=0, 5399 I/O units
+    costguard_sweep_test.go:158:                              | limit=100                          | limit=1000                         | all rows               
+    costguard_sweep_test.go:160:   sel%    rows pages% units% | guard         index     scan   s/i | guard         index     scan   s/i |    index     scan   s/i
+    costguard_sweep_test.go:194:   50.0   99982  100.0  100.0 | cost_guard   56.1ms    5.0ms  0.09 | cost_guard   61.4ms    6.1ms  0.10 |   62.8ms  164.1ms  2.61
+    costguard_sweep_test.go:194:   30.0   59978  100.0  100.0 | cost_guard   36.5ms    5.6ms  0.15 | cost_guard   45.9ms    8.0ms  0.17 |   43.5ms  164.8ms  3.79
+    costguard_sweep_test.go:194:   20.0   39982  100.0  100.0 | cost_guard   32.9ms    6.0ms  0.18 | cost_guard   36.2ms    9.0ms  0.25 |   34.0ms  149.7ms  4.40
+    costguard_sweep_test.go:194:   10.0   19980  100.0  100.0 | cost_guard   19.9ms    6.3ms  0.32 | cost_guard   21.1ms   12.5ms  0.59 |   18.6ms  133.4ms  7.15
+    costguard_sweep_test.go:194:    5.0    9979  100.0  100.0 | cost_guard   14.2ms    7.0ms  0.49 | index        16.0ms   17.3ms  1.08 |   13.7ms  121.3ms  8.84
+    costguard_sweep_test.go:194:    2.0    3985   54.2   54.2 | index         7.9ms    8.8ms  1.11 | index         8.5ms   33.5ms  3.93 |    8.1ms  118.0ms 14.58
+    costguard_sweep_test.go:194:    1.0    1984   28.2   28.2 | index         5.6ms   11.3ms  2.03 | index         5.2ms   60.7ms 11.56 |    4.7ms  108.9ms 23.10
+    costguard_sweep_test.go:194:    0.5     983   14.9   14.9 | index         3.7ms   15.1ms  4.05 | index         3.3ms  115.3ms 34.68 |    4.0ms  114.1ms 28.37
+    costguard_sweep_test.go:194:    0.2     379    6.7    6.7 | index         4.7ms   34.9ms  7.44 | index         4.4ms  130.7ms 29.81 |    5.7ms  127.4ms 22.40
+    costguard_sweep_test.go:194:    0.1     180    3.3    3.3 | index         4.4ms   65.6ms 14.96 | index         3.4ms  113.8ms 33.86 |    3.8ms  115.4ms 29.97
+    costguard_sweep_test.go:156: 
+    costguard_sweep_test.go:157: === uncompressed, clustered: 200000 records, 5405 data pages, block_pages=0, 5405 I/O units
+    costguard_sweep_test.go:158:                              | limit=100                          | limit=1000                         | all rows               
+    costguard_sweep_test.go:160:   sel%    rows pages% units% | guard         index     scan   s/i | guard         index     scan   s/i |    index     scan   s/i
+    costguard_sweep_test.go:194:   50.0   99980   50.0   50.0 | index        62.7ms   58.7ms  0.94 | index        63.6ms   53.3ms  0.84 |   61.2ms  181.1ms  2.96
+    costguard_sweep_test.go:194:   30.0   59980   30.0   30.0 | index        38.4ms   82.6ms  2.15 | index        48.1ms   86.6ms  1.80 |   39.7ms  157.4ms  3.97
+    costguard_sweep_test.go:194:   20.0   39980   20.0   20.0 | index        25.0ms  102.0ms  4.08 | index        30.1ms   94.3ms  3.13 |   31.8ms  142.7ms  4.49
+    costguard_sweep_test.go:194:   10.0   19980   10.0   10.0 | index        13.5ms  106.0ms  7.84 | index        16.5ms  104.7ms  6.33 |   13.3ms  127.1ms  9.58
+    costguard_sweep_test.go:194:    5.0    9980    5.0    5.0 | index         8.7ms  110.1ms 12.72 | index         8.9ms  110.1ms 12.40 |    7.6ms  119.6ms 15.68
+    costguard_sweep_test.go:194:    2.0    3980    2.0    2.0 | index         4.4ms  113.0ms 25.85 | index         5.3ms  117.5ms 22.18 |    4.3ms  115.6ms 26.66
+    costguard_sweep_test.go:194:    1.0    1980    1.0    1.0 | index         3.7ms  112.4ms 30.15 | index         3.5ms  114.1ms 32.51 |    3.1ms  115.4ms 37.66
+    costguard_sweep_test.go:194:    0.5     980    0.5    0.5 | index         2.8ms  114.5ms 40.91 | index         2.7ms  114.6ms 42.89 |    3.0ms  115.1ms 38.49
+    costguard_sweep_test.go:194:    0.2     380    0.2    0.2 | index         4.2ms  116.2ms 27.72 | index         3.8ms  115.1ms 30.45 |    4.1ms  113.7ms 27.58
+    costguard_sweep_test.go:194:    0.1     180    0.1    0.1 | index         3.8ms  115.9ms 30.79 | index         3.7ms  113.2ms 30.19 |    3.8ms  112.6ms 29.53
+    costguard_sweep_test.go:62: load at end: 2.20 2.05 2.72 3/1814 2992258
+--- PASS: TestCostGuardSelectivitySweep (116.55s)
+PASS
+ok  	github.com/advenn/logd/core/query	116.566s

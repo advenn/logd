@@ -1,0 +1,43 @@
+{
+  "elapsed_sec": 9.381122028,
+  "endpoints": {
+    "http://localhost:3100/loki/api/v1/push": {
+      "bytes": 16547173,
+      "elapsed_sec": 2.9340383340000002,
+      "entries": 500000,
+      "failures": 0,
+      "rate_limited": 0,
+      "requests": 500,
+      "retries": 0
+    },
+    "http://localhost:7100/loki/api/v1/push": {
+      "bytes": 16547173,
+      "elapsed_sec": 2.38534163,
+      "entries": 500000,
+      "failures": 0,
+      "rate_limited": 0,
+      "requests": 500,
+      "retries": 0
+    },
+    "http://localhost:7101/loki/api/v1/push": {
+      "bytes": 16547173,
+      "elapsed_sec": 4.545457489,
+      "entries": 500000,
+      "failures": 0,
+      "rate_limited": 0,
+      "requests": 500,
+      "retries": 0
+    },
+    "http://localhost:9428/insert/loki/api/v1/push?_stream_fields=app,env,region": {
+      "bytes": 16547173,
+      "elapsed_sec": 2.015421114,
+      "entries": 500000,
+      "failures": 0,
+      "rate_limited": 0,
+      "requests": 500,
+      "retries": 0
+    }
+  },
+  "lines": 500000,
+  "lines_per_s": 53298.52852437493
+}

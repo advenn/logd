@@ -1,0 +1,13 @@
+PostgreSQL load: corpus/app-500000.jsonl (dataset app), batch 1000
+load at start: 3.54 2.59 2.84 5/1990 2813435
+pgload: 500000 rows, 1 streams, 404984 carrying latency_ms, from corpus/app-500000.jsonl
+       variant     table    rows  load s  lines/s  vacuum s  WAL MB  heap MB  index MB  total MB
+    structured      logs  500000    7.12    70219      0.16  128.51    74.59     26.41    101.00
+  unstructured  logs_raw  500000    3.01   166083      0.12   94.35    72.80     11.26     84.06
+
+  index logs_latency                15.16 MB
+  index logs_ts                     11.26 MB
+  index logs_raw_ts                 11.26 MB
+
+MB = 10^6 bytes. heap = pg_table_size (heap + TOAST + FSM + VM), index = pg_indexes_size,
+total = pg_total_relation_size; WAL is what the load wrote and is not part of total.

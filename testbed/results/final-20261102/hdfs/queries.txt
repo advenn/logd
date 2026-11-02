@@ -1,0 +1,33 @@
+dataset hdfs: 633,736 values of size_bytes; window [1793592625450478230, 1793594627449478230); app=hdfs
+
+logd (typed index)
+  GET http://localhost:7100/loki/api/v1/query_range
+  query={app="hdfs"} | size_bytes < T
+
+logd (forced scan)
+  GET http://localhost:7100/logd/api/v1/query_scan
+  query={app="hdfs"} | size_bytes < T
+
+Loki (| pattern)
+  GET http://localhost:3100/loki/api/v1/query_range
+  query={app="hdfs"} |= "size " | pattern "<_> size <size_bytes> <_>" | pattern "<_> size <size_bytes>" | size_bytes < T
+
+Loki (| regexp)
+  GET http://localhost:3100/loki/api/v1/query_range
+  query={app="hdfs"} |= "size " | regexp "size (?P<size_bytes>[0-9]+)" | size_bytes < T
+
+VictoriaLogs (extract_regexp)
+  GET http://localhost:9428/select/logsql/query
+  query=_stream:{app="hdfs"} "size" | extract_regexp "size (?P<size_bytes>[0-9]+)" | size_bytes:<T
+
+VictoriaLogs (extract)
+  GET http://localhost:9428/select/logsql/query
+  query=_stream:{app="hdfs"} "size" | extract "size <size_bytes> " | extract if (size_bytes:"") "size <size_bytes>" | size_bytes:<T
+
+PostgreSQL (structured)
+  GET http://localhost:7300/loki/api/v1/query_range?variant=structured&dataset=hdfs
+  query=size_bytes < T
+
+PostgreSQL (unstructured)
+  GET http://localhost:7300/loki/api/v1/query_range?variant=unstructured&dataset=hdfs
+  query=size_bytes < T

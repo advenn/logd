@@ -1,0 +1,15 @@
+{
+  "Run": "s10-f50-r200-6",
+  "Acked": 642,
+  "Found": 634,
+  "LostAcked": 8,
+  "LostFirst": 634,
+  "LostLast": 641,
+  "LostTail": true,
+  "LostSpanMS": 40,
+  "LostAckSpanMS": 29.9454,
+  "OldestLostAgeMS": 36.313878,
+  "UnackedFound": 0,
+  "Duplicates": 0,
+  "KillAfterMS": 3206.940459
+}

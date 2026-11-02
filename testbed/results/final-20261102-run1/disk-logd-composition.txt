@@ -1,0 +1,26 @@
+      1 /shard-0000/LOCK
+      1 bin
+      3 idx
+      1 json
+      2 lidx
+      1 log
+      2 logz
+      4 tidx
+0	./shard-0000/LOCK
+0	./shard-0000/segments/seg-01M6D2SEHTBGSAF0GPKPC2WSWY.idx
+2	./shard-0000/lookup.bin
+1514	./shard-0000/manifest.json
+3835	./shard-0000/segments/seg-01M6D1F1YG2V4ZK2FM85DX80K1.status_code.tidx
+4096	./shard-0000/segments/seg-01M6D2SEHTBGSAF0GPKPC2WSWY.log
+12061	./shard-0000/segments/seg-01M6D1E6WTSE53G18RR7JQQMVC.status_code.tidx
+85264	./shard-0000/segments/seg-01M6D1F1YG2V4ZK2FM85DX80K1.idx
+245504	./shard-0000/segments/seg-01M6D1F1YG2V4ZK2FM85DX80K1.labels.lidx
+262128	./shard-0000/segments/seg-01M6D1E6WTSE53G18RR7JQQMVC.idx
+475179	./shard-0000/segments/seg-01M6D1F1YG2V4ZK2FM85DX80K1.latency_ms.tidx
+754600	./shard-0000/segments/seg-01M6D1E6WTSE53G18RR7JQQMVC.labels.lidx
+1445125	./shard-0000/segments/seg-01M6D1E6WTSE53G18RR7JQQMVC.latency_ms.tidx
+3088553	./shard-0000/segments/seg-01M6D1F1YG2V4ZK2FM85DX80K1.logz
+9359007	./shard-0000/segments/seg-01M6D1E6WTSE53G18RR7JQQMVC.logz
+15739448	./shard-0000/segments
+15745060	./shard-0000
+15749156	.

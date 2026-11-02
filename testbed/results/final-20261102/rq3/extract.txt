@@ -1,0 +1,85 @@
+goos: linux
+goarch: amd64
+pkg: github.com/advenn/logd/core/ingest
+cpu: 11th Gen Intel(R) Core(TM) i5-1145G7 @ 2.60GHz
+BenchmarkTemplateExtract/rate=80/templates=0-8         	 8722824	       275.7 ns/op	         0 keys/line	   3627743 lines/s	         0 match%	       0 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=80/templates=1-8         	 6046551	       398.3 ns/op	         0.8003 keys/line	   2510477 lines/s	        80.03 match%	      89 B/op	       1 allocs/op
+BenchmarkTemplateExtract/rate=80/templates=5-8         	 2789792	       857.5 ns/op	         2.790 keys/line	   1166182 lines/s	        80.03 match%	     649 B/op	       3 allocs/op
+BenchmarkTemplateExtract/rate=80/templates=20-8        	 1646467	      1474 ns/op	         4.809 keys/line	    678616 lines/s	        80.03 match%	    1178 B/op	       5 allocs/op
+BenchmarkTemplateExtract/rate=80/templates=5never-8    	 7847758	       304.7 ns/op	         0 keys/line	   3281763 lines/s	         0 match%	       0 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=80/templates=20never-8   	 4611787	       521.6 ns/op	         0 keys/line	   1917279 lines/s	         0 match%	       0 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=0-8          	 9328036	       255.7 ns/op	         0 keys/line	   3910982 lines/s	         0 match%	       0 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=1-8          	 8941112	       268.3 ns/op	         0.05200 keys/line	   3726657 lines/s	         5.200 match%	       5 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=5-8          	 7184263	       342.9 ns/op	         0.1780 keys/line	   2915951 lines/s	         5.200 match%	      41 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=20-8         	 5184602	       465.5 ns/op	         0.3147 keys/line	   2148071 lines/s	         5.200 match%	      76 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=5never-8     	 9029804	       265.0 ns/op	         0 keys/line	   3773669 lines/s	         0 match%	       0 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=20never-8    	 5614040	       429.1 ns/op	         0 keys/line	   2330619 lines/s	         0 match%	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/advenn/logd/core/ingest
+cpu: 11th Gen Intel(R) Core(TM) i5-1145G7 @ 2.60GHz
+BenchmarkTemplateExtract/rate=80/templates=0-8         	 8700386	       275.3 ns/op	         0 keys/line	   3632410 lines/s	         0 match%	       0 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=80/templates=1-8         	 6010696	       399.9 ns/op	         0.8003 keys/line	   2500553 lines/s	        80.03 match%	      89 B/op	       1 allocs/op
+BenchmarkTemplateExtract/rate=80/templates=5-8         	 2787829	       856.0 ns/op	         2.790 keys/line	   1168287 lines/s	        80.03 match%	     649 B/op	       3 allocs/op
+BenchmarkTemplateExtract/rate=80/templates=20-8        	 1626724	      1470 ns/op	         4.809 keys/line	    680230 lines/s	        80.03 match%	    1178 B/op	       5 allocs/op
+BenchmarkTemplateExtract/rate=80/templates=5never-8    	 7854507	       305.3 ns/op	         0 keys/line	   3275044 lines/s	         0 match%	       0 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=80/templates=20never-8   	 4663356	       519.5 ns/op	         0 keys/line	   1925076 lines/s	         0 match%	       0 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=0-8          	 9396981	       258.7 ns/op	         0 keys/line	   3865101 lines/s	         0 match%	       0 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=1-8          	 8808907	       269.0 ns/op	         0.05200 keys/line	   3718129 lines/s	         5.200 match%	       5 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=5-8          	 7153449	       339.3 ns/op	         0.1780 keys/line	   2947575 lines/s	         5.200 match%	      41 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=20-8         	 5176052	       466.0 ns/op	         0.3147 keys/line	   2146078 lines/s	         5.200 match%	      76 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=5never-8     	 9066104	       265.2 ns/op	         0 keys/line	   3771033 lines/s	         0 match%	       0 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=20never-8    	 5630854	       424.2 ns/op	         0 keys/line	   2357137 lines/s	         0 match%	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/advenn/logd/core/ingest
+cpu: 11th Gen Intel(R) Core(TM) i5-1145G7 @ 2.60GHz
+BenchmarkTemplateExtract/rate=80/templates=0-8         	 8720282	       275.0 ns/op	         0 keys/line	   3636537 lines/s	         0 match%	       0 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=80/templates=1-8         	 6019471	       408.9 ns/op	         0.8003 keys/line	   2445801 lines/s	        80.03 match%	      89 B/op	       1 allocs/op
+BenchmarkTemplateExtract/rate=80/templates=5-8         	 2755424	       855.4 ns/op	         2.790 keys/line	   1169040 lines/s	        80.03 match%	     649 B/op	       3 allocs/op
+BenchmarkTemplateExtract/rate=80/templates=20-8        	 1630611	      1478 ns/op	         4.809 keys/line	    676732 lines/s	        80.03 match%	    1178 B/op	       5 allocs/op
+BenchmarkTemplateExtract/rate=80/templates=5never-8    	 7583692	       306.0 ns/op	         0 keys/line	   3268456 lines/s	         0 match%	       0 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=80/templates=20never-8   	 4669561	       519.9 ns/op	         0 keys/line	   1923605 lines/s	         0 match%	       0 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=0-8          	 9398620	       255.9 ns/op	         0 keys/line	   3907255 lines/s	         0 match%	       0 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=1-8          	 8917243	       268.0 ns/op	         0.05200 keys/line	   3731008 lines/s	         5.200 match%	       5 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=5-8          	 7173052	       335.3 ns/op	         0.1780 keys/line	   2982537 lines/s	         5.200 match%	      41 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=20-8         	 5125851	       464.4 ns/op	         0.3147 keys/line	   2153510 lines/s	         5.200 match%	      76 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=5never-8     	 9062336	       265.0 ns/op	         0 keys/line	   3772908 lines/s	         0 match%	       0 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=20never-8    	 5667706	       426.2 ns/op	         0 keys/line	   2346519 lines/s	         0 match%	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/advenn/logd/core/ingest
+cpu: 11th Gen Intel(R) Core(TM) i5-1145G7 @ 2.60GHz
+BenchmarkTemplateExtract/rate=80/templates=0-8         	 8587105	       275.2 ns/op	         0 keys/line	   3634091 lines/s	         0 match%	       0 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=80/templates=1-8         	 5973175	       403.9 ns/op	         0.8003 keys/line	   2475745 lines/s	        80.03 match%	      89 B/op	       1 allocs/op
+BenchmarkTemplateExtract/rate=80/templates=5-8         	 2813187	       864.3 ns/op	         2.790 keys/line	   1156948 lines/s	        80.03 match%	     649 B/op	       3 allocs/op
+BenchmarkTemplateExtract/rate=80/templates=20-8        	 1620205	      1492 ns/op	         4.809 keys/line	    670324 lines/s	        80.03 match%	    1178 B/op	       5 allocs/op
+BenchmarkTemplateExtract/rate=80/templates=5never-8    	 7787262	       305.7 ns/op	         0 keys/line	   3270831 lines/s	         0 match%	       0 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=80/templates=20never-8   	 4618501	       520.7 ns/op	         0 keys/line	   1920480 lines/s	         0 match%	       0 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=0-8          	 9373354	       256.0 ns/op	         0 keys/line	   3905744 lines/s	         0 match%	       0 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=1-8          	 8888127	       270.1 ns/op	         0.05200 keys/line	   3702251 lines/s	         5.200 match%	       5 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=5-8          	 7136818	       337.0 ns/op	         0.1780 keys/line	   2966974 lines/s	         5.200 match%	      41 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=20-8         	 5148739	       463.0 ns/op	         0.3147 keys/line	   2159661 lines/s	         5.200 match%	      76 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=5never-8     	 8999582	       265.8 ns/op	         0 keys/line	   3762823 lines/s	         0 match%	       0 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=20never-8    	 5627644	       424.9 ns/op	         0 keys/line	   2353633 lines/s	         0 match%	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/advenn/logd/core/ingest
+cpu: 11th Gen Intel(R) Core(TM) i5-1145G7 @ 2.60GHz
+BenchmarkTemplateExtract/rate=80/templates=0-8         	 8772056	       273.9 ns/op	         0 keys/line	   3650848 lines/s	         0 match%	       0 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=80/templates=1-8         	 6041206	       400.0 ns/op	         0.8003 keys/line	   2500140 lines/s	        80.03 match%	      89 B/op	       1 allocs/op
+BenchmarkTemplateExtract/rate=80/templates=5-8         	 2819077	       864.0 ns/op	         2.790 keys/line	   1157360 lines/s	        80.03 match%	     649 B/op	       3 allocs/op
+BenchmarkTemplateExtract/rate=80/templates=20-8        	 1620536	      1470 ns/op	         4.809 keys/line	    680278 lines/s	        80.03 match%	    1178 B/op	       5 allocs/op
+BenchmarkTemplateExtract/rate=80/templates=5never-8    	 7893960	       304.4 ns/op	         0 keys/line	   3284788 lines/s	         0 match%	       0 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=80/templates=20never-8   	 4650116	       517.4 ns/op	         0 keys/line	   1932804 lines/s	         0 match%	       0 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=0-8          	 9416732	       254.5 ns/op	         0 keys/line	   3928549 lines/s	         0 match%	       0 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=1-8          	 8914467	       267.6 ns/op	         0.05200 keys/line	   3737007 lines/s	         5.200 match%	       5 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=5-8          	 7196324	       335.5 ns/op	         0.1780 keys/line	   2980287 lines/s	         5.200 match%	      41 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=20-8         	 5210157	       464.7 ns/op	         0.3147 keys/line	   2151789 lines/s	         5.200 match%	      76 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=5never-8     	 9037147	       264.7 ns/op	         0 keys/line	   3777772 lines/s	         0 match%	       0 B/op	       0 allocs/op
+BenchmarkTemplateExtract/rate=5/templates=20never-8    	 5652780	       424.7 ns/op	         0 keys/line	   2354847 lines/s	         0 match%	       0 B/op	       0 allocs/op
+PASS

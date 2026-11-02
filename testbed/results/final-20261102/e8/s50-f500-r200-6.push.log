@@ -1,0 +1,1 @@
+crashpush: 534 batches, last acknowledged seq 1065, stopped: Post "http://127.0.0.1:47377/loki/api/v1/push": dial tcp 127.0.0.1:47377: connect: connection refused

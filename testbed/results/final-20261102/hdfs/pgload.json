@@ -1,0 +1,36 @@
+[
+  {
+    "variant": "structured",
+    "table": "hdfs_logs",
+    "rows": 2000000,
+    "rows_with_value": 633736,
+    "batches": 2000,
+    "load_sec": 13.434746546,
+    "lines_per_s": 148867.71351823313,
+    "vacuum_analyze_sec": 0.234024935,
+    "wal_bytes": 512724968,
+    "heap_bytes": 378888192,
+    "index_bytes": 65396736,
+    "total_bytes": 444284928,
+    "indexes": {
+      "hdfs_logs_size": 20455424,
+      "hdfs_logs_ts": 44941312
+    }
+  },
+  {
+    "variant": "unstructured",
+    "table": "hdfs_logs_raw",
+    "rows": 2000000,
+    "batches": 2000,
+    "load_sec": 9.080182284,
+    "lines_per_s": 220259.8953904437,
+    "vacuum_analyze_sec": 0.220525353,
+    "wal_bytes": 456688712,
+    "heap_bytes": 372727808,
+    "index_bytes": 44941312,
+    "total_bytes": 417669120,
+    "indexes": {
+      "hdfs_logs_raw_ts": 44941312
+    }
+  }
+]

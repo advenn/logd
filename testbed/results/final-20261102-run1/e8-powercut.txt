@@ -1,0 +1,15 @@
+=== RUN   TestMachineCrashLossApproximation
+
+### E-8 machine-crash approximation (power cut at the last fsync)
+
+median (max) over 10 runs; the cut lands uniformly in [1 s, 2 s) after the first record
+
+| rate (lines/s) | sync_interval_ms | flush_interval_ms | lost: open page only (process crash) | lost: + unsynced pages (machine crash) | machine-crash loss, ms of data | since last fsync, ms |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10000 | 50 | 500 | 32 (45) | 190 (503) | 19.0 (50.3) | 19.0 (50.7) |
+| 10000 | 10 | 50 | 46 (54) | 68 (111) | 6.8 (11.1) | 7.5 (11.4) |
+| 200 | 50 | 500 | 38 (49) | 38 (49) | 192.5 (245.0) | 191.2 (242.4) |
+| 200 | 10 | 50 | 4 (6) | 4 (6) | 17.5 (30.0) | 16.6 (27.8) |
+--- PASS: TestMachineCrashLossApproximation (60.92s)
+PASS
+ok  	github.com/advenn/logd/core/storage	60.930s

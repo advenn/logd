@@ -1,0 +1,36 @@
+[
+  {
+    "variant": "structured",
+    "table": "logs",
+    "rows": 500000,
+    "rows_with_value": 404984,
+    "batches": 500,
+    "load_sec": 4.765915415,
+    "lines_per_s": 104911.63951972907,
+    "vacuum_analyze_sec": 0.095875079,
+    "wal_bytes": 128513944,
+    "heap_bytes": 74588160,
+    "index_bytes": 26411008,
+    "total_bytes": 100999168,
+    "indexes": {
+      "logs_latency": 15155200,
+      "logs_ts": 11255808
+    }
+  },
+  {
+    "variant": "unstructured",
+    "table": "logs_raw",
+    "rows": 500000,
+    "batches": 500,
+    "load_sec": 2.176234332,
+    "lines_per_s": 229754.6696363763,
+    "vacuum_analyze_sec": 0.090199469,
+    "wal_bytes": 94348952,
+    "heap_bytes": 72802304,
+    "index_bytes": 11255808,
+    "total_bytes": 84058112,
+    "indexes": {
+      "logs_raw_ts": 11255808
+    }
+  }
+]
