@@ -79,18 +79,21 @@ func (b *Buffer) AddAll(keys []KeyedValue, offset uint64) {
 	}
 }
 
-// Flush writes one .tidx (at TidxPath) per field that accumulated any entries and
+// Flush writes one .tidx (at TidxPath) per field of the schema, empty or not, and
 // returns the set of fields it actually wrote — that becomes the segment's recorded
 // schema, so the planner only ever expects a .tidx that exists. segBase is the
 // segment's path without its extension (so index files sit next to the segment and are
-// deleted with it — retention = delete the segment's files). Fields with no entries are
-// skipped: a query on them finds no .tidx and scans, which is correct.
+// deleted with it — retention = delete the segment's files).
 func (b *Buffer) Flush(segBase string, segmentID uint64) ([]FieldType, error) {
 	var written []FieldType
 	for field, fe := range b.byField {
-		if len(fe.entries) == 0 {
-			continue
-		}
+		// A field with no entries still gets its (empty) .tidx. Skipping it left the field out
+		// of the segment's schema, so a typed predicate on it found "not indexed here" and
+		// scanned the whole segment — to return nothing, since no record of the segment
+		// yielded a value for it. On the Loghub HDFS replay the last segment of 70,668 lines
+		// held no `size` value at all and was scanned by every size query. Written, the empty
+		// index answers "no candidates" and the segment is pruned; the scan, re-extracting with
+		// the same pattern (the planner checks it is the same), would find none either.
 		path := TidxPath(segBase, field)
 		// WriteTIDX sorts what it is given, in place, and a query may be reading these very
 		// entries through a FieldView taken before the seal (see View). Sorting them under
