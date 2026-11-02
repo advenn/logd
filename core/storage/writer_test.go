@@ -1320,3 +1320,87 @@ func TestRecoverySealsAsScanned(t *testing.T) {
 		t.Fatalf("recovered records: got %d want %d", len(recs), 2*entriesPerPage)
 	}
 }
+
+// TestMissingActiveSegmentDoesNotBlockTheShard: a manifest naming an active segment whose
+// file is gone made NewWriter fail ("recovering active segment: ... no such file"), so the
+// daemon would not start and every SEALED segment of the shard was unavailable too — found by
+// the fault matrix (E-6). The unsealed records are lost either way; the sealed ones must not be.
+func TestMissingActiveSegmentDoesNotBlockTheShard(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{SegmentSizeBytes: 4 * PageSize, FlushInterval: time.Hour, BlockPages: -1}
+	w1, err := NewWriter(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w1.Start(nil); err != nil {
+		t.Fatal(err)
+	}
+	const n = 6 * entriesPerPage // more than one 4-page segment, so at least one seals
+	for i := 0; i < n; i++ {
+		if err := w1.Write(makeEntry(i, 1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for deadline := time.Now().Add(5 * time.Second); len(w1.manifest.All()) < 2; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("no segment sealed")
+		}
+	}
+	w1.stop() // crash: the active segment stays active in the manifest
+
+	pre, err := LoadManifest(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := pre.Active()
+	if active == nil {
+		t.Fatal("precondition: the manifest should still name an active segment")
+	}
+	var sealed int
+	for _, s := range pre.All() {
+		if s.State == SegmentSealed {
+			sealed++
+		}
+	}
+	if sealed == 0 {
+		t.Fatal("precondition: expected at least one sealed segment")
+	}
+	if err := os.Remove(active.Path); err != nil {
+		t.Fatal(err)
+	}
+	var durable []model.LogEntry // what the sealed segments still hold
+	for _, s := range pre.All() {
+		if s.State != SegmentSealed {
+			continue
+		}
+		entries, err := readSegmentEntries(s.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		durable = append(durable, entries...)
+	}
+
+	w2, err := NewWriter(dir, opts)
+	if err != nil {
+		t.Fatalf("the shard did not open: %v", err)
+	}
+	if err := w2.Start(nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := w2.manifest.Get(active.ID); got != nil {
+		t.Fatalf("the missing active segment is still listed: %+v", got)
+	}
+	if err := w2.Write(makeEntry(n, 1)); err != nil {
+		t.Fatalf("writing after recovery: %v", err)
+	}
+	if err := w2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := ReadAll(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(durable)+1 {
+		t.Fatalf("read %d entries after reopening, want the %d sealed ones plus the new one", len(after), len(durable))
+	}
+}

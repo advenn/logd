@@ -208,6 +208,18 @@ func NewWriter(dir string, opts Options) (*Writer, error) {
 
 	w.lockFile = lockFile
 
+	if active := manifest.Active(); active != nil && !activeSegmentExists(active) {
+		// The manifest names an active segment whose file is gone (deleted by hand, lost with
+		// a disk, or never created: a crash between saving the manifest and creating the
+		// file). Its unsealed records are lost whatever happens next. Refusing to open the
+		// shard would add an outage of all its SEALED data to that loss, so the entry is
+		// dropped, loudly, and Start creates a fresh active segment as on a first run.
+		log.Printf("storage: active segment %s is listed in the manifest but %s does not exist; its unsealed records are lost, starting a new active segment", active.ID, active.Path)
+		manifest.Remove(active.ID)
+		if err := manifest.Save(dir); err != nil {
+			return nil, fmt.Errorf("dropping the missing active segment from the manifest: %w", err)
+		}
+	}
 	if active := manifest.Active(); active != nil {
 		if err := w.recoverActiveSegment(active); err != nil {
 			return nil, fmt.Errorf("recovering active segment: %w", err)
@@ -226,6 +238,14 @@ func NewWriter(dir string, opts Options) (*Writer, error) {
 	}
 	ok = true
 	return w, nil
+}
+
+// activeSegmentExists reports whether the active segment's file is there to recover. Only a
+// missing file counts as absent: any other failure to stat it (permissions, I/O) is left for
+// recoverActiveSegment to report, because that data may still be readable once fixed.
+func activeSegmentExists(meta *SegmentMeta) bool {
+	_, err := os.Stat(meta.Path)
+	return !os.IsNotExist(err)
 }
 
 // recoverActiveSegment reopens the active segment (repairing a torn tail), publishes
