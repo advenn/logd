@@ -1,6 +1,7 @@
 package query_test
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"testing"
@@ -163,8 +164,8 @@ func TestMetricStepCapRejected(t *testing.T) {
 	}{{"eu", 5, 1}})
 	// 100000s range at a 1ns step → ~1e14 steps, far over the cap.
 	_, err := e.ExecuteMetric(qr.MetricQuery{Range: int64(time.Second), RangeOp: qr.RangeCount, Start: nanoAt(0), End: nanoAt(100000), Step: 1})
-	if err == nil {
-		t.Fatal("expected a step-cap error for an over-fine resolution")
+	if !errors.Is(err, qr.ErrTooManySteps) {
+		t.Fatalf("over-fine resolution: err = %v, want ErrTooManySteps", err)
 	}
 }
 

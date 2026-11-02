@@ -8,6 +8,7 @@
 package query
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"regexp"
@@ -25,6 +26,21 @@ type Direction uint8
 const (
 	Backward Direction = 0
 	Forward  Direction = 1
+)
+
+// Errors a query causes by itself, as opposed to a failure reading the data. Every error
+// the engine returns for one of these matches its sentinel with errors.Is, so a server can
+// answer it as the client's mistake: compat/loki replies 400 where it would otherwise
+// reply 500, as Loki does for a query over its resolution limit.
+var (
+	// ErrInvalidPredicate: a predicate the strict native API cannot answer (design §9.3),
+	// rejected at plan time by every entry point. See validatePreds.
+	ErrInvalidPredicate = errors.New("query: invalid predicate")
+	// ErrTooManySteps: a metric query whose range and step make more than maxMetricSteps
+	// points.
+	ErrTooManySteps = errors.New("query resolution too fine")
+	// ErrTooManyEntries: a metric query matching more than maxMetricEntries entries.
+	ErrTooManyEntries = errors.New("metric query matched too many entries")
 )
 
 // Query is a native query: a time window, predicates (ANDed), a limit, and a direction.
@@ -199,7 +215,8 @@ func (p TypedCompare) Match(e model.LogEntry, r Resolver) bool {
 }
 
 // validatePreds is the plan-time check of the native API, which is strict (design §9.3):
-// a predicate it cannot answer is an error, not an empty or arbitrary result.
+// a predicate it cannot answer is an error, not an empty or arbitrary result. Every error it
+// returns matches ErrInvalidPredicate.
 //
 // A non-finite float bound is such a predicate. Extraction never produces NaN or ±Inf (they
 // are extraction failures, §7.2), and NaN has no place in the numeric order at all, so
@@ -220,7 +237,7 @@ func validatePreds(preds []Predicate) error {
 			continue
 		}
 		if f := tc.Value.Float; math.IsNaN(f) || math.IsInf(f, 0) {
-			return fmt.Errorf("query: field %q: %v is not a finite number", tc.Field, f)
+			return fmt.Errorf("%w: field %q: %v is not a finite number", ErrInvalidPredicate, tc.Field, f)
 		}
 	}
 	return nil

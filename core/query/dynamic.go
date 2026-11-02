@@ -89,11 +89,11 @@ func (p DynamicCompare) Match(e model.LogEntry, r Resolver) bool {
 // validate is DynamicCompare's part of validatePreds: a query it cannot answer is an error.
 func (p DynamicCompare) validate() error {
 	if p.Extract == nil {
-		return fmt.Errorf("query: dynamic comparison on %q has no extractor", p.Name)
+		return fmt.Errorf("%w: dynamic comparison on %q has no extractor", ErrInvalidPredicate, p.Name)
 	}
 	if p.Re != nil {
 		if p.Op != OpEq && p.Op != OpNe {
-			return fmt.Errorf("query: a regex on %q takes = or !=", p.Name)
+			return fmt.Errorf("%w: a regex on %q takes = or !=", ErrInvalidPredicate, p.Name)
 		}
 		return nil
 	}
@@ -102,7 +102,7 @@ func (p DynamicCompare) validate() error {
 		// meaningful place in the order (see validatePreds): both are malformed queries.
 		f, err := strconv.ParseFloat(p.Value, 64)
 		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
-			return fmt.Errorf("query: %q compared with %q, which is not a finite number", p.Name, p.Value)
+			return fmt.Errorf("%w: %q compared with %q, which is not a finite number", ErrInvalidPredicate, p.Name, p.Value)
 		}
 	}
 	return nil

@@ -1,6 +1,7 @@
 package query_test
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -264,14 +265,14 @@ func TestNonFiniteFloatBoundRejected(t *testing.T) {
 				qr.TypedCompare{Field: "lat_s", Op: op, Value: floatV(bound)},
 			}
 			q := qr.Query{Start: ts(0), End: ts(1000), Preds: preds}
-			if _, err := e.Execute(q); err == nil {
-				t.Errorf("Execute accepted lat_s op=%d %v", op, bound)
+			if _, err := e.Execute(q); !errors.Is(err, qr.ErrInvalidPredicate) {
+				t.Errorf("Execute lat_s op=%d %v: err = %v, want ErrInvalidPredicate", op, bound, err)
 			}
-			if _, err := e.ExecuteScan(q); err == nil {
-				t.Errorf("ExecuteScan accepted lat_s op=%d %v", op, bound)
+			if _, err := e.ExecuteScan(q); !errors.Is(err, qr.ErrInvalidPredicate) {
+				t.Errorf("ExecuteScan lat_s op=%d %v: err = %v, want ErrInvalidPredicate", op, bound, err)
 			}
-			if _, err := e.ExecuteMetric(qr.MetricQuery{Preds: preds, RangeOp: qr.RangeCount, Range: int64(time.Minute), Start: ts(0), End: ts(300), Step: int64(time.Minute)}); err == nil {
-				t.Errorf("ExecuteMetric accepted lat_s op=%d %v", op, bound)
+			if _, err := e.ExecuteMetric(qr.MetricQuery{Preds: preds, RangeOp: qr.RangeCount, Range: int64(time.Minute), Start: ts(0), End: ts(300), Step: int64(time.Minute)}); !errors.Is(err, qr.ErrInvalidPredicate) {
+				t.Errorf("ExecuteMetric lat_s op=%d %v: err = %v, want ErrInvalidPredicate", op, bound, err)
 			}
 		}
 	}

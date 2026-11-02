@@ -152,6 +152,38 @@ func TestBadQueryParamsRejected(t *testing.T) {
 	}
 }
 
+// A query the engine refuses because of the query itself is the client's mistake, answered
+// 400 as Loki answers a query over its resolution limit: a metric query over the step cap,
+// and a comparison with a non-finite bound, which the native API rejects at plan time
+// (design §9.3). All of these were 500. A log query's limit over the maximum is refused
+// before it reaches the engine, and was already 400 (TestBadQueryParamsRejected).
+func TestQueryRefusedForTheQueryIs400(t *testing.T) {
+	h := pushAt(t, 1)
+	window := "&start=" + ns(0) + "&end=" + ns(10)
+	for _, target := range []string{
+		// Two days at a 1 s step is 172,801 points, over the 11,000 cap.
+		"/loki/api/v1/query_range?query=" + urlEncode(`count_over_time({region="eu"}[1m])`) + "&start=" + ns(0) + "&end=" + ns(2*86400) + "&step=1",
+		"/loki/api/v1/query_range?query=" + urlEncode(`{region="eu"} | logfmt | x > "NaN"`) + window,
+		"/logd/api/v1/query_scan?query=" + urlEncode(`{region="eu"} | logfmt | x > "Inf"`) + window,
+		"/loki/api/v1/query_range?query=" + urlEncode(`rate({region="eu"} | logfmt | x <= "-Inf" [1m])`) + window,
+		"/loki/api/v1/query?query=" + urlEncode(`{region="eu"} | logfmt | x >= "NaN"`) + "&time=" + ns(10),
+		"/loki/api/v1/query?query=" + urlEncode(`count_over_time({region="eu"} | logfmt | x < "NaN" [1m])`) + "&time=" + ns(10),
+	} {
+		if rr := do(t, h, "GET", target, "", ""); rr.Code != http.StatusBadRequest {
+			t.Errorf("GET %s: got %d %s, want 400", target, rr.Code, rr.Body.String())
+		}
+	}
+	// Under the cap, and with a finite bound, the same queries are answered.
+	for _, target := range []string{
+		"/loki/api/v1/query_range?query=" + urlEncode(`count_over_time({region="eu"}[1m])`) + "&start=" + ns(0) + "&end=" + ns(10000) + "&step=1",
+		"/loki/api/v1/query_range?query=" + urlEncode(`{region="eu"} | logfmt | x > "1.5"`) + window,
+	} {
+		if rr := do(t, h, "GET", target, "", ""); rr.Code != http.StatusOK {
+			t.Errorf("GET %s: got %d %s, want 200", target, rr.Code, rr.Body.String())
+		}
+	}
+}
+
 // Without a step, a metric query takes Loki's default resolution, max(1s, range/250)
 // truncated to whole seconds, instead of a fixed 15s.
 func TestMetricDefaultStepMatchesLoki(t *testing.T) {

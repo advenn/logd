@@ -2,9 +2,9 @@ package query
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime"
-	"strings"
 	"testing"
 	"time"
 
@@ -50,8 +50,8 @@ func TestMetricEntryCapStopsCollection(t *testing.T) {
 	defer func(old int) { maxMetricEntries = old }(maxMetricEntries)
 	maxMetricEntries = 100
 	refused, err := run()
-	if err == nil || !strings.Contains(err.Error(), "too many entries") {
-		t.Fatalf("over the cap: err = %v, want a too-many-entries error", err)
+	if !errors.Is(err, ErrTooManyEntries) {
+		t.Fatalf("over the cap: err = %v, want ErrTooManyEntries", err)
 	}
 	if refused > full/10 {
 		t.Fatalf("refusing at %d entries allocated %d KB; evaluating all %d allocated %d KB", maxMetricEntries, refused>>10, n, full>>10)

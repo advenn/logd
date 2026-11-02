@@ -177,7 +177,7 @@ func (s *Server) queryRangeWith(w http.ResponseWriter, r *http.Request, exec fun
 		}
 		results, err := exec(q)
 		if err != nil {
-			s.writeError(w, http.StatusInternalServerError, err.Error())
+			s.writeError(w, queryErrorStatus(err), err.Error())
 			return
 		}
 		writeJSON(w, newQueryRangeResponse(s.streamsFor(results, tr)))
@@ -189,7 +189,7 @@ func (s *Server) queryRangeWith(w http.ResponseWriter, r *http.Request, exec fun
 		}
 		series, err := s.qe.ExecuteMetric(mq)
 		if err != nil {
-			s.writeError(w, http.StatusInternalServerError, err.Error())
+			s.writeError(w, queryErrorStatus(err), err.Error())
 			return
 		}
 		writeJSON(w, newMatrixResponse(s.hideTenant(series)))
@@ -198,6 +198,19 @@ func (s *Server) queryRangeWith(w http.ResponseWriter, r *http.Request, exec fun
 		// empty body — which reads to a client as "no data" rather than "unsupported".
 		s.writeError(w, http.StatusBadRequest, "unsupported query expression")
 	}
+}
+
+// queryErrorStatus is the HTTP status for an error the query engine returned. An error the
+// query itself caused is the client's: a metric query over the resolution or matched-entry
+// cap (Loki answers "exceeded maximum resolution" with 400 too), or a predicate the native
+// API rejects at plan time, such as a dynamic comparison with a non-finite bound. Anything
+// else is a failure reading the data, and the server's.
+func queryErrorStatus(err error) int {
+	if errors.Is(err, query.ErrTooManySteps) || errors.Is(err, query.ErrTooManyEntries) ||
+		errors.Is(err, query.ErrInvalidPredicate) {
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
 }
 
 // healthCheckExpr is the instant query Grafana's Loki datasource sends from "Save & test"
@@ -230,7 +243,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		}
 		results, err := s.qe.Execute(q)
 		if err != nil {
-			s.writeError(w, http.StatusInternalServerError, err.Error())
+			s.writeError(w, queryErrorStatus(err), err.Error())
 			return
 		}
 		writeJSON(w, newQueryRangeResponse(s.streamsFor(results, tr)))
@@ -248,7 +261,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		mq.Start, mq.End = at.UnixNano(), at.UnixNano() // instant: single step
 		series, err := s.qe.ExecuteMetric(mq)
 		if err != nil {
-			s.writeError(w, http.StatusInternalServerError, err.Error())
+			s.writeError(w, queryErrorStatus(err), err.Error())
 			return
 		}
 		writeJSON(w, newVectorFromMatrix(s.hideTenant(series)))

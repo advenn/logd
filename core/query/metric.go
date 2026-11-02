@@ -123,7 +123,7 @@ func (e *Engine) ExecuteMetric(q MetricQuery) ([]MatrixSeries, error) {
 	// MinInt64..MaxInt64), and the wrapped value slipped past this guard.
 	n := (uint64(q.End)-uint64(q.Start))/uint64(step) + 1
 	if n > maxMetricSteps {
-		return nil, fmt.Errorf("query resolution too fine: %d steps exceeds the max of %d — widen the step or narrow the range", n, maxMetricSteps)
+		return nil, fmt.Errorf("%w: %d steps exceeds the max of %d — widen the step or narrow the range", ErrTooManySteps, n, maxMetricSteps)
 	}
 
 	// Gather entries that could fall in any window ([Start-Range, End]) PER SHARD, so each
@@ -135,7 +135,7 @@ func (e *Engine) ExecuteMetric(q MetricQuery) ([]MatrixSeries, error) {
 			return nil, err
 		}
 		if acc.done() {
-			return nil, fmt.Errorf("metric query matched too many entries (more than %d) — narrow the time range or add filters", maxMetricEntries)
+			return nil, fmt.Errorf("%w (more than %d) — narrow the time range or add filters", ErrTooManyEntries, maxMetricEntries)
 		}
 	}
 	streams := acc.streams

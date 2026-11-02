@@ -1,6 +1,7 @@
 package query_test
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"regexp"
@@ -81,11 +82,11 @@ func TestDynamicCompareValidated(t *testing.T) {
 		{Name: "x", Extract: waited, Op: qr.OpGt, Re: regexp.MustCompile("x")},
 	} {
 		q := qr.Query{Start: ts(0), End: ts(100), Preds: []qr.Predicate{p}}
-		if _, err := e.Execute(q); err == nil {
-			t.Errorf("Execute accepted %+v", p)
+		if _, err := e.Execute(q); !errors.Is(err, qr.ErrInvalidPredicate) {
+			t.Errorf("Execute %+v: err = %v, want ErrInvalidPredicate", p, err)
 		}
-		if _, err := e.ExecuteMetric(qr.MetricQuery{Preds: q.Preds, Start: ts(0), End: ts(10), Step: 1e9, Range: 1e9}); err == nil {
-			t.Errorf("ExecuteMetric accepted %+v", p)
+		if _, err := e.ExecuteMetric(qr.MetricQuery{Preds: q.Preds, Start: ts(0), End: ts(10), Step: 1e9, Range: 1e9}); !errors.Is(err, qr.ErrInvalidPredicate) {
+			t.Errorf("ExecuteMetric %+v: err = %v, want ErrInvalidPredicate", p, err)
 		}
 	}
 }
