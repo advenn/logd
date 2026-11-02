@@ -14,6 +14,7 @@ make explain     # which access path did logd choose?
 make compare     # logd's index path vs its own forced scan
 make bench       # interleaved latency across logd, Loki and VictoriaLogs
 make hdfs        # the Loghub HDFS replay, end to end (destructive: fresh volumes)
+./scripts/final-run.sh   # the whole final evaluation, every engine (see "Final evaluation")
 open http://localhost:3000    # Explore → switch datasource → same query, three engines
 ```
 
@@ -515,9 +516,63 @@ unstructured — returned the manifest's count, and at `< 3535000` the exact (ts
 Ingest during that run (2,000 requests of 1,000 lines, concurrent fan-out, zero retries, one run on
 a loaded box): VictoriaLogs 12.6 s (159k lines/s), Loki 17.9 s (112k), logd 18.8 s (106k).
 
-bench-vs.sh's queries are written for the synthetic corpus's field (`latency_ms`, `took=`; only
-`APP` and `THRESHOLD` are variables), so an HDFS sweep needs the queries above, with
+`DATASET=hdfs ./scripts/bench-vs.sh` times exactly these forms (predicate `size_bytes < T`, the
+two-stage Loki pattern and both VictoriaLogs forms), with
 `eval "$(./scripts/window.sh <manifest> env)"` for the window.
+
+---
+
+## Final evaluation: `scripts/final-run.sh`
+
+One script runs the whole protocol and writes one results directory, so every engine is
+measured in the same session on the same machine, and drift lands on all of them alike:
+
+```sh
+./scripts/build-v1.sh            # once: builds logd:thesis-eval-1 in a temporary worktree
+./scripts/final-run.sh           # all phases, into results/final-<timestamp>
+PHASES="sweep-live sweep-sealed" ./scripts/final-run.sh results/<existing-run>   # rerun phases
+```
+
+**Engines.** This checkout's logd (:7100); the `thesis-eval-1` logd (:7101), from the
+`docker-compose.v1.yml` overlay; Loki 3.7.7 (:3100); VictoriaLogs v1.52.0 (:9428); and
+PostgreSQL 17 through pgshim (:7300), both the generated-column + B-tree variant and the
+extraction-in-WHERE variant. The overlay runs the older daemon next to the current one on
+the same config file, with the same pushes, page cache and neighbours, so "what the fixes
+and features changed" is measured in one interleaved run, not inferred from two sessions.
+Its YAML loader ignores keys it does not know, so options added after the tag are inert for
+it. Compose does not build the overlay's image: run `scripts/build-v1.sh` first, which builds it
+from the tag in a temporary worktree and never switches your checkout.
+
+**Phases**, in this order; `PHASES` selects a subset:
+
+| phase | what it does |
+|---|---|
+| `env` | host, kernel, CPU governor, docker, image digests, git commit, load average |
+| `ingest` | `RUNS` (default 5) fresh-volume runs: the 500k app corpus pushed closed-loop to both logds, Loki and VictoriaLogs, and COPYed into PostgreSQL; accept time, lines/s and cgroup peak memory per engine. The last run's stack stays up |
+| `sweep-live` | warm latency sweep at `latency_ms >` 200/1000/3000/5000 on the layout as loaded, logd's last segment still active; `SAMPLES` (default 60) interleaved samples per cell after 5 warm-ups |
+| `disk` | volume sizes after flushing every engine (Loki `/flush`, VictoriaLogs `force_flush`, a logd restart, which seals) |
+| `sweep-sealed` | the same sweep with logd's active segment sealed |
+| `cold` | `COLD_ROUNDS` (default 5) rounds of restarting every engine, then one sample each |
+| `hdfs` | the Loghub HDFS replay (`hdfs-run.sh`, sealed), then a sweep over its four thresholds (`HDFS_SAMPLES`, default 20); current logd only, not v1 |
+| `inproc` | stack down, then the in-process experiments: RQ3 template sweep, cost-guard sweep, fault matrix, kill -9 loss (E-8) and the power-cut approximation |
+
+Every sweep cell goes through bench-vs.sh's gate: no sample is recorded unless every engine
+returned the same result set. The load average is logged as each phase starts (`phases.log`)
+and at the start and end of each sweep, so a noisy run is visible in its own output.
+
+**Before you start.**
+
+- Expect about two hours for all phases. Close every other workload first: everything here
+  is a timing, and the script can record the load average but not lower it.
+- The host needs Go, Docker, `python3`, `curl` and `bc`. The in-process phase writes to
+  `LOGD_BENCH_DIR` (default `~/.cache/logd-bench`), which must be a real disk:
+  `rq3-templates.sh` refuses tmpfs, where fsync is free.
+- The `hdfs` phase needs `~/.cache/logd-datasets/HDFS.log` (Loghub HDFS_v1; `DATASET=<path>`
+  overrides it, as for hdfs-run.sh). Without it hdfs-run.sh exits and stops the script, so
+  fetch it or leave `hdfs` out of `PHASES`.
+- `ingest`, `hdfs` and `inproc` start with `docker compose down -v`, which deletes this
+  project's volumes. A rerun relies on what earlier phases left: every phase after `ingest`
+  reads its window from `corpus/app-500000.jsonl`, and the sweeps need the stack it left up.
 
 ---
 
@@ -597,6 +652,7 @@ scan, and the daemon reports nothing wrong. `candidates: 0` is how you see it.
 
 ```
 docker-compose.yml            logd + Loki + VictoriaLogs + PostgreSQL + pgshim + Grafana (+ alloy)
+docker-compose.v1.yml         overlay: the thesis-eval-1 logd on :7101, beside the current one
 Makefile                      up / load / pg-load / gate / hdfs / explain / compare / ...
 stack/logd/logd.yaml          templates + label allowlist for the synthetic corpus
 stack/logd/logd-hdfs.yaml     the same for the HDFS replay (LOGD_CONFIG selects it)
@@ -607,6 +663,7 @@ stack/grafana/provisioning/   the three log-store datasources
 cmd/loggen/                   corpus generator, replay mode, multi-target Loki push driver
 cmd/pgload/                   manifest -> PostgreSQL via COPY, with load time and sizes
 cmd/pgshim/                   PostgreSQL behind a Loki-shaped query_range endpoint
+cmd/crashpush/                E-8's sequence-numbered push driver and its verifier
 internal/loggen/              ported generator; corpus.go, replay.go and push.go are new
 internal/pgdata/              PostgreSQL tables, extraction expressions, predicate parser
 scripts/bench-vs.sh           interleaved A/B latency across all engines
@@ -616,6 +673,11 @@ scripts/gate.py               every engine vs the manifest's ground truth; the e
 scripts/hdfs-run.sh           the HDFS replay end to end
 scripts/pg-load.sh            load a manifest into PostgreSQL
 scripts/window.sh             derives the query window from a manifest
+scripts/final-run.sh          the whole final evaluation, every engine, one results directory
+scripts/build-v1.sh           builds logd:<tag> (default thesis-eval-1) in a temporary worktree
+scripts/protocol-*.sh         the protocol's phases one at a time (ingest, sweep, cold)
+scripts/rq3-templates.sh      E-4: extraction and indexing cost per template count (in-process)
+scripts/e8-crashloss.sh       E-8: acknowledged lines a kill -9 loses
 ```
 
 ## Operational notes
