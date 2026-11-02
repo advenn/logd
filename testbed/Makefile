@@ -11,7 +11,9 @@
 #   make down        tear everything down
 
 COMPOSE  ?= docker compose
-COUNT    ?= 200000
+# 500,000 lines, the corpus the protocol-*.sh scripts and final-run.sh push and read back
+# (corpus/app-500000.jsonl), so `make load` produces the manifest they expect.
+COUNT    ?= 500000
 SEED     ?= 1001
 CORPUS   ?= corpus/app-$(COUNT).jsonl
 # "auto" ends the corpus just before now. A corpus dated in the distant past is silently
@@ -82,8 +84,9 @@ gate:
 hdfs:
 	@./scripts/hdfs-run.sh
 
-# Show logd's chosen access path. "mode":"index" on sealed segments is the differentiator
-# working; the active (unsealed) segment always scans by design.
+# Show logd's chosen access path. "mode":"index" is the differentiator working: on sealed
+# segments from their .tidx/.lidx, on the active (unsealed) segment from the writer's
+# in-memory index (reason indexed_in_memory).
 explain:
 	@./scripts/window.sh $(CORPUS) explain
 
@@ -96,7 +99,7 @@ compare:
 # Interleaved A/B latency across every engine. Interleaved rather than sequential so drift
 # over the run (cache warming, a neighbouring container waking up) lands on all engines
 # equally instead of on whichever one happened to go last. Aborts unless every engine
-# returned the same non-zero row count.
+# returned the same non-empty result set.
 bench:
 	@win=$$(./scripts/window.sh $(CORPUS) env) || exit 1; eval "$$win"; ./scripts/bench-vs.sh
 

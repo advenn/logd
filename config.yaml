@@ -27,6 +27,7 @@ multitenancy: false   # when true, tag+isolate data by the X-Scope-OrgID header 
 
 # Typed extraction: {name:type} captures become queryable fields "<template>_<capture>",
 # indexed for O(log n) range queries. In LogQL: {app="api"} | latency_ms > 200
+# An example only: the testbed emits took=247ms, which this pattern never matches; its config is in testbed/stack/logd/.
 index:
   literals:
     - "panic:"

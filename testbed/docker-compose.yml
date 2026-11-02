@@ -69,7 +69,7 @@ services:
     command:
       - "-storageDataPath=/vlogs"
       - "-httpListenAddr=:9428"
-      - "-retentionPeriod=100y"     # the corpus is dated 2026-01-01; do not expire it
+      - "-retentionPeriod=100y"     # a corpus may carry old timestamps (-base-ts=<RFC3339>); do not expire it
       - "-futureRetention=100y"
       - "-inmemoryDataFlushInterval=1s"
       - "-loggerLevel=WARN"

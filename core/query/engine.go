@@ -103,9 +103,9 @@ func NewShardedEngine(shards []Shard, ex *extract.Engine, labelKeys []string) *E
 	return &Engine{shards: shards, ex: ex, labelKeys: set, cache: newReaderCache(defaultIndexCacheBytes)}
 }
 
-// Labels returns the distinct allowlisted label keys present across sealed segments,
-// sorted. (Active-segment labels appear after seal — acceptable eventual consistency for
-// discovery.)
+// Labels returns the distinct allowlisted label keys present across the active and sealed
+// segments of all shards, sorted: the active segments' live streams and every sealed
+// segment's .lidx.
 func (e *Engine) Labels() []string {
 	seen := map[string]struct{}{}
 	// Read the ACTIVE segments first, THEN the sealed .lidx files. If a rotate seals an
