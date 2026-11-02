@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""Summarise a final-run.sh results directory into markdown tables (summary.md).
+
+Every number is recomputed from the raw per-sample CSVs the run kept, so the tables can be
+rebuilt, and plots drawn, without re-measuring. Percentiles use the nearest rank,
+ceil(p/100 * n), the same as bench-vs.sh after H-01; with n = 60 the p99 is the worst sample.
+
+    ./scripts/final-summary.py results/final-20261102 > results/final-20261102/summary.md
+"""
+import csv, glob, math, os, re, statistics, sys
+from collections import defaultdict
+
+R = sys.argv[1]
+
+def pct(v, p):
+    v = sorted(v)
+    return v[max(0, math.ceil(p / 100 * len(v)) - 1)]
+
+def load_samples(d):
+    """{threshold: {engine-slug: [ms...]}} from samples-*/t<T>_<slug>.csv"""
+    out = defaultdict(dict)
+    for f in glob.glob(os.path.join(R, d, "t*_*.csv")):
+        m = re.match(r"t(\d+)_(.*)\.csv$", os.path.basename(f))
+        t, slug = int(m.group(1)), m.group(2)
+        with open(f) as fh:
+            out[t][slug] = [float(x) for x in fh.read().split()[1:] if x.strip()]
+    return out
+
+# Display names and order. bench-vs.sh files each engine's samples under slug(label): every
+# byte outside [A-Za-z0-9] of the label plus echo's newline becomes '_', so the slug is
+# computed from the label here rather than written out by hand.
+LABELS = [
+    ("logd (typed index)", "logd (index)"),
+    ("logd (forced scan)", "logd (forced scan)"),
+    ("logd v1 (typed index)", "logd v1 (index)"),
+    ("logd (Loki | pattern text)", "logd, Loki `| pattern` text"),
+    ("logd (Loki | regexp text)", "logd, Loki `| regexp` text"),
+    ("Loki (| pattern)", "Loki `| pattern`"),
+    ("Loki (| regexp)", "Loki `| regexp`"),
+    ("Loki (2× | pattern)", "Loki 2× `| pattern`"),
+    ("VictoriaLogs (extract)", "VictoriaLogs `extract`"),
+    ("VictoriaLogs (extract_regexp)", "VictoriaLogs `extract_regexp`"),
+    ("PostgreSQL (generated col + B-tree)", "PostgreSQL (generated column + B-tree)"),
+    ("PostgreSQL (extract in WHERE)", "PostgreSQL (extract in WHERE)"),
+]
+
+def slug(label):
+    # tr -c works on bytes: a multi-byte character such as × becomes one '_' per byte.
+    return re.sub(rb"[^a-zA-Z0-9]", b"_", (label + "\n").encode()).decode()
+
+SLUGS = [(slug(l), n) for l, n in LABELS]
+
+def name_of(s):
+    for k, n in SLUGS:
+        if s == k:
+            return n
+    return s
+
+def order_key(s):
+    for i, (k, _) in enumerate(SLUGS):
+        if s == k:
+            return i
+    return 99
+
+def rows_for(sweepfile):
+    """threshold -> row count, from the gate lines of a sweep log."""
+    rows, t = {}, None
+    for line in open(os.path.join(R, sweepfile)):
+        m = re.match(r"=+ (?:threshold|size_bytes <) (\d+)", line)
+        if m:
+            t = int(m.group(1))
+        m = re.match(r"\s+logd \(typed index\)\s+(\d+) rows", line)
+        if m and t is not None and t not in rows:
+            rows[t] = int(m.group(1))
+    return rows
+
+def sweep_tables(title, d, sweepfile, total_lines, op):
+    data = load_samples(d)
+    if not data:
+        return
+    rows = rows_for(sweepfile)
+    ts = sorted(data, reverse=(op == ">")) if op == ">" else sorted(data, reverse=True)
+    ts = sorted(data) if op == ">" else sorted(data, reverse=True)
+    slugs = sorted({s for t in data for s in data[t]}, key=order_key)
+    print(f"\n### {title}: median latency, ms (n per cell in brackets)\n")
+    print("| engine | " + " | ".join(f"{op} {t:,}<br>{rows.get(t, 0):,} rows ({100 * rows.get(t, 0) / total_lines:.3g}%)" for t in ts) + " |")
+    print("| --- |" + " ---: |" * len(ts))
+    for s in slugs:
+        cells = []
+        for t in ts:
+            v = data[t].get(s)
+            cells.append(f"{statistics.median(v):.1f} ({len(v)})" if v else "–")
+        print(f"| {name_of(s)} | " + " | ".join(cells) + " |")
+    print(f"\n### {title}: p95 / p99 / min–max, ms\n")
+    print("| engine | " + " | ".join(f"{op} {t:,}" for t in ts) + " |")
+    print("| --- |" + " --- |" * len(ts))
+    for s in slugs:
+        cells = []
+        for t in ts:
+            v = data[t].get(s)
+            cells.append(f"{pct(v, 95):.1f} / {pct(v, 99):.1f} / {min(v):.1f}–{max(v):.1f}" if v else "–")
+        print(f"| {name_of(s)} | " + " | ".join(cells) + " |")
+    base = slug("logd (typed index)")
+    if any(base in data[t] for t in ts):
+        print(f"\n### {title}: ratio of each engine's median to logd (index); > 1 means logd is faster\n")
+        print("| engine | " + " | ".join(f"{op} {t:,}" for t in ts) + " |")
+        print("| --- |" + " ---: |" * len(ts))
+        for s in slugs:
+            if s == base:
+                continue
+            cells = []
+            for t in ts:
+                v, b = data[t].get(s), data[t].get(base)
+                cells.append(f"{statistics.median(v) / statistics.median(b):.2f}×" if v and b else "–")
+            print(f"| {name_of(s)} | " + " | ".join(cells) + " |")
+
+print(f"# Final evaluation summary: `{os.path.basename(R.rstrip('/'))}`\n")
+print("Generated by `scripts/final-summary.py` from the raw samples; see `env.txt` for the commit, host and images,")
+print("`phases.log` for the load average per phase and `contention.log` for competing processes during the run.")
+
+# Ingest
+ing = list(csv.DictReader(open(os.path.join(R, "ingest.csv"))))
+by = defaultdict(list)
+for r in ing:
+    by[r["engine"]].append(r)
+print("\n## Ingest: 500,000 lines, fresh volumes, median of runs (min–max)\n")
+print("| engine | accept s | lines/s | peak memory MB | retries |")
+print("| --- | ---: | ---: | ---: | ---: |")
+for e, rs in sorted(by.items(), key=lambda kv: -statistics.median(float(r["lines_per_s"]) for r in kv[1])):
+    a = [float(r["accept_sec"]) for r in rs]
+    l = [float(r["lines_per_s"]) for r in rs]
+    pk = [int(r["peak_mb"]) for r in rs if r["peak_mb"]]
+    ret = sum(int(r["retries"] or 0) for r in rs)
+    pks = f"{statistics.median(pk):.0f}" if pk else "–"
+    print(f"| {e} | {statistics.median(a):.2f} ({min(a):.2f}–{max(a):.2f}) | {statistics.median(l):,.0f} | {pks} | {ret} |")
+print("\nPostgreSQL rows are COPY loads of the same manifest (no push protocol), with the generated column computed at insert for `structured`.")
+
+sweep_tables("App corpus, layout as loaded (logd's last segment active)", "samples-app-live", "sweep-app-live.txt", 500000, ">")
+sweep_tables("App corpus, all logd segments sealed", "samples-app-sealed", "sweep-app-sealed.txt", 500000, ">")
+sweep_tables("Loghub HDFS, 2,000,000 lines, sealed", "samples-hdfs-sealed", "sweep-hdfs-sealed.txt", 2000000, "<")
+
+# Disk
+def disk(path, title):
+    if not os.path.exists(path):
+        return
+    print(f"\n## {title}\n")
+    print("| volume | MB |")
+    print("| --- | ---: |")
+    for r in csv.DictReader(open(path)):
+        print(f"| {r['volume']} | {int(r['bytes']) / 1e6:.1f} |")
+disk(os.path.join(R, "disk.csv"), "Disk after flushing every engine (app corpus; whole docker volume)")
+pgj = sorted(glob.glob(os.path.join(R, "pgload-run*.json")))
+if pgj:
+    import json
+    print("\nPostgreSQL relation sizes (last load; the volume above also holds the WAL and both variants):\n")
+    print("| variant | heap MB | indexes MB | total MB | WAL written MB |")
+    print("| --- | ---: | ---: | ---: | ---: |")
+    for v in json.load(open(pgj[-1])):
+        print(f"| {v['variant']} | {v['heap_bytes'] / 1e6:.1f} | {v['index_bytes'] / 1e6:.1f} | {v['total_bytes'] / 1e6:.1f} | {v['wal_bytes'] / 1e6:.1f} |")
+disk(os.path.join(R, "hdfs", "disk.csv"), "Disk, HDFS 2M lines (whole docker volume)")
+
+# Memory
+mem = list(csv.reader(open(os.path.join(R, "memory.csv"))))
+print("\n## Memory (cgroup memory.peak / memory.current, MB) at the end of each phase\n")
+print("| phase | container | peak | current |")
+print("| --- | --- | ---: | ---: |")
+for ph, c, pk, cur in mem:
+    if ph.startswith("ingest-run") and ph != "ingest-run5":
+        continue
+    print(f"| {ph} | {c} | {pk} | {cur} |")
+
+# Cold
+cold = list(csv.DictReader(open(os.path.join(R, "cold.csv"))))
+cb = defaultdict(list)
+for r in cold:
+    cb[(int(r["threshold"]), r["engine"])].append(float(r["ms"]))
+print("\n## Cold process caches: restart every engine, then one sample each (median of rounds, ms)\n")
+print("| threshold | engine | median | min–max | n |")
+print("| ---: | --- | ---: | --- | ---: |")
+for (t, e), v in sorted(cb.items()):
+    print(f"| > {t} | {e} | {statistics.median(v):.1f} | {min(v):.1f}–{max(v):.1f} | {len(v)} |")
+
+# Pass-through sections
+for f, title in [("rq3/summary.md", "RQ3: extraction and ingest cost by template count"),
+                 ("faultmatrix.md", "RQ5: fault-injection matrix")]:
+    p = os.path.join(R, f)
+    if os.path.exists(p):
+        print(f"\n## {title}\n")
+        print(open(p).read())
+p = os.path.join(R, "e8.log")
+if os.path.exists(p):
+    print("\n## E-8: acknowledged lines lost to kill -9\n")
+    txt = open(p).read()
+    m = txt.find("| rate")
+    print(txt[m:] if m >= 0 else txt)
+p = os.path.join(R, "e8-powercut.txt")
+if os.path.exists(p):
+    print("\n## E-8: power-cut approximation (in process)\n")
+    print("\n".join(l.strip().split(": ", 1)[-1] for l in open(p) if "|" in l))
+p = os.path.join(R, "costguard-sweep.txt")
+if os.path.exists(p):
+    print("\n## Cost-guard selectivity sweep\n\n```")
+    print("\n".join(l.split(": ", 1)[-1].rstrip() for l in open(p) if "costguard_sweep_test.go" in l))
+    print("```")
