@@ -777,6 +777,17 @@ const rotateRetryInterval = time.Second
 // full queue. Returns false only once the writer is closing and one more attempt has failed.
 func (w *Writer) flushFullPage() bool {
 	for {
+		// Whether the writer is closing is read BEFORE the attempt, not after it. Read after,
+		// an attempt that failed while the disk was still bad would count as the last one if
+		// Close began while it ran — and a record would be dropped although the fault had
+		// cleared before shutdown. Read before, giving up always follows an attempt that
+		// started after Close did.
+		closing := false
+		select {
+		case <-w.closeCh:
+			closing = true
+		default:
+		}
 		err := w.flushPage()
 		if w.hdr.EntryCount == 0 {
 			// The page is on disk. An error from past that point (the .idx append, or the
@@ -786,15 +797,13 @@ func (w *Writer) flushFullPage() bool {
 			}
 			return true
 		}
-		select {
-		case <-w.closeCh:
+		if closing {
 			log.Printf("storage: writing full page: %v", err)
 			return false
-		default:
 		}
 		log.Printf("storage: writing full page (retrying in %v): %v", flushRetryDelay, err)
 		select {
-		case <-w.closeCh: // one last attempt, then give up
+		case <-w.closeCh: // one more attempt, which now knows it is the last
 		case <-time.After(flushRetryDelay):
 		}
 	}
